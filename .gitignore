@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-journal
+# Windows download metadata, 101 files at import time
+*:Zone.Identifier
