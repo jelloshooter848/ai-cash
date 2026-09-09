@@ -12,7 +12,7 @@ Defaults are for a local functional test: loopback only, plain HTTP. TLS is
 deployment, not code (LOCKED-DESIGN-DECISIONS L17), so do not expose this
 port beyond localhost without a reverse proxy terminating TLS in front.
 """
-import argparse, json, os, sys, base64
+import argparse, base64, json, os, sys, threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "impl"))
 
@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--db", default="mint.db")
     ap.add_argument("--keys", default="mint-keys.json")
     ap.add_argument("--mint-id", default="local-test-mint")
+    ap.add_argument("--console-port", type=int, default=8080,
+                    help="operator console in a browser; 0 disables it")
     ap.add_argument("--model-class", default="baseline-v1")
     ap.add_argument("--rate-ppm", type=int, default=0,
                     help="burn rate in parts per million (default 0: no burn)")
@@ -88,6 +90,14 @@ def main():
                         "exempt_below_mc": args.exempt_below_mc},
         "admin_token": admin_token or "(NONE - issuance is open to anyone)",
     }, indent=2))
+    console = None
+    if args.console_port:
+        import mint_console
+        console = mint_console.serve(args.console_port, port, args.mint_id, admin_token)
+        threading.Thread(target=console.serve_forever, daemon=True,
+                         name="aicash-console").start()
+        print(f"\n  CONSOLE     http://127.0.0.1:{args.console_port}   <- open this in a browser")
+
     print(f"\nmint is up. ctrl-c to stop."
           f"\n  descriptor  GET  {base}/v3/mints"
           f"\n  exchange    POST {base}/v3/exchange"
@@ -99,6 +109,8 @@ def main():
             __import__("time").sleep(3600)
     except KeyboardInterrupt:
         print("\nstopping...")
+        if console:
+            console.shutdown()
         server.stop()
 
 
