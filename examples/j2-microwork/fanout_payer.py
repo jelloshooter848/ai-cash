@@ -22,7 +22,7 @@ What this script demonstrates, end to end, against a real in-process mint
      to a sink wallet), and reconcile: mint outstanding supply ==
      sum of all wallet balances.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 fanout_payer.py
+Run:  PYTHONPATH=impl python3 fanout_payer.py
 """
 
 import http.client

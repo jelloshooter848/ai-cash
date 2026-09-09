@@ -8,7 +8,7 @@ was read beyond public signatures/docstrings, and NOTHING touches SwapParty
 private state — everything below is reachable by a real integrator.
 
 Run with:
-    PYTHONPATH=/home/lando/projects/aicash/impl python3 swap_market_maker.py
+    PYTHONPATH=impl python3 swap_market_maker.py
 
 What it demonstrates end to end, with real money on two live in-process HTTP
 mints that have DIFFERENT burn policies, independent sqlite ledgers, and
@@ -46,7 +46,7 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/home/lando/projects/aicash/impl")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "impl"))
 
 # Everything below is from the package root — the README's promise is that an
 # integrator needs nothing else.

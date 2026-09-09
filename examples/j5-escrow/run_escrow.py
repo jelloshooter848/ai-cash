@@ -17,7 +17,7 @@ Ledger + FakeClock):
     starts, with the offending rung named — and the sandboxed "negligent
     payee" path shows the attack succeeding without the check.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 run_escrow.py
+Run:  PYTHONPATH=impl python3 run_escrow.py
 """
 
 import hashlib

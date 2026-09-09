@@ -22,7 +22,7 @@ against a REAL in-process mint over HTTP:
   8.  Mint supply invariant + the "outstanding == held by the two wallets"
       reconciliation are asserted, not eyeballed.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 streaming_pair.py
+Run:  PYTHONPATH=impl python3 streaming_pair.py
 """
 
 import json

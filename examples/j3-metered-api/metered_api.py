@@ -29,7 +29,7 @@ over HTTP on 127.0.0.1):
      (outstanding == issued − burned == wallets + seller revenue) checked
      exactly.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 metered_api.py
+Run:  PYTHONPATH=impl python3 metered_api.py
 """
 
 import http.client
@@ -39,7 +39,9 @@ import sys
 import tempfile
 import uuid
 
-sys.path.insert(0, "/home/lando/projects/aicash/impl")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "impl"))
 
 from aicash.burncalc import BurnPolicy, compute_burn
 from aicash.channels import ChannelPayee, ChannelPayer

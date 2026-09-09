@@ -5,7 +5,7 @@ a fresh ZERO-capital wallet built with no registration, verify balance, spend
 part of it, and demonstrate catching PaymentInvalid on an already-spent token.
 
 Built only from README + components/C07-wallet.md Public API. No impl source read.
-Run: PYTHONPATH=/home/lando/projects/aicash/impl python3 first_token.py
+Run: PYTHONPATH=impl python3 first_token.py
 """
 import os
 import tempfile

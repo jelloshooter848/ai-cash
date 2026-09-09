@@ -8,7 +8,7 @@ again with no account and no relationship.
 
 Written cold from README + components/C06,C07 Public API blocks only.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 first_token.py
+Run:  PYTHONPATH=impl python3 first_token.py
 """
 import os
 import tempfile

@@ -16,7 +16,7 @@ Demonstrates, end to end over real HTTP against a real sqlite ledger:
   5. Reconciliation: wallet balances + the signed §3.6 supply snapshot
      (outstanding == issued - burned) account for every millicredit.
 
-Run with:  PYTHONPATH=/home/lando/projects/aicash/impl python3 first_token.py
+Run with:  PYTHONPATH=impl python3 first_token.py
 """
 
 import http.client

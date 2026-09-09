@@ -25,7 +25,7 @@ Next:    component complete
 
 ## ITERATION 1 — C05-signing
 Passing: 5/6 benchmark items · suite 72/72
-Failed:  [major] verify_obj accepts malformed b64u signature strings as valid, violating spec Requirement 3 ('malformed b64u ... -> False') and the B4 property ('Tampered ... signature strings -> False'). Cause: _b64u_decode_strict (/home/lando/projects/aicash/impl/aicash/signing.py lines 47-59) pre-screens only '='
+Failed:  [major] verify_obj accepts malformed b64u signature strings as valid, violating spec Requirement 3 ('malformed b64u ... -> False') and the B4 property ('Tampered ... signature strings -> False'). Cause: _b64u_decode_strict (impl/aicash/signing.py lines 47-59) pre-screens only '='
 Failed:  [weakened-check] test_bad_signature_strings_are_false_not_exceptions (tests/test_c05_signing.py, B4) only tampers characters whose change alters the decoded bytes (first-char flip, truncation, '=' padding, '\n'); it never tries non-alphabet-character injection or las
 Open questions: 4
 Next:    verify_obj accepts malformed b64u signature strings as valid, violating spec Requirement 3 ('malformed b64u ... -> False

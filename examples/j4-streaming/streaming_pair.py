@@ -20,7 +20,7 @@ What it demonstrates, end to end against a REAL in-process mint over HTTP:
      the 40 undrawn increments back into its wallet.
   8. Balances and the mint supply invariant are asserted, not eyeballed.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 streaming_pair.py
+Run:  PYTHONPATH=impl python3 streaming_pair.py
 """
 
 import http.client

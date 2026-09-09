@@ -21,7 +21,7 @@ quickstart, driven by a FakeClock so deadlines can be advanced):
      hash is caught by verify_funding BEFORE work starts (offending rung named),
      and — with the check skipped — the arbiter's genuine release opens nothing.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 run_escrow.py
+Run:  PYTHONPATH=impl python3 run_escrow.py
 """
 
 import hashlib

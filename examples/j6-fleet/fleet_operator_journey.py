@@ -25,7 +25,7 @@ What this script demonstrates, end to end, against a REAL in-process mint
      verified against the mint's published key, and their kind-partition /
      balance invariants are re-checked independently.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 fleet_operator_journey.py
+Run:  PYTHONPATH=impl python3 fleet_operator_journey.py
 """
 
 import json
@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, "/home/lando/projects/aicash/impl")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "impl"))
 
 from aicash.burncalc import BurnPolicy, compute_burn
 from aicash.clock import FakeClock

@@ -20,7 +20,7 @@ enterprise operator can:
      Ed25519 signature with the mint's published key, and check the pinned
      balance invariant sum(credit-like) - sum(debit-like) == closing - opening.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 fleet_ops.py
+Run:  PYTHONPATH=impl python3 fleet_ops.py
 
 Uses ONLY package-root public API (aicash.__all__) + the documented supervision
 HTTP routes (components/C10-supervision.md). No implementation source is read.

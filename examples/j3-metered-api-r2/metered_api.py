@@ -36,7 +36,7 @@ What it demonstrates, end to end on a real in-process mint (real HTTP on 127.0.0
      `status`, and the mint's signed supply arithmetic checked exactly
      (outstanding == issued − burned == sum(client balances) + seller balance).
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 metered_api.py
+Run:  PYTHONPATH=impl python3 metered_api.py
 """
 
 import os

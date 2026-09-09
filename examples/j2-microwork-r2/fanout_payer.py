@@ -22,7 +22,7 @@ What this script demonstrates end to end against a real in-process C06 mint:
   6. Verify all 20 workers can spend what they received (each pays 1 mc to a
      sink) and reconcile balances.
 
-Run:  PYTHONPATH=/home/lando/projects/aicash/impl python3 fanout_payer.py
+Run:  PYTHONPATH=impl python3 fanout_payer.py
 """
 
 import os

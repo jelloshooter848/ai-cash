@@ -3,7 +3,7 @@
 usability test of the AICash repo (an agent that had never seen the
 codebase, working from repo contents alone).
 
-Run with:  PYTHONPATH=/home/lando/projects/aicash/impl python3 swap_demo.py
+Run with:  PYTHONPATH=impl python3 swap_demo.py
 
 What this demonstrates, end to end, with real money on two real
 in-process HTTP mints (different burn policies, independent sqlite
@@ -39,7 +39,7 @@ import tempfile
 import urllib.request
 import json
 
-sys.path.insert(0, "/home/lando/projects/aicash/impl")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "impl"))
 
 from aicash.burncalc import BurnPolicy, compute_burn
 from aicash.clock import FakeClock
