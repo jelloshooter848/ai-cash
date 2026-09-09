@@ -5,3 +5,6 @@ __pycache__/
 *.db-journal
 # Windows download metadata, 101 files at import time
 *:Zone.Identifier
+# the mint's Ed25519 signing key - its identity. Never commit.
+mint-keys.json
+*-keys.json
