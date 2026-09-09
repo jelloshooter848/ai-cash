@@ -47,9 +47,24 @@ def main():
                     help="burn rate in parts per million (default 0: no burn)")
     ap.add_argument("--cap-mc", type=int, default=0)
     ap.add_argument("--exempt-below-mc", type=int, default=10)
+    ap.add_argument("--admin-token",
+                    help="operator credential for POST /admin/issue. "
+                         "Generated and printed if omitted.")
+    ap.add_argument("--open-issuance", action="store_true",
+                    help="DANGEROUS: leave /admin/issue unauthenticated, which "
+                         "lets anyone who can reach the port mint without limit. "
+                         "MintConfig.admin_token=None means 'allow everyone', "
+                         "not 'allow no one'.")
     args = ap.parse_args()
 
     private, public = load_or_create_keys(args.keys)
+    if args.open_issuance:
+        admin_token = None
+        print("WARNING: /admin/issue is unauthenticated. Anyone who can reach "
+              f"port {args.port} can mint without limit.", file=sys.stderr)
+    else:
+        admin_token = args.admin_token or base64.urlsafe_b64encode(
+            os.urandom(24)).decode().rstrip("=")
     config = MintConfig(
         mint_id=args.mint_id,
         baseline_model_class=args.model_class,
@@ -57,6 +72,7 @@ def main():
                                exempt_below_mc=args.exempt_below_mc),
         signing_private=private,
         signing_public=public,
+        admin_token=admin_token,
     )
     server, ledger = make_mint(config, args.db)
     port = server.start(args.port)
@@ -70,6 +86,7 @@ def main():
         "db": os.path.abspath(args.db),
         "burn_policy": {"rate_ppm": args.rate_ppm, "cap_mc": args.cap_mc,
                         "exempt_below_mc": args.exempt_below_mc},
+        "admin_token": admin_token or "(NONE - issuance is open to anyone)",
     }, indent=2))
     print(f"\nmint is up. ctrl-c to stop."
           f"\n  descriptor  GET  {base}/v3/mints"
