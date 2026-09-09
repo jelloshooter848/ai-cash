@@ -655,11 +655,21 @@ class MintServer:
         self._httpd: _MintHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self) -> int:
-        """Bind 127.0.0.1:0, serve on background threads, return the port."""
+    def start(self, port: int = 0, host: str = "127.0.0.1") -> int:
+        """Bind and serve on background threads; return the bound port.
+
+        Defaults to 127.0.0.1:0 — an ephemeral port on loopback, which is
+        what the tests want. A deployed mint needs a FIXED port instead: its
+        URL is published in the descriptor and held by counterparties, so an
+        address that moves on every restart is not addressable. Pass one.
+
+        `host` stays loopback by default. Transport is plain HTTP (L17), so
+        binding a routable interface publishes an unencrypted mint; put TLS
+        in front before widening this.
+        """
         if self._httpd is not None:
             raise RuntimeError("server already started")
-        self._httpd = _MintHTTPServer(("127.0.0.1", 0), _Handler)
+        self._httpd = _MintHTTPServer((host, port), _Handler)
         self._httpd.core = self._core
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Start an aicash mint. Nothing here is protocol - it is only a launcher.
+
+  python3 run_mint.py [--port N] [--db PATH] [--keys PATH] [--mint-id ID]
+
+Keys are generated on first run and reused after, so the mint keeps its
+identity across restarts; a fresh keypair would invalidate every token
+already issued against the old one. The descriptor is printed at startup so
+a client has everything it needs to talk to this mint.
+
+Defaults are for a local functional test: loopback only, plain HTTP. TLS is
+deployment, not code (LOCKED-DESIGN-DECISIONS L17), so do not expose this
+port beyond localhost without a reverse proxy terminating TLS in front.
+"""
+import argparse, json, os, sys, base64
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "impl"))
+
+from aicash.burncalc import BurnPolicy
+from aicash.mintapi import MintConfig, make_mint
+from aicash.signing import generate_keypair, pubkey_b64u
+
+
+def load_or_create_keys(path):
+    """Return (private, public), generating and persisting them once."""
+    if os.path.exists(path):
+        blob = json.load(open(path))
+        return (base64.b64decode(blob["private"]), base64.b64decode(blob["public"]))
+    private, public = generate_keypair()
+    with open(path, "w") as f:
+        json.dump({"private": base64.b64encode(private).decode(),
+                   "public": base64.b64encode(public).decode()}, f)
+    os.chmod(path, 0o600)  # the signing key is the mint's identity
+    print(f"generated a new mint keypair -> {path}")
+    return private, public
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Run an aicash mint.")
+    ap.add_argument("--port", type=int, default=8787,
+                    help="0 picks an ephemeral port")
+    ap.add_argument("--db", default="mint.db")
+    ap.add_argument("--keys", default="mint-keys.json")
+    ap.add_argument("--mint-id", default="local-test-mint")
+    ap.add_argument("--model-class", default="baseline-v1")
+    ap.add_argument("--rate-ppm", type=int, default=0,
+                    help="burn rate in parts per million (default 0: no burn)")
+    ap.add_argument("--cap-mc", type=int, default=0)
+    ap.add_argument("--exempt-below-mc", type=int, default=10)
+    args = ap.parse_args()
+
+    private, public = load_or_create_keys(args.keys)
+    config = MintConfig(
+        mint_id=args.mint_id,
+        baseline_model_class=args.model_class,
+        burn_policy=BurnPolicy(rate_ppm=args.rate_ppm, cap_mc=args.cap_mc,
+                               exempt_below_mc=args.exempt_below_mc),
+        signing_private=private,
+        signing_public=public,
+    )
+    server, ledger = make_mint(config, args.db)
+    port = server.start(args.port)
+
+    base = f"http://127.0.0.1:{port}"
+    print(json.dumps({
+        "mint_id": args.mint_id,
+        "url": base,
+        "descriptor": f"{base}/v3/mints",
+        "pubkey": pubkey_b64u(public),
+        "db": os.path.abspath(args.db),
+        "burn_policy": {"rate_ppm": args.rate_ppm, "cap_mc": args.cap_mc,
+                        "exempt_below_mc": args.exempt_below_mc},
+    }, indent=2))
+    print(f"\nmint is up. ctrl-c to stop."
+          f"\n  descriptor  GET  {base}/v3/mints"
+          f"\n  exchange    POST {base}/v3/exchange"
+          f"\n  status      POST {base}/v3/status  (or GET /v3/status/<id>)"
+          f"\n  issue       POST {base}/admin/issue  (operator credential)",
+          flush=True)
+    try:
+        while True:
+            __import__("time").sleep(3600)
+    except KeyboardInterrupt:
+        print("\nstopping...")
+        server.stop()
+
+
+if __name__ == "__main__":
+    main()
