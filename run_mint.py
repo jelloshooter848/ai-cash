@@ -77,7 +77,16 @@ def main():
         admin_token=admin_token,
     )
     server, ledger = make_mint(config, args.db)
-    port = server.start(args.port)
+    try:
+        port = server.start(args.port)
+    except OSError as exc:
+        # A stale mint on this port is worse than no mint: clients connect,
+        # everything "works", and the results come from a database you are
+        # not looking at. Fail loudly rather than let that happen.
+        sys.exit(f"cannot bind port {args.port}: {exc}\n"
+                 f"another mint is probably already running. Check with:\n"
+                 f"  ss -ltnp | grep {args.port}\n"
+                 f"then stop it, or pass a different --port.")
 
     base = f"http://127.0.0.1:{port}"
     print(json.dumps({
