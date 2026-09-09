@@ -12,7 +12,7 @@ Defaults are for a local functional test: loopback only, plain HTTP. TLS is
 deployment, not code (LOCKED-DESIGN-DECISIONS L17), so do not expose this
 port beyond localhost without a reverse proxy terminating TLS in front.
 """
-import argparse, base64, json, os, sys, threading
+import argparse, base64, json, logging, os, sys, threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "impl"))
 
@@ -44,6 +44,10 @@ def main():
     ap.add_argument("--mint-id", default="local-test-mint")
     ap.add_argument("--console-port", type=int, default=8080,
                     help="operator console in a browser; 0 disables it")
+    ap.add_argument("--access-log", default="mint-access.log",
+                    help="request log: method, route pattern and status. The "
+                         "mint already emits these at INFO and nothing was "
+                         "listening. Never contains token secrets.")
     ap.add_argument("--model-class", default="baseline-v1")
     ap.add_argument("--rate-ppm", type=int, default=0,
                     help="burn rate in parts per million (default 0: no burn)")
@@ -58,6 +62,14 @@ def main():
                          "MintConfig.admin_token=None means 'allow everyone', "
                          "not 'allow no one'.")
     args = ap.parse_args()
+
+    if args.access_log:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(message)s",
+            handlers=[logging.FileHandler(args.access_log),
+                      logging.StreamHandler(sys.stdout)],
+        )
 
     private, public = load_or_create_keys(args.keys)
     if args.open_issuance:
@@ -98,6 +110,7 @@ def main():
         "burn_policy": {"rate_ppm": args.rate_ppm, "cap_mc": args.cap_mc,
                         "exempt_below_mc": args.exempt_below_mc},
         "admin_token": admin_token or "(NONE - issuance is open to anyone)",
+        "access_log": os.path.abspath(args.access_log) if args.access_log else None,
     }, indent=2))
     console = None
     if args.console_port:
