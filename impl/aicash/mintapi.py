@@ -83,8 +83,36 @@ def _require_plain_int(name: str, value: object, minimum: int | None = None):
 
 
 def _default_rate() -> dict:
-    # OPEN-QUESTIONS #3 interim schema for published rate limits.
-    return {"per_caller_rps": 50, "burst": 200}
+    # §3.6 pinned schema: per_caller_rps, burst, scope. OPEN-QUESTIONS R15
+    # closed the old Open #3 and pinned scope as mandatory; this function was
+    # still emitting the pre-resolution shape. Found 2026-09-08 by an outside
+    # implementation reading the descriptor against §3.6.
+    return {"per_caller_rps": 50, "burst": 200, "scope": "ip"}
+
+
+RATE_SCOPES = ("ip", "connection", "global")
+
+
+def _validate_rate(name: str, r: object) -> None:
+    """Enforce the §3.6 pinned rate schema.
+
+    Nothing checked this, which is how the descriptor shipped without `scope`
+    against a decision (OPEN-QUESTIONS R15) that had already closed pinning it
+    as mandatory. A published descriptor is a conformance claim; an unvalidated
+    one is a claim nobody checked.
+    """
+    if not isinstance(r, dict):
+        raise ValueError(f"{name} must be a dict")
+    missing = {"per_caller_rps", "burst", "scope"} - set(r)
+    if missing:
+        raise ValueError(f"{name} missing §3.6 pinned field(s): "
+                         f"{', '.join(sorted(missing))}")
+    if isinstance(r["per_caller_rps"], bool) or not isinstance(
+            r["per_caller_rps"], (int, float)):
+        raise ValueError(f"{name}.per_caller_rps must be a number")
+    _require_plain_int(f"{name}.burst", r["burst"], 0)
+    if r["scope"] not in RATE_SCOPES:
+        raise ValueError(f"{name}.scope must be one of {', '.join(RATE_SCOPES)}")
 
 
 def _policy_dict(p: BurnPolicy) -> dict:
@@ -146,6 +174,8 @@ class MintConfig:
             next_policy, effective_at = self.burn_policy_next
             validate_policy(next_policy)
             _require_plain_int("burn_policy_next effective_at", effective_at, 0)
+        _validate_rate("anonymous_rate", self.anonymous_rate)
+        _validate_rate("registered_rate", self.registered_rate)
         for kb in ("signing_private", "signing_public"):
             v = getattr(self, kb)
             if not isinstance(v, bytes) or len(v) != 32:
@@ -165,12 +195,10 @@ class MintConfig:
             raise ValueError(
                 "prunes_spent_records requires a finite max_lock_expiry_ms"
             )
-        for rate_name in ("anonymous_rate", "registered_rate"):
-            rate = getattr(self, rate_name)
-            if not isinstance(rate, dict):
-                raise ValueError(f"{rate_name} must be a dict")
-            for k, v in rate.items():
-                _require_plain_int(f"{rate_name}.{k}", v, 0)
+        # (rate schemas validated above by _validate_rate against the §3.6
+        # pinned shape. The loop that stood here required every value to be a
+        # plain int, which did not merely omit the mandatory `scope` field —
+        # it made adding it raise. The descriptor could not have conformed.)
         if self.performance is not None:
             perf = self.performance
             if not isinstance(perf, dict) or set(perf) != _PERFORMANCE_FIELDS:

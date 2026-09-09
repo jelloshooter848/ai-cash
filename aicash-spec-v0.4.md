@@ -234,7 +234,15 @@ Batch rejections (exchange and status) MUST enumerate offending items:
                                 { index: 7, kind: "input", reason: "lock_preimage_invalid" } ] }
 ```
 
-Reason vocabulary: `unknown | spent | lock_preimage_invalid | lock_expired | lock_not_expired | refund_invalid | bad_witness_length | amount_mismatch | output_exists | bad_format | over_batch_limit`. Enumerated rejection is read-only diagnostics over lookups the mint already performed; opaque all-or-nothing rejection (v0.3) forced O(log n) bisection at volume.
+Some rejections are properties of the **call**, not of any one item — a reused `idempotency_key` whose body digest differs (§3.3), a malformed envelope, a batch over the limit. Those carry `index: null` and `kind: "call"`:
+
+```
+{ status: "rejected", errors: [ { index: null, kind: "call", reason: "idempotency_conflict" } ] }
+```
+
+`kind` is `input | output | call`. A call-level rejection stands alone: a mint MUST NOT mix it with item-level errors in the same response, because there is no item to attribute.
+
+Reason vocabulary: `unknown | spent | lock_preimage_invalid | lock_expired | lock_not_expired | refund_invalid | bad_witness_length | amount_mismatch | output_exists | bad_format | over_batch_limit | idempotency_conflict`. Enumerated rejection is read-only diagnostics over lookups the mint already performed; opaque all-or-nothing rejection (v0.3) forced O(log n) bisection at volume.
 
 ---
 

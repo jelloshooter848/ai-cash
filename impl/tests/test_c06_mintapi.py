@@ -295,8 +295,14 @@ class MintApiTest(unittest.TestCase):
         self.assertIn(b'"performance":null', raw)
         limits = desc["limits"]
         self.assertIsInstance(limits["max_batch"], int)
-        self.assertIsInstance(limits["anonymous_rate"], dict)
-        self.assertIsInstance(limits["registered_rate"], dict)
+        # §3.6 pins the rate schema; asserting only "is a dict" is what let
+        # the descriptor ship without `scope` against closed decision R15.
+        for tier in ("anonymous_rate", "registered_rate"):
+            self.assertIsInstance(limits[tier], dict)
+            self.assertEqual({"per_caller_rps", "burst", "scope"},
+                             set(limits[tier]), f"{tier} must match the §3.6 pinned schema")
+            self.assertIsInstance(limits[tier]["burst"], int)
+            self.assertIn(limits[tier]["scope"], ("ip", "connection", "global"))
         lp = desc["lock_params"]
         self.assertIsInstance(lp["grace_ms"], int)
         self.assertIsInstance(lp["timestamp_precision_ms"], int)
@@ -1268,3 +1274,42 @@ class EnvelopeAliasTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RateSchemaConformance(unittest.TestCase):
+    """§3.6 pins the rate schema. Nothing checked it, and the descriptor
+    shipped without `scope` against OPEN-QUESTIONS R15, which had closed
+    pinning it mandatory. Found 2026-09-08 by an outside implementation
+    reading the published descriptor against the spec."""
+
+    def _config(self, **over):
+        priv, pub = generate_keypair()
+        base = dict(mint_id="rate-test", baseline_model_class="b",
+                    burn_policy=BurnPolicy(0, 0, 10),
+                    signing_private=priv, signing_public=pub)
+        base.update(over)
+        return MintConfig(**base)
+
+    def test_default_rates_carry_all_three_pinned_fields(self):
+        c = self._config()
+        for tier in (c.anonymous_rate, c.registered_rate):
+            self.assertEqual({"per_caller_rps", "burst", "scope"}, set(tier))
+            self.assertIn(tier["scope"], ("ip", "connection", "global"))
+
+    def test_rate_missing_scope_is_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            self._config(anonymous_rate={"per_caller_rps": 50, "burst": 200})
+        self.assertIn("scope", str(cm.exception))
+
+    def test_rate_with_bad_scope_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._config(registered_rate={"per_caller_rps": 50, "burst": 200,
+                                          "scope": "planetary"})
+
+    def test_scope_is_not_required_to_be_an_int(self):
+        # The old validator required every rate value to be a plain int, so
+        # adding the mandatory string field would raise. Conformance was
+        # structurally impossible, not merely absent.
+        c = self._config(anonymous_rate={"per_caller_rps": 50, "burst": 200,
+                                         "scope": "connection"})
+        self.assertEqual("connection", c.anonymous_rate["scope"])

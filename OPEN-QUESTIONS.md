@@ -35,3 +35,25 @@ R9. **max_batch is an operational limit, not a measurement** — lives in `limit
 R10. **Joint escrow preimages are impossible without ZK** (attesting `sha256(p_m)` requires holding `p_m`), so k-of-n panels use the rung construction: per-arbiter preimages, signed-vote quorum, defection bounded to value/n. Found by the independent verification pass. (§9.3)
 R11. **Canonical JSON** pinned: UTF-8, sorted keys, no insignificant whitespace, plain integers, NFC strings. (§3.3)
 R12. **Statement kind partition** pinned; freeze/unfreeze are amount 0 and excluded; withdrawals net-of-burn with burn as its own line. (§6.1(7))
+
+## Found by outside review, 2026-09-08
+
+An independently written client (ALPHA), working from spec v0.4 without
+reading `impl/`, checked the published descriptor and the error vocabulary
+against the text. Both findings were confirmed against the source and fixed.
+
+- **R15 was closed but never implemented.** `_default_rate()` omitted the
+  mandatory `scope` field, with a comment still citing the superseded
+  "OPEN-QUESTIONS #3 interim schema". Worse, `MintConfig.__post_init__`
+  required every rate value to be a plain int, so adding the pinned string
+  field would raise: the descriptor could not have conformed. Fixed, with
+  schema validation and the descriptor-completeness test strengthened —
+  it had asserted only that the rate tiers were dicts.
+- **§3.3 mandated a reason §3.8 did not define.** `idempotency_conflict`
+  was absent from the vocabulary, and §3.8 had no call-level error shape at
+  all, so the `{index: null, kind: "call"}` the reference mint answers with
+  was invented rather than specified. §3.8 now defines both.
+
+Neither was reachable from inside: a client that shares its author with the
+mint makes the same reading of the spec on both sides, and a happy-path
+client never sends a duplicate idempotency key.
