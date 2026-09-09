@@ -21,15 +21,57 @@ from aicash.mintapi import MintConfig, make_mint
 from aicash.signing import generate_keypair, pubkey_b64u
 
 
-def load_or_create_keys(path):
-    """Return (private, public), generating and persisting them once."""
+def load_or_create_keys(path, mint_id, baseline, pin=False):
+    """Return (private, public), generating and persisting them once.
+
+    Also pins mint_id and baseline_model_class. §4.1 makes the baseline
+    immutable for the life of a mint_id: it is the definition of the unit, so
+    changing it reprices every outstanding credit while the §3.6 supply
+    counters, being denominated in mc, stay unchanged and the invariant still
+    holds. Nothing in the ledger can detect that, so the launcher refuses it.
+    """
     if os.path.exists(path):
         blob = json.load(open(path))
+        was_id = blob.get("mint_id")
+        was_base = blob.get("baseline_model_class")
+        if was_id is not None and was_id != mint_id:
+            sys.exit(f"this key file belongs to mint_id {was_id!r}, not {mint_id!r}.\n"
+                     f"Use --keys for a different file, or --mint-id {was_id}.")
+        if was_base is not None and was_base != baseline:
+            sys.exit(
+                f"refusing to start: baseline_model_class for mint_id {mint_id!r} "
+                f"was {was_base!r} and is now {baseline!r}.\n"
+                f"§4.1 makes the baseline immutable for the life of a mint_id — it "
+                f"is the definition of the millicredit, so changing it silently "
+                f"reprices every credit already issued while every supply counter "
+                f"stays put.\nA different baseline is a different mint: pass a new "
+                f"--mint-id with a new --keys and --db.")
+        if was_base is None:
+            # The file predates identity pinning, so nothing here can confirm
+            # what the baseline WAS. Writing whatever was passed would pin the
+            # attacker's value on the first run and call it the original —
+            # which is exactly what this check exists to prevent. Make a human
+            # assert it instead.
+            if not pin:
+                sys.exit(
+                    f"{path} has no pinned baseline_model_class, so this cannot "
+                    f"verify that {baseline!r} is the one this mint has been using.\n"
+                    f"If it is, re-run with --pin-baseline to record it. If you are "
+                    f"not certain, check what earlier descriptors published first: "
+                    f"pinning the wrong value makes a redefinition permanent and "
+                    f"invisible.")
+            blob.update(mint_id=mint_id, baseline_model_class=baseline)
+            json.dump(blob, open(path, "w"))
+            print(f"pinned baseline_model_class={baseline!r} for mint_id={mint_id!r}")
+        elif was_id is None:
+            blob["mint_id"] = mint_id
+            json.dump(blob, open(path, "w"))
         return (base64.b64decode(blob["private"]), base64.b64decode(blob["public"]))
     private, public = generate_keypair()
     with open(path, "w") as f:
         json.dump({"private": base64.b64encode(private).decode(),
-                   "public": base64.b64encode(public).decode()}, f)
+                   "public": base64.b64encode(public).decode(),
+                   "mint_id": mint_id, "baseline_model_class": baseline}, f)
     os.chmod(path, 0o600)  # the signing key is the mint's identity
     print(f"generated a new mint keypair -> {path}")
     return private, public
@@ -53,6 +95,9 @@ def main():
                     help="burn rate in parts per million (default 0: no burn)")
     ap.add_argument("--cap-mc", type=int, default=0)
     ap.add_argument("--exempt-below-mc", type=int, default=10)
+    ap.add_argument("--pin-baseline", action="store_true",
+                    help="record baseline_model_class into a key file that "
+                         "predates identity pinning. Assert it, do not guess.")
     ap.add_argument("--admin-token",
                     help="operator credential for POST /admin/issue. "
                          "Generated and printed if omitted.")
@@ -71,7 +116,8 @@ def main():
                       logging.StreamHandler(sys.stdout)],
         )
 
-    private, public = load_or_create_keys(args.keys)
+    private, public = load_or_create_keys(args.keys, args.mint_id, args.model_class,
+                                              args.pin_baseline)
     if args.open_issuance:
         admin_token = None
         print("WARNING: /admin/issue is unauthenticated. Anyone who can reach "

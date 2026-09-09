@@ -255,6 +255,8 @@ Reason vocabulary: `unknown | spent | lock_preimage_invalid | lock_expired | loc
 
 All ledger amounts are integers in millicredits. This is a **definitional peg to a unit of compute, not a convertible exchange rate.** It gives agents shared pricing intuition without making credits redeemable for anything. Each mint publishes its baseline model class; cross-mint value transfer is §11.
 
+**`baseline_model_class` is immutable for the life of a `mint_id`.** A mint MUST NOT change it after issuing its first token; a mint wanting a different baseline is a different mint and MUST use a new `mint_id`. This is why the field has no `_next` variant while `burn_policy` and `signing_pubkey` do: those are parameters denominated in the unit, and the baseline *is* the unit. Redefining it silently reprices every outstanding credit while `outstanding_mc`, `cumulative_issued_mc` and `cumulative_burned_mc` all stay unchanged and the §3.6 invariant continues to hold — so the dilution mitigation in §14, being denominated in mc, cannot see it. There are two ways to dilute a currency: issue more units, or redefine the unit. Monotonic supply counters address the first; immutability is what addresses the second. **A descriptor whose `baseline_model_class` differs from any earlier signed descriptor for the same `mint_id` is portable proof of nonconformance**, on the same footing as a broken supply invariant.
+
 ### 4.2 Standard denomination ladder
 
 Mints and wallets SHOULD use powers of ten in millicredits:
@@ -546,7 +548,8 @@ Everything else — channels, k-of-n arbitration, escrow, both profiles, the env
 | Threat | Status |
 |---|---|
 | ~~Corrupt/fooled attestor mints against fake work~~ | **Eliminated** — earned issuance deleted permanently (§0.1). The stack no longer contains an unbounded failure. |
-| Mint double-issues (dilution) | **Mitigated** — signed monotonic supply counters (§3.6); two conflicting signed snapshots are portable proof of nonconformance. Residual: a mint that never signs honest numbers; detectable by aggregate-vs-observed drift, accepted single-mint assumption otherwise. |
+| Mint double-issues (dilution by issuance) | **Mitigated** — signed monotonic supply counters (§3.6); two conflicting signed snapshots are portable proof of nonconformance. Residual: a mint that never signs honest numbers; detectable by aggregate-vs-observed drift, accepted single-mint assumption otherwise. |
+| Mint redefines the unit (dilution by redefinition) | **Mitigated** — `baseline_model_class` is immutable per `mint_id` (§4.1); a descriptor contradicting an earlier signed one for the same mint is portable proof of nonconformance. Noted because the counters above cannot detect this: they are denominated in mc, and a baseline change moves what mc means while leaving every counter and the invariant intact. |
 | Double-spend via racing two `/exchange` calls | Prevented by atomic check-and-mark (§3.3). Cannot be best-effort. |
 | Bearer token lost to disk failure | **Unrecoverable by design.** Mitigations: custodial mode (§5.2); secret-sharding pattern (§5.1). |
 | Money lost in a mode transition | Persist-before-send applied to withdrawals (§5.3). |

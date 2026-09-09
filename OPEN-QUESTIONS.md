@@ -54,6 +54,24 @@ against the text. Both findings were confirmed against the source and fixed.
   all, so the `{index: null, kind: "call"}` the reference mint answers with
   was invented rather than specified. §3.8 now defines both.
 
-Neither was reachable from inside: a client that shares its author with the
+- **The rate validator also forbade fractional `per_caller_rps`**, which §3.6
+  permits as `number`. No mint could have published 0.5 rps. A second defect,
+  not a consequence of the first; it went out with the same fix.
+- **The unit of account had no change notice, and dilution detection is blind
+  to it.** §4.1 defines 1 mc as the inference cost of one output token from the
+  declared baseline model class, so `baseline_model_class` *is* the unit — yet
+  it appeared exactly once in the spec, as a bare descriptor field, while
+  `burn_policy` and `signing_pubkey` both carry `_next` notice machinery.
+  Redeclaring the baseline reprices every outstanding credit while
+  `outstanding_mc`, `cumulative_issued_mc` and `cumulative_burned_mc` all stay
+  unchanged and the §3.6 invariant holds exactly — so the §14 dilution
+  mitigation, being denominated in mc, cannot see it. There are two ways to
+  dilute a currency: issue more units, or redefine the unit; only the first was
+  addressed. Since L3 makes that snapshot the *only* mitigation behind the
+  accepted single-mint trust assumption, the one defense had an uncovered side.
+  Resolved by making the baseline immutable per `mint_id` (§4.1), adding the
+  redefinition row to §14, and enforcing it at startup in `run_mint.py`.
+
+Neither of the first two was reachable from inside: a client that shares its author with the
 mint makes the same reading of the spec on both sides, and a happy-path
 client never sends a duplicate idempotency key.
