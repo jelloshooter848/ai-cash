@@ -255,6 +255,33 @@ class MintApiTest(unittest.TestCase):
     # B3
     # ------------------------------------------------------------------
 
+    def test_signed_snapshot_carries_mint_id_and_baseline(self):
+        mint = self.start_mint()
+        status, raw, _ = http_raw(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        desc = json.loads(raw.decode("utf-8"))
+        snap = desc["supply"]
+        pub = b64u_decode(desc["signing_pubkey"], expect_len=32)
+        self.assertIn("mint_id", snap)
+        self.assertIn("baseline_model_class", snap)
+        self.assertEqual(desc["baseline_model_class"], snap["baseline_model_class"],
+                         "the signed copy must match the one served at top level")
+        self.assertTrue(verify_obj(snap, pub),
+                        "the served snapshot must verify as signed")
+
+    def test_tampering_with_the_baseline_breaks_the_signature(self):
+        # This is the whole point: an altered baseline must be detectable from
+        # the artifact alone, without trusting the mint that served it.
+        mint = self.start_mint()
+        _, raw, _ = http_raw(mint.port, "GET", "/v3/mints")
+        desc = json.loads(raw.decode("utf-8"))
+        snap = desc["supply"]
+        pub = b64u_decode(desc["signing_pubkey"], expect_len=32)
+        self.assertTrue(verify_obj(snap, pub))
+        snap["baseline_model_class"] = "cheaper-model-v2"
+        self.assertFalse(verify_obj(snap, pub),
+                         "a redefined baseline must invalidate the signature")
+
     def test_b3_descriptor_completeness_and_snapshot(self):
         """B3: every §3.6 field present with correct types; performance null
         renders as JSON null; snapshot verifies against signing_pubkey via
@@ -1313,3 +1340,4 @@ class RateSchemaConformance(unittest.TestCase):
         c = self._config(anonymous_rate={"per_caller_rps": 50, "burst": 200,
                                          "scope": "connection"})
         self.assertEqual("connection", c.anonymous_rate["scope"])
+

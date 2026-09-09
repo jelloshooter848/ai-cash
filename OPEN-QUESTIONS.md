@@ -75,3 +75,22 @@ against the text. Both findings were confirmed against the source and fixed.
 Neither of the first two was reachable from inside: a client that shares its author with the
 mint makes the same reading of the spec on both sides, and a happy-path
 client never sends a duplicate idempotency key.
+
+- **The portable-proof claim was itself unbacked when written.** The §4.1 fix
+  above called a contradicting descriptor portable proof of nonconformance
+  while nothing signed `baseline_model_class`: the descriptor signature covered
+  the supply counters only, so a mint could serve a changed baseline and deny
+  it. Found by the same outside review, reading the fix rather than the report.
+  `mint_id` and `baseline_model_class` now ride inside the signed snapshot
+  body, which also means the archiver network already diffing signed snapshots
+  detects a redefinition with no new code.
+
+  Four findings today share one shape: a check that does not cover the thing it
+  is named after. Dilution detection denominated in mc, blind to what mc means.
+  A descriptor test asserting the rate tiers were dicts, blind to their
+  contents. Two scanning tools that looked right and verified nothing. Portable
+  proof over an unsigned field. None was missing — all four ran and reported
+  success, which is worse than absence, because a missing check is visible in a
+  coverage list and a non-covering one reads as coverage. The suggested audit:
+  take each row in §14 marked Mitigated and ask what artifact the mitigation
+  produces and whether anything covers the field it names.

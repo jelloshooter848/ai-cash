@@ -457,8 +457,20 @@ class _Core:
             activity_count, activity_volume = row[2], row[3]
         else:  # counters belong to an earlier mint-clock day: none today
             activity_count, activity_volume = 0, 0
+        # mint_id and baseline_model_class ride INSIDE the signed body. §4.1
+        # calls a contradicting descriptor portable proof of nonconformance,
+        # and that proof is only constructible if a signature covers the
+        # field: the supply invariant is portable precisely because each
+        # snapshot is signed. Carrying them here also means the archiver
+        # network already diffing signed snapshots sees a baseline change with
+        # no new code. Found 2026-09-08 by outside review of the fix that
+        # introduced the §4.1 claim.
         snapshot = dict(
-            supply, snapshot_seq=snapshot_seq, snapshot_time=mint_time
+            supply,
+            mint_id=c.mint_id,
+            baseline_model_class=c.baseline_model_class,
+            snapshot_seq=snapshot_seq,
+            snapshot_time=mint_time,
         )
         snapshot = attach_sig(snapshot, c.signing_private)  # C05
 
