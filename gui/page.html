@@ -1,0 +1,883 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>aicash operator</title><style>
+/* Same palette and proportions as mint_console.py, so the two read as one
+   product. No CDN, no framework, no build step: this file is the whole UI. */
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1a1a18;--dim:#6b6b66;--line:#e2e2dd;
+--accent:#2f6f4f;--warn:#8a4b2a;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(prefers-color-scheme:dark){:root{--bg:#16161a;--card:#1e1e23;--ink:#e8e8e4;
+--dim:#9a9a94;--line:#30303a;--accent:#6bbf90;--warn:#d89a6a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:940px;margin:0 auto;padding:24px 18px 60px}
+h1{font-size:20px;margin:0 0 2px}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);
+margin:0 0 12px}
+h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+margin:20px 0 6px;font-weight:600}
+.sub{color:var(--dim);font-size:13px;margin-bottom:22px;font-family:var(--mono)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:18px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px}
+.stat .n{font-size:22px;font-family:var(--mono);font-weight:600;word-break:break-all}
+.stat .l{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+input,textarea,select{width:100%;padding:9px 10px;border:1px solid var(--line);
+border-radius:7px;background:var(--bg);color:var(--ink);font-family:var(--mono);
+font-size:13px}
+textarea{min-height:76px;resize:vertical}
+button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:9px 16px;
+font-size:14px;cursor:pointer;margin-top:12px}
+button:hover:not(:disabled){opacity:.9}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.sec{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button.small{padding:5px 10px;font-size:12px;margin-top:0}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:130px}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:12px;
+overflow-x:auto;font-size:12px;margin:12px 0 0;white-space:pre-wrap;word-break:break-all}
+pre.log{max-height:240px;overflow-y:auto;white-space:pre;word-break:normal}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);
+margin-right:6px;vertical-align:middle}
+.dot.off{background:var(--warn)}.dot.unk{background:var(--dim)}
+.warn{color:var(--warn);font-size:12px;margin-top:8px}
+.note{color:var(--dim);font-size:12px;margin-top:8px}
+.ok{color:var(--accent)}.bad{color:var(--warn)}
+details summary{cursor:pointer;color:var(--dim);font-size:13px;margin-top:14px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--dim);font-weight:600;padding:4px 8px 4px 0;border-bottom:1px solid var(--line)}
+td{padding:6px 8px 6px 0;border-bottom:1px solid var(--line);vertical-align:top}
+td.num{font-family:var(--mono);text-align:right;white-space:nowrap}
+.wallet{display:flex;align-items:center;gap:12px;padding:10px 12px;margin-top:8px;
+border:1px solid var(--line);border-radius:8px;background:var(--bg);cursor:pointer}
+.wallet:hover{border-color:var(--accent)}
+.wallet.active{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.wallet .nm{flex:1;font-weight:600;word-break:break-all}
+.wallet .bal{font-family:var(--mono);white-space:nowrap}
+.wallet .tag{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.banner{border:1px solid var(--warn);border-radius:8px;padding:10px 12px;
+color:var(--warn);font-size:13px;margin-bottom:16px}
+.step{display:inline-block;width:18px;height:18px;border-radius:50%;
+background:var(--dim);color:var(--bg);font-size:11px;line-height:18px;
+text-align:center;margin-right:8px;font-weight:700}
+</style></head><body><div class="wrap">
+
+<h1><span class="dot unk" id="hdr-dot"></span>aicash operator</h1>
+<div class="sub" id="hdr-state">starting up...</div>
+
+<div class="banner" id="stopped-banner" hidden>
+  No mint is running, so wallets cannot be created, funded or spent. Start one
+  under <b>MINT</b> below — the defaults are fine.
+</div>
+<div class="banner" id="fatal-banner" hidden></div>
+
+<!-- ================= MINT ================= -->
+<div class="card">
+  <h2><span class="step">1</span>Mint</h2>
+
+  <div class="grid" id="m-stats"></div>
+  <div id="m-policy" class="note"></div>
+
+  <details id="m-settings"><summary>Mint settings (defaults are fine)</summary>
+    <div class="row">
+      <div><label>Mint id (lowercase, digits, hyphens)</label>
+        <input id="m-id" value="local-test-mint" autocomplete="off"></div>
+      <div><label>Baseline model class</label>
+        <input id="m-baseline" value="baseline-v1" autocomplete="off"></div>
+      <div><label>Port</label><input id="m-port" value="8787" inputmode="numeric"></div>
+    </div>
+    <h3>Burn policy — what every payment costs</h3>
+    <div class="row">
+      <div><label>Rate (parts per million)</label>
+        <input id="m-rate" value="0" inputmode="numeric"></div>
+      <div><label>Cap: most one payment can burn (mc)</label>
+        <input id="m-cap" value="0" inputmode="numeric"></div>
+      <div><label>Exempt below (mc)</label>
+        <input id="m-exempt" value="10" inputmode="numeric"></div>
+    </div>
+    <div class="note">The burn is <b>min(cap, amount &times; rate &divide; 1,000,000)</b>,
+      and it is charged on top of what the recipient gets. A cap of 0 therefore
+      means <b>no burn at all</b>, whatever the rate says &mdash; leave both at 0
+      for a mint where a payment moves the whole amount. For a 1% burn capped at
+      1,000 mc, set rate 10000 and cap 1000. Amounts at or below the exempt
+      figure never burn. A payment is burned <b>twice</b>: once when the paying
+      wallet splits its coins, and again when the recipient redeems the tokens
+      &mdash; both are shown in the cost line before you pay. The mint id and baseline are written into the mint's
+      identity file the first time it runs and cannot be changed afterwards;
+      the burn policy can.</div>
+  </details>
+
+  <div class="btnrow">
+    <button id="m-start">Start mint</button>
+    <button id="m-stop" class="sec">Stop mint</button>
+    <button id="m-refresh" class="sec">Refresh</button>
+  </div>
+  <div id="m-msg"></div>
+
+  <details id="m-descbox"><summary>Mint descriptor (what a client sees)</summary>
+    <pre id="m-desc">not running</pre></details>
+
+  <details id="m-logbox"><summary>Log tail</summary>
+    <div class="btnrow" style="margin-top:8px">
+      <button id="m-logs-refresh" class="sec small">Refresh log</button></div>
+    <pre id="m-logs" class="log">not running</pre></details>
+
+  <h3>Operator funding — create money and put it in a wallet</h3>
+  <div class="row">
+    <div><label>Amount each (millicredits)</label>
+      <input id="f-amount" value="1000" inputmode="numeric"></div>
+    <div><label>How many tokens</label>
+      <input id="f-count" value="1" inputmode="numeric"></div>
+    <div><label>Into wallet</label><select id="f-wallet"></select></div>
+  </div>
+  <button id="f-go">Issue into wallet</button>
+  <div class="warn">Issuing creates new money out of nothing. It is signed into
+    the supply snapshot and cannot be undone.</div>
+  <div id="f-out"></div>
+</div>
+
+<!-- ================= WALLETS ================= -->
+<div class="card">
+  <h2><span class="step">2</span>Wallets</h2>
+  <div class="row">
+    <div><label>New wallet name (letters, digits, - and _)</label>
+      <input id="w-name" placeholder="alice" autocomplete="off"></div>
+    <div style="flex:0 0 auto;min-width:0">
+      <label>&nbsp;</label><button id="w-create" style="margin-top:0">Create wallet</button></div>
+  </div>
+  <div id="w-msg"></div>
+  <div id="w-list"></div>
+  <div class="note">Click a wallet to make it the <b>active</b> one — that is the
+    wallet that pays and receives in section 3. Each wallet is one sqlite file in
+    <span id="wallets-dir">the workdir</span>; whoever has the file has the money.</div>
+</div>
+
+<!-- ================= SEND / RECEIVE ================= -->
+<div class="card">
+  <h2><span class="step">3</span>Send &amp; receive</h2>
+  <div class="sub" style="margin-bottom:14px">active wallet:
+    <b id="active-name">none</b> &nbsp;·&nbsp; balance
+    <b id="active-balance">-</b></div>
+
+  <h3>Pay</h3>
+  <div class="row">
+    <div><label>Amount (millicredits)</label>
+      <input id="p-amount" value="500" inputmode="numeric"></div>
+    <div><label>Pay to</label><select id="p-to"></select></div>
+  </div>
+  <div id="p-quote" class="note">Enter an amount to see what it costs.</div>
+  <div class="btnrow"><button id="p-go" disabled>Pay</button>
+    <button id="p-requote" class="sec">Re-check cost</button></div>
+  <div id="p-out"></div>
+
+  <h3>Receive</h3>
+  <label>Paste token strings, one per line</label>
+  <textarea id="r-tokens" placeholder="aicash:v3:local-test-mint:1000:..."></textarea>
+  <button id="r-go">Receive into active wallet</button>
+  <div id="r-out"></div>
+
+  <h3>History</h3>
+  <div class="btnrow"><button id="h-refresh" class="sec small">Refresh history</button>
+    <button id="h-recover" class="sec small">Recover interrupted payments</button></div>
+  <div id="h-out"></div>
+  <table id="h-table"><thead><tr><th>When</th><th>What</th>
+    <th style="text-align:right">Amount</th><th>Detail</th></tr></thead>
+    <tbody id="h-body"></tbody></table>
+
+  <details><summary>Look up a token</summary>
+    <label>Token string or ledger key</label>
+    <textarea id="t-q" placeholder="aicash:v3:..."></textarea>
+    <button id="t-go" class="sec">Check status</button>
+    <div id="t-out"></div></details>
+</div>
+
+<div class="note">Loopback only, and no password: anyone who can reach this port
+  can mint money and spend every wallet in the workdir. Local operator tool, not
+  a hosted service.</div>
+
+</div><script>
+"use strict";
+const $ = id => document.getElementById(id);
+const TIMEOUTS = {default: 20000, start: 90000, stop: 70000};
+
+/* ---------- state ---------- */
+let mint = {running: false};
+let wallets = [];
+let active = null;
+try { active = localStorage.getItem("aicash-active") || null; } catch (e) { active = null; }
+let busy = false;
+let quoteTimer = null;
+let lastQuote = null;
+/* The mint's §7.3 burn policy, read from its own descriptor (or, while it
+   is stopped, from what this GUI last started it with). Null means "not
+   known", which the cost line says out loud rather than guessing. */
+let policy = null;
+let policySource = "";
+/* Bumped whenever a quote is voided. A quote request that comes back after
+   its generation has been retired is dropped on the floor: without this,
+   two quotes in flight can land out of order and leave the sentence on
+   screen describing an amount the box no longer holds. */
+let quoteSeq = 0;
+/* Set once the operator edits a mint field, so the 4-second poll stops
+   writing the running mint's settings over what they are typing. */
+let settingsEdited = false;
+let settingsInitialised = false;
+
+/* ---------- fetch with a deadline, so nothing can spin forever ---------- */
+async function api(path, body, ms) {
+  const limit = ms || TIMEOUTS.default;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), limit);
+  try {
+    const init = {signal: ctrl.signal, headers: {"Accept": "application/json"}};
+    if (body !== undefined && body !== null) {
+      init.method = "POST";
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, init);
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) {
+      const err = (data && data.error) || {};
+      return {ok: false, reason: err.reason || ("http_" + res.status),
+              detail: err.detail || ("The server answered " + res.status +
+                                     " with no explanation."), data: data};
+    }
+    if (data === null) {
+      return {ok: false, reason: "bad_response",
+              detail: "The server answered with something that is not JSON."};
+    }
+    return {ok: true, data: data};
+  } catch (e) {
+    if (e.name === "AbortError") {
+      return {ok: false, reason: "timeout",
+              detail: "No answer after " + Math.round(limit / 1000) +
+                      " seconds. Nothing is hanging in the background — press " +
+                      "Refresh to see the real state."};
+    }
+    return {ok: false, reason: "unreachable",
+            detail: "Could not reach the GUI server at all (" + e.message +
+                    "). Is app.py still running in your terminal?"};
+  } finally { clearTimeout(timer); }
+}
+
+/* ---------- small helpers ---------- */
+function esc(s) {
+  return String(s === undefined || s === null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function mc(n) {
+  if (n === undefined || n === null || isNaN(n)) return "-";
+  return Number(n).toLocaleString() + " mc";
+}
+/* §7.3, and it must stay identical to impl/aicash/burncalc.compute_burn:
+     burn = 0                                  if sum <= exempt_below_mc
+          = min(cap_mc, sum * rate_ppm // 1e6) otherwise
+   Integer arithmetic, floor division. Returns null when the policy is not
+   known, which every caller has to handle rather than print a zero. */
+function burnFor(sum, p) {
+  if (!p) return null;
+  if (!(sum > 0)) return 0;
+  if (sum <= p.exempt_below_mc) return 0;
+  return Math.min(p.cap_mc, Math.floor((sum * p.rate_ppm) / 1000000));
+}
+/* The policy actually in force, per the MINT's clock (L17: never this
+   browser's). Mirrors channels._policy_from_descriptor. */
+function policyFromDescriptor(d) {
+  if (!d || !d.burn_policy) return null;
+  const now = d.mint_time;
+  const nxt = d.burn_policy_next;
+  if (nxt && nxt.policy && typeof nxt.effective_at === "number" &&
+      typeof now === "number" && now >= nxt.effective_at) return nxt.policy;
+  return d.burn_policy;
+}
+function policyWords(p) {
+  if (!p) return "not known";
+  if (!p.rate_ppm || !p.cap_mc) return "nothing is burned";
+  const pct = p.rate_ppm / 10000;
+  return (Number(pct.toFixed(4)) + "% of each exchange, at most " +
+          mc(p.cap_mc) + ", nothing at or below " + mc(p.exempt_below_mc));
+}
+/* What a payment of `amount` really costs, both halves of it.
+   Pure: no DOM, no fetch. This is the number the operator commits to. */
+function payCost(amount, q, p) {
+  const payBurn = (q && q.burn_mc) || 0;
+  const recvBurn = burnFor(amount, p);
+  return {
+    amount_mc: amount,
+    out_mc: (q && q.inputs_mc !== null && q.inputs_mc !== undefined)
+            ? q.inputs_mc : amount + payBurn,
+    change_mc: (q && q.change_mc) || 0,
+    pay_burn_mc: payBurn,
+    recv_burn_mc: recvBurn,
+    recipient_mc: recvBurn === null ? null : amount - recvBurn,
+    total_burn_mc: recvBurn === null ? null : payBurn + recvBurn
+  };
+}
+/* The sentence under the amount box. Pure, for the same reason. */
+function costSentence(c, who, from) {
+  // A wallet name is printed as the operator typed it; only the generic
+  // stand-in gets capitalised when it opens a sentence.
+  const to = who || "whoever redeems the tokens";
+  const To = who || "Whoever redeems the tokens";
+  let s = "Paying " + mc(c.amount_mc) + " takes " + mc(c.out_mc) + " out of " +
+          (from || "this wallet") +
+          (c.pay_burn_mc ? " (" + mc(c.amount_mc) +
+          " in tokens plus " + mc(c.pay_burn_mc) + " burned on the split)" : "") +
+          (c.change_mc ? ", and " + mc(c.change_mc) + " comes back as change" : "") +
+          ". ";
+  if (c.recv_burn_mc === null) {
+    s += "The mint burns AGAIN when the tokens are redeemed, and this page " +
+         "cannot read the burn policy right now, so " + to + " will get " +
+         "somewhat less than " + mc(c.amount_mc) + ".";
+  } else if (c.recv_burn_mc > 0) {
+    s += "Redeeming them burns " + mc(c.recv_burn_mc) + " more, so " + to +
+         " ends up with " + mc(c.recipient_mc) + ". Burned in total: " +
+         mc(c.total_burn_mc) + ".";
+  } else if (c.pay_burn_mc > 0) {
+    s += "Redeeming them burns nothing more, so " + to + " ends up with " +
+         mc(c.recipient_mc) + ".";
+  } else {
+    s += To + " ends up with the whole " + mc(c.amount_mc) +
+         "; nothing is burned.";
+  }
+  return s;
+}
+function say(el, cls, text) { el.innerHTML = '<div class="' + cls + '">' + esc(text) + '</div>'; }
+function fail(el, r) { say(el, "warn bad", r.detail + "  [" + r.reason + "]"); }
+function when(ms) {
+  if (!ms) return "-";
+  const d = new Date(ms);
+  return isNaN(d.getTime()) ? "-" : d.toLocaleString();
+}
+function since(ms) {
+  if (!ms) return "";
+  let s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  return (h ? h + "h " : "") + (h || m ? m + "m " : "") + s + "s";
+}
+function working(btn, label) {
+  btn.dataset.label = btn.dataset.label || btn.textContent;
+  btn.textContent = label;
+  btn.disabled = true;
+}
+function done(btn) {
+  if (btn.dataset.label) btn.textContent = btn.dataset.label;
+  btn.disabled = false;
+}
+function tokenBlock(tokens, heading, cls) {
+  const text = tokens.join("\n");
+  const id = "tok" + Math.random().toString(36).slice(2, 8);
+  return '<div class="' + cls + '">' + esc(heading) + '</div>' +
+    '<textarea readonly id="' + id + '" style="margin-top:6px">' + esc(text) + '</textarea>' +
+    '<button class="sec small" style="margin-top:8px" onclick="copyFrom(\'' + id + '\',this)">' +
+    'Copy ' + tokens.length + ' token' + (tokens.length === 1 ? '' : 's') + '</button>';
+}
+function copyFrom(id, btn) {
+  const el = $(id);
+  if (!el) return;
+  el.select();
+  const finish = ok => { btn.textContent = ok ? "Copied" : "Select the text and copy it"; };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(el.value).then(() => finish(true), () => finish(false));
+  } else {
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    finish(ok);
+  }
+}
+window.copyFrom = copyFrom;
+
+/* ---------- mint ---------- */
+function renderMint() {
+  const running = !!mint.running;
+  $("hdr-dot").className = "dot" + (running ? "" : " off");
+  $("hdr-state").textContent = running
+    ? (mint.mint_id || "mint") + "  .  " + (mint.base_url || "") +
+      "  .  up " + since(mint.started_at_ms)
+    : "no mint running" + (mint.last_error ? "  .  last error: " + mint.last_error : "");
+  $("stopped-banner").hidden = running;
+  $("m-stats").innerHTML = [
+    ["State", running ? "running" : "stopped"],
+    ["Mint id", mint.mint_id || "-"],
+    ["Port", mint.port || "-"],
+    ["Process", mint.pid || "-"]
+  ].map(p => '<div class="stat"><div class="n">' + esc(p[1]) +
+             '</div><div class="l">' + esc(p[0]) + '</div></div>').join("");
+  $("m-start").disabled = running || busy;
+  $("m-stop").disabled = !running || busy;
+  // Set ONCE, on the first render. This function also runs on the 4-second
+  // poll and inside renderWallets, and mint_id survives a stop, so assigning
+  // it every time slammed the panel shut under the operator's hands — which
+  // is exactly where the burn policy lives.
+  if (!settingsInitialised) {
+    settingsInitialised = true;
+    $("m-settings").open = !running && !mint.mint_id;
+  }
+  for (const id of ["m-id", "m-baseline", "m-port", "m-rate", "m-cap", "m-exempt"]) {
+    $(id).disabled = running;
+  }
+  if (running && mint.mint_id) $("m-id").value = mint.mint_id;
+  if (running && mint.port) $("m-port").value = mint.port;
+  // What this GUI last started a mint with, for the case the descriptor
+  // cannot answer (mint stopped, page reloaded). Without it, Start re-sends
+  // whatever the form happened to default to and silently rewrites the
+  // mint's economics.
+  if (!running && !settingsEdited && mint.last_start) {
+    const s = mint.last_start;
+    const fields = [["m-id", s.mint_id], ["m-baseline", s.baseline_model_class],
+                    ["m-port", s.port], ["m-rate", s.rate_ppm],
+                    ["m-cap", s.cap_mc], ["m-exempt", s.exempt_below_mc]];
+    for (const f of fields) {
+      if (f[1] !== null && f[1] !== undefined) $(f[0]).value = f[1];
+    }
+    if (!policy) {
+      policy = {rate_ppm: s.rate_ppm, cap_mc: s.cap_mc,
+                exempt_below_mc: s.exempt_below_mc};
+      policySource = "what this GUI last started it with";
+    }
+  }
+  renderPolicy(running);
+  $("f-go").disabled = !running || busy;
+  $("w-create").disabled = !running || busy;
+  $("r-go").disabled = !running || busy || !active;
+  $("h-recover").disabled = !running || busy || !active;
+  $("t-go").disabled = !running;
+  $("p-requote").disabled = !running || !active;
+  if (!running) { $("p-go").disabled = true; }
+}
+
+/* The burn policy, in words, outside the collapsed descriptor blob. */
+function renderPolicy(running) {
+  const el = $("m-policy");
+  if (!policy) {
+    el.className = "note";
+    el.textContent = running
+      ? "Burn policy: not read yet."
+      : "No mint has run here yet, so there is no burn policy to show.";
+    return;
+  }
+  const burns = !!(policy.rate_ppm && policy.cap_mc);
+  el.className = burns ? "note bad" : "note";
+  el.textContent = (running ? "Burn policy in force" : "Burn policy last used") +
+    " (" + policySource + "): " + policyWords(policy) +
+    (burns ? ". Every payment is burned twice — on the split and again when " +
+             "the recipient redeems. The cost line in section 3 shows both."
+           : ". A payment moves its whole amount.");
+}
+
+/* The running mint's own settings, written back into the form, so that a
+   Stop followed by a Start cannot quietly change the mint's economics. */
+function applyDescriptor(d) {
+  const p = policyFromDescriptor(d);
+  if (!p) return;
+  policy = p;
+  policySource = "from the mint's descriptor";
+  if (d.mint_id) $("m-id").value = d.mint_id;
+  if (d.baseline_model_class) $("m-baseline").value = d.baseline_model_class;
+  $("m-rate").value = p.rate_ppm;
+  $("m-cap").value = p.cap_mc;
+  $("m-exempt").value = p.exempt_below_mc;
+  settingsEdited = false;
+  renderPolicy(!!mint.running);
+}
+
+async function refreshMint() {
+  const r = await api("/api/mint/status");
+  if (!r.ok) {
+    mint = {running: false, last_error: r.detail};
+    if (r.reason === "gui_incomplete" || r.reason === "component_error") {
+      $("fatal-banner").hidden = false;
+      $("fatal-banner").textContent = r.detail;
+    }
+    renderMint();
+    return;
+  }
+  $("fatal-banner").hidden = true;
+  mint = r.data;
+  renderMint();
+  if (mint.running) { refreshDescriptor(); if ($("m-logbox").open) refreshLogs(); }
+  else { $("m-desc").textContent = "not running"; }
+}
+
+async function refreshDescriptor() {
+  const r = await api("/api/mint/descriptor");
+  $("m-desc").textContent = r.ok ? JSON.stringify(r.data, null, 2)
+                                 : r.detail + "  [" + r.reason + "]";
+  if (r.ok) applyDescriptor(r.data);
+}
+
+async function refreshLogs() {
+  const r = await api("/api/mint/logs?lines=200");
+  if (!r.ok) { $("m-logs").textContent = r.detail + "  [" + r.reason + "]"; return; }
+  const lines = (r.data.lines || []);
+  $("m-logs").textContent = lines.length ? lines.join("\n") : "(log is empty)";
+  $("m-logs").scrollTop = $("m-logs").scrollHeight;
+}
+
+async function startMint() {
+  const body = {
+    mint_id: $("m-id").value.trim(),
+    baseline_model_class: $("m-baseline").value.trim(),
+    port: parseInt($("m-port").value, 10),
+    rate_ppm: parseInt($("m-rate").value, 10),
+    cap_mc: parseInt($("m-cap").value, 10),
+    exempt_below_mc: parseInt($("m-exempt").value, 10)
+  };
+  busy = true; working($("m-start"), "starting...");
+  say($("m-msg"), "note", "Starting the mint and waiting for it to answer...");
+  const r = await api("/api/mint/start", body, TIMEOUTS.start);
+  busy = false; done($("m-start"));
+  if (!r.ok) { fail($("m-msg"), r); } else { say($("m-msg"), "note ok", "Mint is up."); }
+  await refreshAll();
+}
+
+async function stopMint() {
+  busy = true; working($("m-stop"), "stopping...");
+  const r = await api("/api/mint/stop", {drain_seconds: 10}, TIMEOUTS.stop);
+  busy = false; done($("m-stop"));
+  if (!r.ok) { fail($("m-msg"), r); } else { say($("m-msg"), "note", "Mint stopped."); }
+  await refreshAll();
+}
+
+/* ---------- funding ---------- */
+async function issueInto() {
+  const name = $("f-wallet").value;
+  const amount = parseInt($("f-amount").value, 10);
+  const count = parseInt($("f-count").value, 10);
+  if (!name) { say($("f-out"), "warn bad", "Create a wallet first (section 2)."); return; }
+  busy = true; working($("f-go"), "issuing...");
+  const r = await api("/api/mint/issue", {amount_mc: amount, count: count});
+  if (!r.ok) { busy = false; done($("f-go")); fail($("f-out"), r); return; }
+  const tokens = r.data.tokens || [];
+  working($("f-go"), "crediting " + name + "...");
+  const got = await api("/api/wallet/receive", {name: name, tokens: tokens});
+  busy = false; done($("f-go"));
+  if (!got.ok) {
+    // The mint stores hashes, never secrets: an issued token that is not shown
+    // here is money nobody can ever spend. So show it, loudly.
+    $("f-out").innerHTML = '<div class="warn bad">The money was created but ' +
+      esc(name) + ' did not take it (' + esc(got.reason) + ' - ' + esc(got.detail) +
+      '). These token strings are the ONLY copy. Save them, then paste them into ' +
+      'Receive below.</div>' + tokenBlock(tokens, "", "warn bad");
+    return;
+  }
+  const rej = got.data.rejected || [];
+  // Issuing creates the full amount; redeeming it into the wallet is an
+  // exchange like any other, so the wallet is credited NET of that burn.
+  const created = r.data.total_mc;
+  const burned = (typeof created === "number" && !rej.length)
+    ? created - got.data.accepted_mc : null;
+  $("f-out").innerHTML = '<div class="warn ok">Created ' + esc(mc(created)) +
+    (burned ? ' and burned ' + esc(mc(burned)) + ' when ' + esc(name) +
+              ' redeemed it' : '') +
+    ': credited ' + esc(mc(got.data.accepted_mc)) + ' to ' + esc(name) +
+    '. Balance now ' + esc(mc(got.data.balance_mc)) + '.</div>' +
+    (rej.length ? '<div class="warn bad">' + rej.length +
+      ' token(s) rejected: ' + esc(rej.map(x => x.reason).join(", ")) + '</div>' +
+      tokenBlock(rej.map(x => x.token), "Rejected tokens:", "note") : "");
+  await refreshWallets();
+}
+
+/* ---------- wallets ---------- */
+function renderWallets() {
+  const list = $("w-list");
+  if (!wallets.length) {
+    list.innerHTML = '<div class="note">No wallets yet. Create two — say ' +
+      '<b>alice</b> and <b>bob</b> — then fund one above and pay the other below.</div>';
+  } else {
+    list.innerHTML = wallets.map(w => {
+      const bal = w.balance_mc === null || w.balance_mc === undefined
+        ? (w.error ? "unreadable" : "?") : mc(w.balance_mc);
+      const tag = w.error ? '<span class="tag bad">' + esc(w.error.slice(0, 60)) + '</span>'
+        : (w.connected ? "" : '<span class="tag">last known</span>');
+      return '<div class="wallet' + (w.name === active ? " active" : "") +
+        '" data-name="' + esc(w.name) + '"><span class="nm">' + esc(w.name) +
+        '</span>' + tag + '<span class="bal">' + esc(bal) + '</span></div>';
+    }).join("");
+    for (const el of list.querySelectorAll(".wallet")) {
+      el.addEventListener("click", () => setActive(el.dataset.name));
+    }
+  }
+  const names = wallets.map(w => w.name);
+  if (active && names.indexOf(active) < 0) active = null;
+  if (!active && names.length) active = names[0];
+  fillSelect($("f-wallet"), names, active);
+  const payTargets = [["", "-- just make token strings --"]].concat(
+    names.filter(n => n !== active).map(n => [n, "wallet: " + n]));
+  fillSelect2($("p-to"), payTargets);
+  const me = wallets.filter(w => w.name === active)[0];
+  $("active-name").textContent = active || "none";
+  $("active-balance").textContent = me ? mc(me.balance_mc) : "-";
+  renderMint();
+}
+function fillSelect(sel, names, chosen) {
+  const keep = sel.value;
+  sel.innerHTML = names.map(n => '<option value="' + esc(n) + '">' + esc(n) +
+    '</option>').join("");
+  if (names.indexOf(keep) >= 0) sel.value = keep;
+  else if (chosen && names.indexOf(chosen) >= 0) sel.value = chosen;
+}
+function fillSelect2(sel, pairs) {
+  const keep = sel.value;
+  sel.innerHTML = pairs.map(p => '<option value="' + esc(p[0]) + '">' + esc(p[1]) +
+    '</option>').join("");
+  if (pairs.some(p => p[0] === keep)) sel.value = keep;
+}
+function setActive(name) {
+  active = name;
+  try { localStorage.setItem("aicash-active", name); } catch (e) {}
+  renderWallets();
+  refreshHistory();
+  scheduleQuote();
+}
+async function refreshWallets() {
+  const r = await api("/api/wallet/list");
+  if (!r.ok) { fail($("w-msg"), r); return; }
+  wallets = r.data.wallets || [];
+  $("wallets-dir").textContent = r.data.dir || "the workdir";
+  renderWallets();
+}
+async function createWallet() {
+  const name = $("w-name").value.trim();
+  if (!name) { say($("w-msg"), "warn bad", "Give the wallet a name first."); return; }
+  busy = true; working($("w-create"), "creating...");
+  const r = await api("/api/wallet/create", {name: name});
+  busy = false; done($("w-create"));
+  if (!r.ok) { fail($("w-msg"), r); return; }
+  say($("w-msg"), "note ok", "Created " + name + ".");
+  $("w-name").value = "";
+  await refreshWallets();
+  setActive(name);
+}
+
+/* ---------- pay ---------- */
+/* Invalidate FIRST, debounce second. The quote is what the operator is
+   agreeing to, so the moment the amount or the recipient changes, the old
+   quote is void and Pay is dead — not 350 ms later, when a fast click has
+   already sent an amount nobody was shown. */
+function invalidateQuote() {
+  quoteSeq++;
+  lastQuote = null;
+  $("p-go").disabled = true;
+  $("p-go").textContent = "Pay";
+  $("p-go").dataset.label = "Pay";
+}
+function scheduleQuote() {
+  invalidateQuote();
+  $("p-quote").innerHTML = '<div class="note">checking the cost...</div>';
+  clearTimeout(quoteTimer);
+  quoteTimer = setTimeout(refreshQuote, 350);
+}
+async function refreshQuote() {
+  clearTimeout(quoteTimer);
+  invalidateQuote();
+  const seq = quoteSeq;
+  const stale = () => seq !== quoteSeq;
+  const amount = parseInt($("p-amount").value, 10);
+  if (!active) { say($("p-quote"), "note", "Pick an active wallet first."); return; }
+  if (!mint.running) { say($("p-quote"), "note", "The mint is stopped."); return; }
+  if (!(amount > 0)) { say($("p-quote"), "note", "Enter an amount above zero."); return; }
+  $("p-quote").innerHTML = '<div class="note">checking...</div>';
+  const r = await api("/api/wallet/quote", {name: active, amount_mc: amount});
+  if (stale()) return;                 // the operator moved on while we asked
+  if (!r.ok) {
+    $("p-quote").innerHTML = '<div class="warn bad">Cannot pay ' + esc(mc(amount)) +
+      ': ' + esc(r.detail) + '</div>';
+    return;
+  }
+  // The mint is the authority on the burn; if the descriptor has not been
+  // read yet, read it now rather than print a cost that is only half of one.
+  if (!policy) await refreshDescriptor();
+  if (stale()) return;
+  const to = $("p-to").value;
+  const cost = payCost(amount, r.data, policy);
+  // A quote is only valid for the amount and wallet it was asked about.
+  lastQuote = {name: active, to: to, amount_mc: amount, cost: cost};
+  const heavy = cost.total_burn_mc === null || cost.total_burn_mc > 0;
+  $("p-quote").innerHTML = '<div class="note' + (heavy ? " bad" : "") + '">' +
+    esc(costSentence(cost, to, active)) + '</div>';
+  $("p-go").textContent = "Pay " + mc(amount) +
+    (to ? " to " + to : " (tokens only)") +
+    (cost.recipient_mc !== null && cost.recipient_mc !== amount
+       ? " \u2014 they get " + mc(cost.recipient_mc) : "");
+  $("p-go").dataset.label = $("p-go").textContent;
+  $("p-go").disabled = busy;
+}
+
+async function payNow() {
+  // The amount comes from the QUOTE, never from the input box: the box can
+  // have changed since the quote was shown, and money must only ever move
+  // in the amount the operator was actually shown and the button named.
+  const q = lastQuote;
+  const typed = parseInt($("p-amount").value, 10);
+  const to = $("p-to").value;
+  if (!q || q.name !== active) {
+    invalidateQuote();
+    say($("p-out"), "warn bad",
+        "Nothing was paid: there is no current cost estimate. Press " +
+        "Re-check cost.");
+    scheduleQuote();
+    return;
+  }
+  if (typed !== q.amount_mc || to !== q.to) {
+    invalidateQuote();
+    say($("p-out"), "warn bad",
+        "Nothing was paid: the amount or the recipient changed after that " +
+        "estimate was shown. The new cost is being checked — read it, then " +
+        "press Pay again.");
+    scheduleQuote();
+    return;
+  }
+  const amount = q.amount_mc;
+  if (!active || !(amount > 0)) return;
+  busy = true; working($("p-go"), "paying...");
+  const r = await api("/api/wallet/pay", {name: active, amount_mc: amount});
+  if (!r.ok) { busy = false; done($("p-go")); fail($("p-out"), r); await refreshWallets(); return; }
+  const tokens = r.data.tokens || [];
+  const spent = '<div class="note ok">' + esc(active) + ' paid ' +
+    esc(mc(r.data.amount_mc)) + '; its balance is now ' + esc(mc(r.data.balance_mc)) + '.</div>';
+  if (!to) {
+    $("p-out").innerHTML = spent +
+      tokenBlock(tokens, "These token strings ARE the money. Anyone holding one " +
+                 "can spend it, and this is the only copy.", "warn");
+    busy = false; done($("p-go"));
+    await refreshWallets(); await refreshHistory(); return;
+  }
+  working($("p-go"), "delivering to " + to + "...");
+  const got = await api("/api/wallet/receive", {name: to, tokens: tokens});
+  busy = false; done($("p-go"));
+  if (!got.ok) {
+    $("p-out").innerHTML = spent +
+      '<div class="warn bad">' + esc(to) + ' did not take the payment (' +
+      esc(got.reason) + ' - ' + esc(got.detail) + '). The money is NOT lost, but ' +
+      'these strings are the only copy of it — save them and paste them into ' +
+      'Receive.</div>' + tokenBlock(tokens, "", "warn bad");
+  } else {
+    const rej = got.data.rejected || [];
+    // The estimate promised a figure; say so if reality disagreed, rather
+    // than print the new number as if it had always been the plan.
+    const promised = q.cost.recipient_mc;
+    const mismatch = (promised !== null && promised !== undefined &&
+                      got.data.accepted_mc !== promised && !rej.length)
+      ? '<div class="warn bad">That is not what the cost line said (' +
+        esc(mc(promised)) + '). The mint\'s burn policy must have changed ' +
+        'between the estimate and the payment.</div>' : '';
+    $("p-out").innerHTML = spent + '<div class="note ok">' + esc(to) + ' received ' +
+      esc(mc(got.data.accepted_mc)) + ' and now holds ' + esc(mc(got.data.balance_mc)) +
+      '.</div>' + mismatch + (rej.length ? '<div class="warn bad">' + rej.length +
+      ' token(s) rejected: ' + esc(rej.map(x => x.reason + " " + x.detail).join("; ")) +
+      '</div>' + tokenBlock(rej.map(x => x.token), "Rejected:", "note") : "");
+  }
+  await refreshWallets(); await refreshHistory(); refreshQuote();
+}
+
+/* ---------- receive ---------- */
+async function receiveNow() {
+  const tokens = $("r-tokens").value.split(/\s+/).map(s => s.trim()).filter(s => s);
+  if (!active) { say($("r-out"), "warn bad", "Pick an active wallet first."); return; }
+  if (!tokens.length) { say($("r-out"), "warn bad", "Paste at least one token."); return; }
+  busy = true; working($("r-go"), "receiving...");
+  const r = await api("/api/wallet/receive", {name: active, tokens: tokens});
+  busy = false; done($("r-go"));
+  if (!r.ok) { fail($("r-out"), r); return; }
+  const rej = r.data.rejected || [];
+  // Green means money arrived. Nothing arriving is a failure, whatever the
+  // reasons underneath say, and a partial take is not a clean success either.
+  const took = r.data.accepted || 0;
+  const cls = took === 0 ? "warn bad" : (rej.length ? "note bad" : "note ok");
+  let html = '<div class="' + cls + '">' +
+    (took === 0 ? 'Took NONE of ' + tokens.length + ' token(s)'
+                : 'Took ' + esc(took) + ' of ' + tokens.length +
+                  ' token(s), worth ' + esc(mc(r.data.accepted_mc))) +
+    '. Balance now ' + esc(mc(r.data.balance_mc)) + '.</div>';
+  if (rej.length) {
+    html += '<table><thead><tr><th>Rejected token</th><th>Why</th></tr></thead><tbody>' +
+      rej.map(x => '<tr><td style="font-family:var(--mono);font-size:11px">' +
+        esc(x.token) + '</td><td class="bad">' + esc(x.reason) +
+        (x.detail ? ' - ' + esc(x.detail) : '') + '</td></tr>').join("") +
+      '</tbody></table>';
+  }
+  $("r-out").innerHTML = html;
+  if (!rej.length) $("r-tokens").value = "";
+  await refreshWallets(); await refreshHistory();
+}
+
+/* ---------- history ---------- */
+async function refreshHistory() {
+  const body = $("h-body");
+  if (!active) { body.innerHTML = '<tr><td colspan="4">No active wallet.</td></tr>'; return; }
+  const r = await api("/api/wallet/history?limit=50&name=" + encodeURIComponent(active));
+  if (!r.ok) {
+    body.innerHTML = '<tr><td colspan="4" class="bad">' + esc(r.detail) +
+      '  [' + esc(r.reason) + ']</td></tr>';
+    return;
+  }
+  const rows = r.data.history || [];
+  // The wallet's own schema stores no timestamps, so walletops cannot invent
+  // them. Say that once, rather than print a column of 1970s.
+  if (rows.length && rows.every(h => !h.ts_ms)) {
+    say($("h-out"), "note", "This wallet's database does not record when each " +
+        "entry happened, so the When column is blank. The order is newest first.");
+  }
+  body.innerHTML = rows.length ? rows.map(h =>
+    '<tr><td>' + esc(when(h.ts_ms)) + '</td><td>' + esc(h.kind) +
+    '</td><td class="num">' + esc(h.amount_mc === null ? "-" : mc(h.amount_mc)) +
+    '</td><td class="note" style="margin:0">' + esc(h.detail) + '</td></tr>').join("")
+    : '<tr><td colspan="4">Nothing yet.</td></tr>';
+}
+async function recoverNow() {
+  busy = true; working($("h-recover"), "recovering...");
+  const r = await api("/api/wallet/recover", {name: active});
+  busy = false; done($("h-recover"));
+  if (!r.ok) { fail($("h-out"), r); return; }
+  say($("h-out"), "note ok", "Recovery done. Balance " + mc(r.data.balance_mc) +
+      ". " + JSON.stringify(r.data.result));
+  await refreshWallets(); await refreshHistory();
+}
+
+/* ---------- token lookup ---------- */
+async function lookupToken() {
+  const q = $("t-q").value.trim();
+  if (!q) { say($("t-out"), "warn bad", "Paste a token or ledger key."); return; }
+  working($("t-go"), "checking...");
+  const r = await api("/api/token/status?token=" + encodeURIComponent(q));
+  done($("t-go"));
+  if (!r.ok) { fail($("t-out"), r); return; }
+  $("t-out").innerHTML = '<pre>' + esc(JSON.stringify(r.data.result || r.data.raw, null, 2)) +
+    '</pre>';
+}
+
+/* ---------- wiring ---------- */
+async function refreshAll() { await refreshMint(); await refreshWallets(); await refreshHistory(); }
+$("m-start").addEventListener("click", startMint);
+$("m-stop").addEventListener("click", stopMint);
+$("m-refresh").addEventListener("click", refreshAll);
+$("m-logs-refresh").addEventListener("click", refreshLogs);
+$("m-logbox").addEventListener("toggle", () => { if ($("m-logbox").open) refreshLogs(); });
+$("f-go").addEventListener("click", issueInto);
+$("w-create").addEventListener("click", createWallet);
+$("w-name").addEventListener("keydown", e => { if (e.key === "Enter") createWallet(); });
+$("p-amount").addEventListener("input", scheduleQuote);
+$("p-to").addEventListener("change", scheduleQuote);
+for (const id of ["m-id", "m-baseline", "m-port", "m-rate", "m-cap", "m-exempt"]) {
+  $(id).addEventListener("input", () => { settingsEdited = true; });
+}
+$("p-requote").addEventListener("click", refreshQuote);
+$("p-go").addEventListener("click", payNow);
+$("r-go").addEventListener("click", receiveNow);
+$("h-refresh").addEventListener("click", refreshHistory);
+$("h-recover").addEventListener("click", recoverNow);
+$("t-go").addEventListener("click", lookupToken);
+
+refreshAll().then(refreshQuote);
+setInterval(() => { if (!busy) { refreshMint(); refreshWallets(); } }, 4000);
+setInterval(() => { if (mint.running) $("hdr-state").textContent =
+  (mint.mint_id || "mint") + "  .  " + (mint.base_url || "") + "  .  up " +
+  since(mint.started_at_ms); }, 1000);
+</script></body></html>

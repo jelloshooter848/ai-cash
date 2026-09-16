@@ -21,6 +21,7 @@ import time
 import unittest
 from typing import NamedTuple
 
+from aicash import mintapi
 from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger
@@ -30,7 +31,9 @@ from aicash.mintapi import (
     MAX_REQUEST_SECONDS,
     MintConfig,
     MintServer,
+    _FAT_ENTRY_BYTES,
     _Handler,
+    _max_batch_ceiling,
 )
 from aicash.signing import generate_keypair, verify_obj
 from aicash.tokencodec import (
@@ -1928,3 +1931,297 @@ class DeploymentHardeningTest(unittest.TestCase):
         # Exactly one answer came back: the smuggled line was never served.
         self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
         self.assertNotIn(b"smuggled", raw)
+
+
+class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
+    """max_batch is PUBLISHED; MAX_BODY_BYTES is not — so they must agree.
+
+    §3.6's `limits.max_batch` is a promise: a caller may send that many
+    entries. MAX_BODY_BYTES is a deployment bound that is deliberately NOT
+    published (that object's scope guard is explicit), and a body over it is
+    refused with `bad_format`, which §9.5 pins as PERMANENT. A config whose
+    published limit its own byte cap cannot carry therefore advertises a
+    batch size whose maximal call always fails, with a reason that tells the
+    payer never to retry it — nothing a conforming client can do about it.
+    (Entries smaller than the allowance still get through at such a
+    max_batch, which is what made the mismatch silent: the published limit
+    is not unusable, only unreachable at the entry size it promises.) The
+    two numbers were never cross-checked; max_batch=8000 was accepted
+    silently.
+    """
+
+    def make_config(self, **kw):
+        priv, pub = generate_keypair()
+        return MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            **kw,
+        )
+
+    # -- the fattest LEGAL entry, built and measured, not assumed ---------
+
+    @staticmethod
+    def big() -> str:
+        """43 characters of b64u: the length every §3.3 hash field has."""
+        return b64u_encode(b"\xff" * 32)
+
+    @classmethod
+    def fat_output(cls) -> dict:
+        """The fattest §3.3 output a conforming caller sends.
+
+        Every field at the longest the spec's own shapes make it: a
+        19-digit amount (the largest that fits a signed 64-bit int, which
+        is as far as any real balance goes), a 43-character b64u
+        secret_hash and a §3.4 lock whose two hashes are also 43
+        characters with a 13-digit expiry. NOT the largest string §3.1
+        will parse — see test_an_entry_the_mint_parses_can_exceed_the
+        _allowance for that.
+        """
+        big = cls.big()
+        return {
+            "amount_mc": 9_223_372_036_854_775_807,
+            "secret_hash": big,
+            "lock": {
+                "preimage_hash": big,
+                "expiry": 9_999_999_999_999,
+                "refund_hash": big,
+            },
+        }
+
+    @staticmethod
+    def fat_input() -> dict:
+        """The fattest §3.3 input a conforming caller sends: a claim form
+        whose token carries a 64-character mint_id (the §3.1 maximum)."""
+        return {
+            "token": format_token(
+                "m" * 64, 9_223_372_036_854_775_807, b"\xff" * 32
+            ),
+            "witness": b64u_encode(b"\xff" * 32),
+        }
+
+    def start_mint(self, max_batch: int) -> int:
+        """A real mint at `max_batch`, bound to a port. Returns the port."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            os.path.join(tmp.name, "ledger.sqlite3"),
+            FakeClock(T0),
+            POLICY,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            max_batch=max_batch,
+            max_lock_expiry_ms=30 * DAY_MS,
+            recovery_window_ms=90 * DAY_MS,
+        )
+        server = MintServer(config, ledger)
+        port = server.start()
+        self.addCleanup(server.stop)
+        return port
+
+    def fat_body(self, entries: int) -> dict:
+        """A whole request at `entries` entries, all of them the fattest
+        conforming kind, with the longest idempotency key this mint
+        accepts."""
+        return {
+            "idempotency_key": "k" * MAX_IDEMPOTENCY_KEY_LEN,
+            "inputs": [],
+            "outputs": [self.fat_output()] * entries,
+        }
+
+    def test_the_per_entry_allowance_is_not_smaller_than_a_real_entry(self):
+        """_FAT_ENTRY_BYTES must cover the fattest entry a CONFORMING caller
+        sends — every §3.3 field at the longest the spec's own shapes make
+        it, including the whitespace json.dumps adds by default, since
+        nothing obliges a caller to post canonical JSON.
+
+        Deliberately NOT a claim that the allowance bounds every entry the
+        mint will parse: it does not, and the next test sends one that
+        breaks it. What this pins is the direction that would make the
+        ceiling arithmetic dishonest in the ordinary case — an allowance
+        retuned BELOW a real, spec-shaped entry.
+        """
+        for name, entry in (
+            ("locked output", self.fat_output()),
+            ("claim input", self.fat_input()),
+        ):
+            with self.subTest(entry=name):
+                self.assertLessEqual(
+                    len(canonical_json(entry)), _FAT_ENTRY_BYTES
+                )
+                self.assertLessEqual(
+                    len(json.dumps(entry).encode("utf-8")), _FAT_ENTRY_BYTES
+                )
+
+    def test_an_entry_the_mint_parses_can_exceed_the_allowance(self):
+        """The known hole in the allowance, pinned so it cannot be quietly
+        forgotten or quietly claimed shut.
+
+        §3.1 pins an amount's FORM but not its LENGTH, so an output with a
+        1000-digit amount is an entry the mint READS — it answers
+        `amount_mismatch`, a call-level arithmetic complaint, not the
+        `bad_format` it gives an entry it cannot parse — at nearly 3x
+        _FAT_ENTRY_BYTES. So max_batch entries of this shape still exceed
+        the body cap at a max_batch the ceiling admits: the cross-check
+        narrows that, it does not close it. Closing it needs an amount
+        length bound in C01, which is protocol, not deployment config.
+        If that bound ever lands, this test fails and _FAT_ENTRY_BYTES can
+        be promoted from an allowance to a real upper bound.
+        """
+        entry = {"amount_mc": int("9" * 1000), "secret_hash": self.big()}
+        self.assertGreater(len(canonical_json(entry)), _FAT_ENTRY_BYTES)
+        port = self.start_mint(max_batch=256)
+        status, body, _ = http_json(
+            port,
+            "POST",
+            "/v3/exchange",
+            {
+                "idempotency_key": "fat-amount",
+                "inputs": [],
+                "outputs": [entry],
+            },
+        )
+        self.assertEqual(status, 400, body)
+        reasons = {e["reason"] for e in body["errors"]}
+        # Parsed, and complained about the ARITHMETIC: a bad_format here
+        # would mean the mint rejects the shape and the entry is not one a
+        # caller can actually put in a body.
+        self.assertEqual(reasons, {"amount_mismatch"}, body)
+
+    def test_the_largest_accepted_max_batch_actually_fits(self):
+        """The ceiling is not merely arithmetic: a real request at exactly
+        the largest accepted max_batch, every entry the fattest conforming
+        one, is SENT to a real mint at that max_batch and must be read and
+        enumerated — not refused whole for its size.
+
+        An over-size body comes back as one call-level `bad_format` with a
+        null index (``_read_json`` refuses before parsing). Per-index
+        output errors can only be produced by a body the mint actually
+        read, which is the property the arithmetic is claiming.
+        """
+        ceiling = _max_batch_ceiling()
+        config = self.make_config(max_batch=ceiling)  # must not raise
+        self.assertEqual(config.max_batch, ceiling)
+        body = self.fat_body(ceiling)
+        self.assertLessEqual(len(canonical_json(body)), MAX_BODY_BYTES)
+        wire = json.dumps(body).encode("utf-8")  # the fatter, realistic form
+        self.assertLessEqual(len(wire), MAX_BODY_BYTES)
+
+        port = self.start_mint(max_batch=ceiling)
+        status, answer, _ = http_raw(
+            port,
+            "POST",
+            "/v3/exchange",
+            wire,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400, answer[:200])
+        parsed = json.loads(answer.decode("utf-8"))
+        errors = parsed["errors"]
+        # Every entry was reached and answered about individually: the body
+        # was read in full, which is what "it fits" means here.
+        enumerated = [e for e in errors if e["index"] is not None]
+        self.assertEqual(
+            [e["index"] for e in enumerated], list(range(ceiling))
+        )
+        self.assertEqual({e["kind"] for e in enumerated}, {"output"})
+        # ...and NOT the call-level, null-index bad_format _read_json gives
+        # a body it refuses on size, which is the failure under test.
+        self.assertNotIn(
+            ("call", "bad_format"),
+            {(e["kind"], e["reason"]) for e in errors},
+            errors[-1],
+        )
+
+    def test_max_batch_past_the_body_cap_is_refused_at_construction(self):
+        """The gate's measured case: max_batch=8000 used to construct
+        silently, and a maximal spec-shaped call at that published limit
+        measures ~1.9 MB against a 1 MiB cap. The mint must refuse to boot
+        rather than publish a limit whose maximal call it always rejects.
+
+        The message must quote the BUDGET it actually refused on — the
+        allowance arithmetic — and that budget must not be under the real
+        body it is standing in for.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.make_config(max_batch=8000)
+        message = str(caught.exception)
+        worst = len(canonical_json(self.fat_body(8000)))
+        self.assertGreater(worst, MAX_BODY_BYTES)  # the premise, measured
+        self.assertIn("max_batch", message)
+        self.assertIn("8000", message)
+        # Both numbers, so the operator can see the gap without reading code.
+        self.assertIn(str(MAX_BODY_BYTES), message)
+        self.assertRegex(message, r"about [0-9]+ bytes")
+        # ...and the budget it quotes is not below a real maximal body (it
+        # is an allowance, so it is above; what would be dishonest is a
+        # figure smaller than the thing it stands for).
+        stated = int(re.search(r"about ([0-9]+) bytes", message).group(1))
+        self.assertGreaterEqual(stated, worst)
+        # ...and it says what to do about it, both ways out.
+        self.assertIn("Lower max_batch", message)
+        self.assertIn("MAX_BODY_BYTES", message)
+        self.assertIn(str(_max_batch_ceiling()), message)
+
+    def test_the_boundary_is_exact(self):
+        """One past the ceiling is refused; the ceiling itself is not."""
+        ceiling = _max_batch_ceiling()
+        self.make_config(max_batch=ceiling)
+        with self.assertRaises(ValueError):
+            self.make_config(max_batch=ceiling + 1)
+
+    def test_the_shipped_default_still_constructs(self):
+        """A config that boots today must keep booting: the refusal is aimed
+        at limits the cap cannot carry, not at the shipped mint."""
+        config = self.make_config()
+        self.assertEqual(config.max_batch, 256)  # the shipped default
+        self.assertEqual(MintConfig.max_batch, 256)  # ...on the dataclass too
+        # And the default is not marginal. Measured against real bytes,
+        # not restated from the two constants the ceiling is made of: four
+        # maximal calls at the shipped max_batch still fit in one body.
+        biggest = len(json.dumps(self.fat_body(256)).encode("utf-8"))
+        self.assertLess(biggest * 4, MAX_BODY_BYTES)
+
+    def test_the_ceiling_follows_a_retuned_body_cap(self):
+        """The refusal has to be validated against the cap the SERVER will
+        enforce, which is the live module global — ``_read_json`` reads it
+        per request.
+
+        Binding it in a default argument (``body_cap: int = MAX_BODY_BYTES``)
+        froze it at import, so an operator who followed the message's own
+        second remedy — raise MAX_BODY_BYTES — got the same refusal, now
+        printing the raised cap and the requirement as the SAME number and
+        still refusing, while the reader enforced one cap and the config
+        check enforced another. This drives the remedy the message prints.
+        """
+        original = mintapi.MAX_BODY_BYTES
+        self.addCleanup(setattr, mintapi, "MAX_BODY_BYTES", original)
+        with self.assertRaises(ValueError) as caught:
+            self.make_config(max_batch=8000)
+        wanted = int(
+            re.search(
+                r"raise MAX_BODY_BYTES to at least ([0-9]+)",
+                str(caught.exception),
+            ).group(1)
+        )
+        # Do exactly what the operator was told to do, and no more.
+        mintapi.MAX_BODY_BYTES = wanted
+        self.assertEqual(_max_batch_ceiling(), 8000)
+        config = self.make_config(max_batch=8000)  # must not raise
+        self.assertEqual(config.max_batch, 8000)
+        # ...and the ceiling is still a ceiling at the new cap.
+        with self.assertRaises(ValueError):
+            self.make_config(max_batch=8001)
+        # The other remedy the message prints works at the untouched cap.
+        mintapi.MAX_BODY_BYTES = original
+        self.assertEqual(self.make_config(max_batch=2728).max_batch, 2728)

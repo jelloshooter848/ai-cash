@@ -17,7 +17,13 @@ class MintConfig:
     signing_public: bytes              # 32 raw bytes
     denominations_mc: tuple[int, ...] = (1, 10, 100, 1_000, 10_000, 100_000)
     burn_policy_next: tuple[BurnPolicy, int] | None = None   # (policy, effective_at_ms) — §7.3 notice
-    max_batch: int = 256
+    max_batch: int = 256               # published as limits.max_batch, so it MUST fit the
+                                       # server's request-body cap: __post_init__ raises
+                                       # ValueError above mintapi._max_batch_ceiling()
+                                       # (2728 at the shipped 1 MiB MAX_BODY_BYTES): above it
+                                       # the mint would publish a limit whose maximal call its
+                                       # own body cap always refuses with bad_format — PERMANENT
+                                       # under §9.5, so no conforming caller could recover
     anonymous_rate: dict = {"per_caller_rps": 50, "burst": 200}   # published, not enforced (L17)
     registered_rate: dict = {"per_caller_rps": 50, "burst": 200}
     grace_ms: int = 5_000

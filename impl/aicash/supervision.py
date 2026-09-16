@@ -53,12 +53,14 @@ Design notes
   request body or an untimed socket costs the mint memory or a parked
   thread. ``_MAX_BODY_BYTES`` is checked against Content-Length before
   anything is read, and ``_SupHandler.timeout`` bounds how long one
-  connection may stall or idle. Both are local copies of the guard C06's
-  handler carries: C10 must not silently lose its bound if C06's changes
-  (L17 leaves rate limiting and TLS out of the reference build, so these
-  two caps are all there is). An over-size body is refused with the
-  existing ``bad_format`` rejection — no new error vocabulary. The cap
-  lives on a C10-private reader (``_read_sup_json``), never as an
+  connection may stall or idle. Both are enforced by C10's own code, but
+  the byte cap is no longer a second number: it is DERIVED at import from
+  C06's ``MAX_BODY_BYTES``, since two hand-written copies were equal only
+  by coincidence and nothing kept them that way (L17 leaves rate limiting
+  and TLS out of the reference build, so these two caps are all there
+  is). An over-size body is refused with the existing ``bad_format``
+  rejection — no new error vocabulary. The cap lives on a C10-private
+  reader (``_read_sup_json``), never as an
   override of C06's ``_read_json``: the inherited Layer 0 routes must
   keep answering exactly as a plain C06 mint does (L13/B9), including
   C06's own choice of §3.8 reason for a body it refuses.
@@ -82,7 +84,13 @@ import urllib.parse
 from aicash.burncalc import compute_burn
 from aicash.ledgerstore import ExchangeRejected, Ledger, OutputSpec
 from aicash.lockeval import InputForm
-from aicash.mintapi import MintConfig, MintServer, _Handler, _MintHTTPServer
+from aicash.mintapi import (
+    MAX_BODY_BYTES,
+    MintConfig,
+    MintServer,
+    _Handler,
+    _MintHTTPServer,
+)
 from aicash.signing import attach_sig
 from aicash.tokencodec import (
     Token,
@@ -1240,13 +1248,24 @@ class _SupHTTPServer(_MintHTTPServer):
 #: of service: one request would otherwise make the mint allocate an
 #: arbitrary amount of memory. The largest legitimate supervision body is
 #: a deposit's token list (a few hundred bytes per token), so 1 MiB is
-#: orders of magnitude of headroom. Deliberately a local copy: C06's
-#: handler carries its own guard and the two servers stay uncoupled; L17
-#: keeps rate limiting out of the reference build, so this cap is the
-#: only bound on what a single supervision request can ask the mint to
-#: allocate. It bounds C10's routes only — Layer 0 keeps C06's bound and
-#: C06's refusal, byte for byte (L13/B9).
-_MAX_BODY_BYTES = 1 << 20
+#: orders of magnitude of headroom. Enforced by C10's own reader on C10's
+#: own routes; L17 keeps rate limiting out of the reference build, so this
+#: cap is the only bound on what a single supervision request can ask the
+#: mint to allocate. It bounds C10's routes only — Layer 0 keeps C06's
+#: bound and C06's refusal, byte for byte (L13/B9).
+#:
+#: DERIVED from C06's ``MAX_BODY_BYTES`` rather than written out again: the
+#: two were equal only by coincidence (``1 << 20`` here, ``1_048_576``
+#: there) and nothing made them stay equal, so retuning one would have moved
+#: the supervision routes' cap away from Layer 0's without a single test
+#: noticing. Binding the value at IMPORT time is the point — this is one
+#: constant with one source, not a live alias: the readers stay separate
+#: (``_read_sup_json`` vs ``_Handler._read_json``) because C06 and C10
+#: answer a refused body with different error envelopes by design, and the
+#: C10 tests that prove C10 enforces its own bound do so by raising
+#: ``mintapi.MAX_BODY_BYTES`` at runtime, which must not drag this value up
+#: with it.
+_MAX_BODY_BYTES = MAX_BODY_BYTES
 
 #: Per-connection socket timeout, in seconds. socketserver applies a
 #: handler's ``timeout`` in setup(); the stdlib default is None, i.e. no
@@ -1407,9 +1426,23 @@ class SupervisionServer(MintServer):
         self.sup = _SupCore(config, ledger)
 
     def start(self) -> int:
-        """Bind 127.0.0.1:0 and serve; same contract as MintServer.start."""
+        """Bind 127.0.0.1:0 and serve; same contract as MintServer.start.
+
+        Including the single-writer claim. This class binds its own socket
+        instead of calling ``super().start()``, which used to mean the
+        ``flock`` on the ledger was never taken before the bind; the claim
+        is lazy and idempotent, so ``_Core.descriptor`` took it at the first
+        fetch and a supervision mint alone on its ledger still served
+        correctly. What was lost was FAIL-FAST: between this bind and the
+        first descriptor, another process could take the claim, and from
+        then on this mint answers every descriptor with a 500 forever —
+        bound, serving Layer 0 and the profile, and unable to sign a
+        snapshot — instead of having refused to start. Claimed here, in the
+        same place and the same order as ``MintServer.start``.
+        """
         if self._httpd is not None:
             raise RuntimeError("server already started")
+        self._core._claim_single_writer()
         self._httpd = _SupHTTPServer(("127.0.0.1", 0), _SupHandler)
         self._httpd.core = self._core
         self._httpd.sup = self.sup

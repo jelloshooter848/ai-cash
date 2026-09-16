@@ -9,3 +9,10 @@ __pycache__/
 mint-keys.json
 *-keys.json
 *.log
+
+# The operator GUI's workdir: a live mint ledger, its signing key, its
+# operator credential, the supervision state and one sqlite file per
+# wallet. Runtime state of one machine, and two of those files are
+# secrets. The *.db / *-keys.json / *.log rules above miss
+# mint-control.json, mint-token-digests.json and gui-state.json.
+gui/var/

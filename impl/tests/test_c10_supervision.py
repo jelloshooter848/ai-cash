@@ -12,6 +12,8 @@ import logging
 import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2193,6 +2195,214 @@ class SupervisionTest(unittest.TestCase):
         self.assertNotIn(a_key, joined)
         self.assertNotIn("Bearer", joined)
         self.assertNotIn("nope", joined)
+
+
+class SupervisionStartupTest(unittest.TestCase):
+    """A Supervision Profile mint must start exactly like a plain C06 mint.
+
+    ``SupervisionServer.start`` binds its own socket instead of calling
+    ``super().start()``, and it used to bind WITHOUT first taking the
+    single-writer claim on the ledger. That did not break a lone mint: the
+    claim is lazy and idempotent, so ``_Core.descriptor`` took it at the
+    first fetch and everything served correctly. What it broke was
+    FAIL-FAST. Between the bind and the first descriptor there is a window
+    in which another process can take the claim; after that this mint is
+    bound and serving but can never sign a snapshot again — every
+    ``GET /v3/mints`` is a 500, forever — where a plain C06 mint would have
+    refused to come up at all. One line, in the same place C06 has it.
+    """
+
+    def build(self, db_path, clock=None):
+        """An UNSTARTED SupervisionServer over `db_path`."""
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            db_path,
+            clock or FakeClock(T0),
+            NO_BURN,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=NO_BURN,
+            signing_private=priv,
+            signing_public=pub,
+        )
+        server = SupervisionServer(config, ledger)
+        self.addCleanup(server.stop)
+        return server
+
+    def shared_ledger(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return os.path.join(tmp.name, "ledger.sqlite3")
+
+    def test_supervision_mint_refuses_to_start_when_the_ledger_is_held(self):
+        """The deployment slip this has to survive: two mint processes on
+        one ledger file, bound to different ports (a port collision is the
+        only clash a launcher can see by itself). The second must fail at
+        the door, not serve a mint that cannot sign."""
+        db_path = self.shared_ledger()
+        holder = self.build(db_path)
+        holder.start()
+        second = self.build(db_path)
+        with self.assertRaises(RuntimeError) as caught:
+            second.start()
+        self.assertIn("ledger", str(caught.exception).lower())
+        # Refused BEFORE the bind: no socket, no serving thread, no port.
+        self.assertIsNone(second._httpd)
+        self.assertIsNone(second._thread)
+        # The mint that does hold the ledger is untouched.
+        status, desc = api(holder._httpd.server_address[1], "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        self.assertIn("supervision", desc["profiles"])
+
+    def test_a_held_supervision_mint_is_refused_by_a_plain_c06_mint_too(self):
+        """The claim is over the LEDGER, not over a server class: a plain
+        C06 mint must not be able to take a ledger a supervision mint is
+        serving, or the profile would be a hole in the guarantee."""
+        db_path = self.shared_ledger()
+        holder = self.build(db_path)
+        holder.start()
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            db_path,
+            FakeClock(T0),
+            NO_BURN,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        plain = MintServer(
+            MintConfig(
+                mint_id=MINT_ID,
+                baseline_model_class="frontier-2026",
+                burn_policy=NO_BURN,
+                signing_private=priv,
+                signing_public=pub,
+            ),
+            ledger,
+        )
+        self.addCleanup(plain.stop)
+        with self.assertRaises(RuntimeError):
+            plain.start()
+
+    def test_a_stopped_supervision_mint_hands_the_ledger_back(self):
+        """Claiming at start() must not turn a restart into an outage: the
+        successor takes the ledger once the holder is stopped."""
+        db_path = self.shared_ledger()
+        holder = self.build(db_path)
+        holder.start()
+        second = self.build(db_path)
+        with self.assertRaises(RuntimeError):
+            second.start()
+        holder.stop()
+        port = second.start()  # must not raise now
+        status, desc = api(port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+
+class BodyCapParityTest(unittest.TestCase):
+    """C10's body cap is C06's number, not a second one that looks like it.
+
+    ``_MAX_BODY_BYTES`` was written out independently (``1 << 20`` against
+    C06's ``1_048_576``) and nothing tied them together, so retuning one
+    would have moved the supervision routes' bound away from Layer 0's
+    silently. The READERS stay separate on purpose — C06 and C10 answer a
+    refused body with different envelopes (L13/B9) — so only the number is
+    shared.
+
+    Note on what each test here is worth. The two equality tests below are
+    guards against FUTURE drift: because ``1 << 20 == 1_048_576`` they pass
+    against the two independent literals as well, so they cannot tell the
+    fix from the bug. ``test_the_c10_cap_is_derived_not_copied`` is the one
+    that can, and it fails on the pre-fix file.
+    """
+
+    def test_the_two_caps_are_one_number(self):
+        self.assertEqual(supervision._MAX_BODY_BYTES, mintapi.MAX_BODY_BYTES)
+
+    def test_the_c10_cap_is_derived_not_copied(self):
+        """One number with one SOURCE, not two numbers that happen to be
+        equal today.
+
+        The equality tests cannot see the difference: the old literal
+        ``1 << 20`` equals C06's ``1_048_576``, so they pass either way.
+        This retunes C06's cap and re-executes supervision.py's module body
+        against it — the import a redeployed mint with a retuned cap would
+        do. Derived, C10's cap is the retuned number; copied, it is still
+        1 MiB and this fails. Run in a subprocess because a reload would
+        leave this process with rebound C10 classes that every other test
+        in the file would then be running against.
+        """
+        impl = os.path.dirname(os.path.dirname(os.path.abspath(
+            supervision.__file__)))
+        retuned = 3_145_728  # 3 MiB: nothing in either module is this
+        self.assertNotEqual(retuned, mintapi.MAX_BODY_BYTES)
+        env = dict(os.environ, PYTHONPATH=impl)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import importlib\n"
+                "from aicash import mintapi, supervision\n"
+                "mintapi.MAX_BODY_BYTES = %d\n"
+                "importlib.reload(supervision)\n"
+                "print(supervision._MAX_BODY_BYTES)\n" % retuned,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(int(proc.stdout.strip()), retuned, proc.stdout)
+
+    def test_the_c10_cap_does_not_follow_c06_at_runtime(self):
+        """Derived at IMPORT, deliberately not a live alias.
+
+        Four tests above prove C10 enforces its own bound by raising
+        ``mintapi.MAX_BODY_BYTES`` out of reach for the duration of a test.
+        A cap that tracked C06's attribute at request time would rise with
+        it and those tests would go vacuous — they would pass with C10's
+        guard deleted. This pins the property they depend on.
+        """
+        original = mintapi.MAX_BODY_BYTES
+        mintapi.MAX_BODY_BYTES = 1 << 40
+        try:
+            self.assertEqual(supervision._MAX_BODY_BYTES, original)
+        finally:
+            mintapi.MAX_BODY_BYTES = original
+
+    def test_the_readers_were_not_merged(self):
+        """C10's cap lives on its own reader, and C06's reader is C06's.
+
+        If ``_read_sup_json`` ever became an override of ``_read_json``,
+        the inherited Layer 0 routes would start answering with C10's error
+        envelope for the same wire bytes — which L13/B9 forbid.
+
+        A structural guard, and it holds on the unmodified file too — but
+        it is not redundant with the behavioural comparison. I checked:
+        with an override actually installed
+        (``_read_json = lambda self: self._read_sup_json()``),
+        ``test_layer0_body_refusals_match_a_plain_c06_mint`` still PASSES,
+        because both readers return the same ``(None, False)`` and C06's
+        ``do_POST`` picks the §3.8 reason either way — and because the two
+        caps are equal today, so the bound Layer 0 got would be the same
+        number. What a merge really changes is WHICH constant bounds Layer
+        0 (``_MAX_BODY_BYTES`` instead of ``MAX_BODY_BYTES``): invisible
+        now, an L13/B9 break the moment either moves. That is the drift
+        this whole class exists for, and this is the test that sees it.
+
+        Checked by identity across the WHOLE MRO, so an override installed
+        by assignment, by a mixin, or on any base between the two classes
+        is caught — not only one written into _SupHandler's own body.
+        """
+        self.assertIs(
+            supervision._SupHandler._read_json, mintapi._Handler._read_json
+        )
+        self.assertIn("_read_sup_json", supervision._SupHandler.__dict__)
 
 
 if __name__ == "__main__":

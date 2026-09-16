@@ -109,10 +109,17 @@ _DAY_MS = 86_400_000
 # a token is "v3:<mint_id<=64>:<amount>:<secret b64u 43>" and every hash or
 # witness is a 43-character b64u of 32 bytes, so ~300 bytes of JSON per
 # entry is already generous. 256 entries then need ~77 KiB; 1 MiB leaves
-# better than 13x headroom for whitespace, a long mint_id and the envelope,
-# while still refusing the unbounded ``Content-Length`` a single client used
-# to be able to make the server allocate. Not a rate limit (L17 scopes those
-# out) — a per-request allocation bound.
+# better than 13x headroom AT THAT DEFAULT for whitespace, a long mint_id and
+# the envelope, while still refusing the unbounded ``Content-Length`` a single
+# client used to be able to make the server allocate. That headroom is a
+# property of the default max_batch, not of this cap: max_batch is
+# configurable, and at the largest value this cap admits (_max_batch_ceiling)
+# the cap is only ~1.5x a maximal call, not 13x it (677 KB canonical, 707 KB
+# as json.dumps writes it, against 1 MiB). Not a
+# rate limit (L17 scopes those out) — a per-request allocation bound. A
+# deployment that raises max_batch past what this cap can carry is refused at
+# construction rather than left to publish an impossible limit: see
+# _max_batch_ceiling and MintConfig.
 MAX_BODY_BYTES = 1_048_576
 
 # §3.3 idempotency keys are caller-chosen and are PERSISTED by C04 for the
@@ -121,6 +128,58 @@ MAX_BODY_BYTES = 1_048_576
 # fits every sane construction with room to spare: a UUID is 36, a b64u
 # SHA-256 is 43, a "<caller>:<uuid>" namespaced pair well under 100.
 MAX_IDEMPOTENCY_KEY_LEN = 128
+
+# Per-entry byte ALLOWANCE for the max_batch cross-check against
+# MAX_BODY_BYTES (see MintConfig.__post_init__), so a mint can never publish
+# in limits.max_batch a batch size whose maximal call its own body cap always
+# refuses. MEASURED against the fattest entry a CONFORMING caller sends: an
+# output carrying a §3.4 lock,
+#   {"amount_mc":<19 digits>,"secret_hash":"<43>","lock":{"preimage_hash":
+#    "<43>","expiry":<13 digits>,"refund_hash":"<43>"}}
+# at 247 bytes with no insignificant whitespace and 257 the way json.dumps
+# writes it by default; the fattest input, a claim {"token","witness"} whose
+# token carries a 64-character mint_id, is 206 / 209. 384 keeps better than
+# 50% headroom over the worst of those, for the whitespace a client is free
+# to send and for any future field that grows an entry.
+#
+# NOT an upper bound over every entry the mint will parse, and deliberately
+# not claimed as one. §3.1 pins an amount's FORM (^[1-9][0-9]*$) but not its
+# LENGTH, so {"amount_mc": <1000 digits>, "secret_hash": "<43>"} is an entry
+# the mint reads and answers `amount_mismatch` — not `bad_format` — at ~1074
+# bytes, 2.8x this allowance. A caller sending max_batch entries of that
+# shape can still put a body over MAX_BODY_BYTES. The ceiling below NARROWS
+# that hole (it closes max_batch=8000, where every maximal call of the
+# ordinary shape was refused) rather than closing it; closing it needs a
+# length bound on amounts in C01, which is a protocol question and not a
+# deployment-config one. test_c06 pins both halves of this.
+_FAT_ENTRY_BYTES = 384
+
+# Allowance for everything outside the two entry arrays: the idempotency_key
+# (bounded by MAX_IDEMPOTENCY_KEY_LEN above), the three envelope keys, the
+# brackets and the separators — under 300 bytes in the worst case. 1024 is
+# deliberate slack, not a measurement.
+_ENVELOPE_BYTES = 1024
+
+
+def _max_batch_ceiling(body_cap: int | None = None) -> int:
+    """Largest ``max_batch`` a body cap of ``body_cap`` bytes can carry.
+
+    ``body_cap`` defaults to the LIVE value of MAX_BODY_BYTES, read at call
+    time. Spelling that default as ``body_cap: int = MAX_BODY_BYTES`` binds
+    it at IMPORT instead, which is the same cap-versus-cap drift this
+    arithmetic exists to prevent: ``_Handler._read_json`` reads the global
+    per request, so a deployment that retunes MAX_BODY_BYTES would have had
+    its config validated against the old number while the reader enforced
+    the new one — and the refusal it printed quoted the new one while
+    refusing on the old, making its own remedy inert.
+
+    At least 1: a mint that cannot carry one entry is broken in a way this
+    arithmetic is not the place to report.
+    """
+    if body_cap is None:
+        body_cap = MAX_BODY_BYTES
+    return max(1, (body_cap - _ENVELOPE_BYTES) // _FAT_ENTRY_BYTES)
+
 
 # Wall-clock life of ONE request: request line, headers and body together.
 # ``_Handler.timeout`` is a per-recv IDLE timeout and nothing more — a peer
@@ -254,6 +313,39 @@ class MintConfig:
         for d in self.denominations_mc:
             _require_plain_int("denomination", d, 1)
         _require_plain_int("max_batch", self.max_batch, 1)
+        # max_batch is PUBLISHED (§3.6 limits.max_batch) and MAX_BODY_BYTES
+        # is not, so a config whose published limit the byte cap cannot carry
+        # makes the mint advertise a batch size whose maximal call it
+        # always refuses — and refuses with `bad_format`, which §9.5 pins as
+        # PERMANENT, so a payer aiming at the published limit with entries of
+        # ordinary size has no conforming recovery. (Smaller entries still
+        # get through at such a max_batch, which is what made this silent:
+        # the limit is not unusable, only unreachable at the size it
+        # promises.)
+        # The two numbers were never cross-checked: max_batch=8000 was
+        # accepted silently. Refused at construction instead, because the
+        # alternative is a descriptor that lies.
+        ceiling = _max_batch_ceiling(MAX_BODY_BYTES)
+        if self.max_batch > ceiling:
+            # The BUDGET, not a measurement: _FAT_ENTRY_BYTES is an
+            # allowance over the fattest conforming entry (see its comment),
+            # so this number is what the mint sizes against, which is what
+            # an operator has to move to get past this refusal. Raising
+            # MAX_BODY_BYTES to exactly this figure admits exactly this
+            # max_batch — the arithmetic below is the same one, inverted.
+            budget = _ENVELOPE_BYTES + self.max_batch * _FAT_ENTRY_BYTES
+            raise ValueError(
+                "max_batch=%d exceeds what this mint's request body cap can"
+                " carry: at an allowance of %d bytes per entry plus %d for"
+                " the envelope, a call at that published limit is budgeted"
+                " at about %d bytes against a MAX_BODY_BYTES of %d, so the"
+                " mint would advertise in limits.max_batch a batch size its"
+                " own body cap refuses with a permanent bad_format. Lower"
+                " max_batch to %d or below, or raise MAX_BODY_BYTES to at"
+                " least %d."
+                % (self.max_batch, _FAT_ENTRY_BYTES, _ENVELOPE_BYTES,
+                   budget, MAX_BODY_BYTES, ceiling, budget)
+            )
         _require_plain_int("grace_ms", self.grace_ms, 0)
         _require_plain_int(
             "timestamp_precision_ms", self.timestamp_precision_ms, 1
@@ -935,8 +1027,16 @@ class _Handler(BaseHTTPRequestHandler):
         is also not a §3.6 published limit and cannot become one (that
         object's scope guard is explicit), so no client can be expected to
         aim at it — which is precisely what makes a permanent reason the
-        honest one. Sized at better than 13x the fattest legal max_batch
-        call, it can only be hit by a body no published limit allows.
+        honest one. It is NOT, however, out of a published limit's reach:
+        at the largest max_batch MintConfig admits (_max_batch_ceiling) this
+        cap is only ~1.5x a maximal call, and an entry the mint
+        parses can exceed the per-entry allowance that ceiling is derived
+        from (see _FAT_ENTRY_BYTES), so a caller aiming at a published limit
+        CAN land here. The permanent reason still holds on its own ground:
+        identical bytes over the cap fail identically forever, so "retryable
+        with backoff" would be advice that can never work, while the
+        recovery that does work — split the call — is exactly what a
+        permanent reason tells a payer to go find.
         """
         try:
             length = int(self.headers.get("Content-Length", 0))
