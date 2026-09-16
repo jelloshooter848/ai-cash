@@ -2095,6 +2095,88 @@ class TestFailureCauses(ServerCase):
         self.assertEqual([r["cause"] for r in obj["history"]],
                          ["unknown", ""])
 
+    def test_a_history_row_never_leaves_a_closed_field_outside_its_set(self):
+        """THE SWEEP AT THIS LAYER, over both kinds of non-answer.
+
+        A ``receive`` row has no delivery, so all five record fields are
+        "" -- the question does not arise. A recovered payment DID happen
+        and reads real words in every one of them. A component that
+        answers a word this build cannot read is undetermined, not blank.
+        Those are three different rows and this route must not merge any
+        two of them.
+        """
+        FakeWalletOps.history_rows = [
+            {"ts_ms": 0, "kind": "receive", "amount_mc": 5, "detail": "x",
+             "cause": "", "recipient": "", "recipient_kind": "",
+             "delivery": "", "delivery_cause": "", "delivery_attempt": ""},
+            {"ts_ms": 0, "kind": "pay", "amount_mc": 5, "detail": "x",
+             "cause": "", "recipient": "bob", "recipient_kind": "wallet",
+             "delivery": "undelivered", "delivery_cause": "",
+             "delivery_attempt": "not_attempted"},
+            {"ts_ms": 0, "kind": "pay", "amount_mc": 5, "detail": "x",
+             "cause": "", "recipient": "", "recipient_kind": "unknown",
+             "delivery": "unknown", "delivery_cause": "",
+             "delivery_attempt": "unknown"},
+            {"ts_ms": 0, "kind": "pay", "amount_mc": 5, "detail": "x",
+             "cause": "", "recipient": "eve",
+             "recipient_kind": "sky-writing", "delivery": "probably fine",
+             "delivery_cause": "", "delivery_attempt": "sort of"},
+        ]
+        status, obj, raw = self.call("GET", "/api/wallet/history?name=alice")
+        self.assertEqual(status, 200, raw[:200])
+        rows = obj["history"]
+        self.assertEqual([r["recipient_kind"] for r in rows],
+                         ["", "wallet", "unknown", "unknown"])
+        self.assertEqual([r["delivery_attempt"] for r in rows],
+                         ["", "not_attempted", "unknown", "unknown"])
+        self.assertEqual([r["delivery"] for r in rows],
+                         ["", "undelivered", "unknown", "unknown"])
+        for row in rows:
+            self.assertIn(row["recipient_kind"],
+                          gui_app.RECIPIENT_KINDS + (gui_app.NOT_APPLICABLE,))
+            self.assertIn(row["delivery_attempt"],
+                          gui_app.DELIVERY_ATTEMPTS
+                          + (gui_app.NOT_APPLICABLE,))
+
+    def test_a_recovered_payment_row_survives_the_history_route(self):
+        """The recovered row, end to end through the wire it is read on."""
+        FakeWalletOps.history_rows = [
+            {"ts_ms": 0, "kind": "pay", "amount_mc": 5000,
+             "detail": "payment of 5000 mc was stranded in flight, burn 0 mc"
+                       " \u2014 nothing was handed over: it was meant for bob",
+             "cause": "", "recipient": "bob", "recipient_kind": "wallet",
+             "delivery": "undelivered", "delivery_cause": "",
+             "delivery_attempt": "not_attempted"},
+        ]
+        status, obj, _raw = self.call("GET", "/api/wallet/history?name=alice")
+        self.assertEqual(status, 200)
+        row = obj["history"][0]
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        self.assertEqual(row["delivery"], "undelivered")
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
+        self.assertIn("nothing was handed over", row["detail"])
+
+    def test_the_two_non_answers_are_not_the_same_string(self):
+        """Unit, so the rule is pinned where it is written.
+
+        ABSENT is the caller's business -- a history page has rows where
+        the question does not arise, an endpoint that lists only payments
+        does not. PRESENT-but-unreadable is always undetermined.
+        """
+        for clean, good in ((gui_app.clean_attempt, "attempted"),
+                            (gui_app.clean_recipient_kind, "wallet")):
+            with self.subTest(fn=clean.__name__):
+                self.assertEqual(clean(good), good)
+                self.assertEqual(clean(None), "")
+                self.assertEqual(clean(""), "")
+                self.assertEqual(clean("   "), "")
+                self.assertEqual(clean(None, "unknown"), "unknown")
+                # present and unreadable: it answered, we cannot read it
+                self.assertEqual(clean("sky-writing"), "unknown")
+                self.assertEqual(clean(7), "unknown")
+                self.assertEqual(clean("sky-writing", ""), "unknown")
+
     def test_a_rejected_paste_carries_its_cause(self):
         FakeWalletOps.rejected = [
             {"token": "aicash:v3:x:1:zz", "reason": "malformed token",
@@ -2427,10 +2509,68 @@ class TestOutstandingRoute(ServerCase):
                          ("bob", "wallet", "undelivered", "mint_stopped"))
         # Invented vocabulary does not pass through: it becomes the
         # honest "we do not know", never a new word on the operator's
-        # screen.
-        self.assertEqual(second["recipient_kind"], "")
+        # screen. AND "we do not know" is not "" -- "" is what this wire
+        # says when there was no payment for the question to be about,
+        # and a component that answered "sky-writing" HAS answered about
+        # a payment that exists. All three fields take the same reading.
+        self.assertEqual(second["recipient_kind"], "unknown")
         self.assertEqual(second["delivery"], "unknown")
         self.assertEqual(second["delivery_cause"], "unknown")
+
+    def test_a_recovered_payment_keeps_every_field_across_the_wire(self):
+        """The row this round exists for, relayed rather than blanked.
+
+        walletops.py reports a payment that was stranded in flight and
+        settled by recover() under ``recovered_ops``: nothing was handed
+        over, so it is not outstanding value, and the five record fields
+        say who it was meant for and that it reached nobody. Until this
+        round this route relayed two of its seven fields, so the same
+        payment that reads "meant for bob, nothing handed over" in the
+        history panel carried no recipient at all in this one.
+        """
+        FakeWalletOps.outstanding = {
+            "checked": True, "mint_id": "fake-mint", "payments": [],
+            "recovered_mc": 5000,
+            "recovered_ops": [{"op_id": "op-r", "amount_mc": 5000,
+                               "recipient": "bob",
+                               "recipient_kind": "wallet",
+                               "delivery": "undelivered",
+                               "delivery_cause": "",
+                               "delivery_attempt": "not_attempted"}]}
+        status, obj, raw = self.call("GET",
+                                     "/api/wallet/outstanding?name=alice")
+        self.assertEqual(status, 200, raw[:200])
+        self.assertEqual(obj["recovered_mc"], 5000)
+        got = obj["recovered_ops"][0]
+        self.assertEqual(got, {"op_id": "op-r", "amount_mc": 5000,
+                               "recipient": "bob",
+                               "recipient_kind": "wallet",
+                               "delivery": "undelivered",
+                               "delivery_cause": "",
+                               "delivery_attempt": "not_attempted"})
+
+    def test_a_recovered_op_that_says_nothing_reads_undetermined(self):
+        """...and a component that carries none of it does not read "".
+
+        Every item on this endpoint is a payment, so "who was this for"
+        always arises. A component build that does not answer it leaves
+        the question undetermined, which is a word; "" here would say
+        "this row has no recipient field to fill", which is false of
+        every payment.
+        """
+        FakeWalletOps.outstanding = {
+            "checked": True, "mint_id": "fake-mint", "payments": [],
+            "recovered_mc": 7, "recovered_ops": [{"op_id": "op-s",
+                                                  "amount_mc": 7}]}
+        status, obj, _raw = self.call("GET",
+                                      "/api/wallet/outstanding?name=alice")
+        self.assertEqual(status, 200)
+        got = obj["recovered_ops"][0]
+        self.assertEqual(got["recipient_kind"], "unknown")
+        self.assertEqual(got["delivery_attempt"], "unknown")
+        self.assertEqual(got["delivery"], "unknown")
+        self.assertNotEqual(got["recipient_kind"], "")
+        self.assertNotEqual(got["delivery_attempt"], "")
 
     def test_a_payment_with_no_record_reads_unknown_not_delivered(self):
         FakeWalletOps.outstanding = {
@@ -2442,7 +2582,12 @@ class TestOutstandingRoute(ServerCase):
         self.assertEqual(status, 200)
         self.assertEqual(obj["payments"][0]["delivery"], "unknown")
         self.assertEqual(obj["payments"][0]["recipient"], "")
-        self.assertEqual(obj["payments"][0]["recipient_kind"], "")
+        # The component said nothing at all about the kind. Every item
+        # THIS endpoint lists is a payment, so the question arises and the
+        # answer is undetermined -- not "", which is what this wire says
+        # about a row that has no recipient field to fill at all.
+        self.assertEqual(obj["payments"][0]["recipient_kind"], "unknown")
+        self.assertEqual(obj["payments"][0]["delivery_attempt"], "unknown")
 
     def test_it_needs_a_wallet_that_exists(self):
         status, obj, raw = self.call("GET",
@@ -2525,8 +2670,14 @@ class TestOutstandingRoute(ServerCase):
         _status, obj, _raw = self.call("GET",
                                        "/api/wallet/outstanding?name=alice")
         self.assertEqual(obj["recovered_mc"], 5000)
+        # The five record fields ride along, and a component that carries
+        # none of them leaves them undetermined -- every item here is a
+        # payment, so the questions arise whether or not it answered.
         self.assertEqual(obj["recovered_ops"],
-                         [{"op_id": "op-r", "amount_mc": 5000}])
+                         [{"op_id": "op-r", "amount_mc": 5000,
+                           "recipient": "", "recipient_kind": "unknown",
+                           "delivery": "unknown", "delivery_cause": "",
+                           "delivery_attempt": "unknown"}])
         self.assertEqual(obj["unredeemed_mc"], 3000)
         self.assertEqual(obj["handed_over_mc"], 3000)
 
@@ -2767,7 +2918,10 @@ class TestPayDelivery(ServerCase):
             self.assertEqual(status, 200, raw[:200])
             self.assertEqual(obj["delivery"], "unknown")
             self.assertEqual(obj["delivery_cause"], "unknown")
-            self.assertEqual(obj["recipient_kind"], "")
+            # "carrier pigeon" is an ANSWER this build cannot read, which
+            # is undetermined -- the same reading the two fields above
+            # take. "" would say this response is not about a payment.
+            self.assertEqual(obj["recipient_kind"], "unknown")
         finally:
             FakeWalletOps.pay = saved
 
@@ -2833,14 +2987,19 @@ class TestPayDelivery(ServerCase):
         self.assertEqual((first["op_id"], first["recipient"],
                           first["delivery"], first["delivery_cause"]),
                          ("op-1", "bob", "undelivered", "mint_stopped"))
-        self.assertEqual(second["recipient_kind"], "")
         # It ANSWERED, in a word this file cannot read: unknown, not "".
+        # ALL THREE FIELDS, which is the fix: `delivery` has read that way
+        # since round 4 while `recipient_kind` beside it read "", the same
+        # string the row below uses for "the question does not arise".
+        self.assertEqual(second["recipient_kind"], "unknown")
         self.assertEqual(second["delivery"], "unknown")
         self.assertEqual(second["delivery_cause"], "unknown")
         # A row that says nothing about delivery keeps saying nothing: ""
         # is "the question does not arise", and must not become "unknown".
         self.assertEqual(third["delivery"], "")
         self.assertEqual(third["recipient"], "")
+        self.assertEqual(third["recipient_kind"], "")
+        self.assertEqual(third["delivery_attempt"], "")
 
 
 # ======================================================================
@@ -3858,12 +4017,32 @@ class TestMoneyEndToEnd(unittest.TestCase):
 
         rows = {op: self.row_for("alice", op)
                 for op in (served["op_id"], pasted["op_id"])}
+        # ONE TRUTH about the OUTCOME: who it was for and whether it
+        # arrived are the same through both roads.
         for op, row in rows.items():
             self.assertEqual(row["recipient"], "bob", op)
             self.assertEqual(row["recipient_kind"], "wallet", op)
             self.assertEqual(row["delivery"], "delivered", op)
             self.assertEqual(row["delivery_cause"], "", op)
-            self.assertEqual(row["delivery_attempt"], "attempted", op)
+        # ...AND ONE FIELD THAT MUST DIFFER, because it asks a different
+        # question: "did THIS WALLET ever try?". alice's wallet performed
+        # the first delivery and performed nothing at all for the second
+        # -- the strings were pasted, and the recipient's side of this
+        # server watched them land. This line used to assert "attempted"
+        # for both, which meant the paste route overwrote the answer
+        # `pay()` had recorded seven lines above (asserted there as
+        # `not_attempted`): the product knew, wrote it down, and then
+        # replaced it with the opposite. "never sent" and "sent and lost"
+        # send an operator to different components, and this is the only
+        # field that tells them apart.
+        self.assertEqual(rows[served["op_id"]]["delivery_attempt"],
+                         "attempted", "the server did deliver this one")
+        self.assertEqual(rows[pasted["op_id"]]["delivery_attempt"],
+                         "not_attempted",
+                         "this wallet never attempted the pasted delivery")
+        self.assertEqual(rows[pasted["op_id"]]["delivery_attempt"],
+                         pasted["delivery_attempt"],
+                         "the recorded answer must survive the observation")
         # and it is durable: a GUI that never saw either payment reads it
         get = self.second_gui()
         status, obj = get("/api/wallet/history?name=alice")
@@ -4306,6 +4485,66 @@ class TestAliveIsNotTheSameAsAnswering(unittest.TestCase):
         for junk in ("true", 1, 0, [], {}, "no"):
             with self.subTest(junk=junk):
                 self.assertIsNone(self._status({"responding": junk})["responding"])
+
+
+class TestTheRecordVocabulariesDoNotDrift(unittest.TestCase):
+    """Three closed sets, two files, one meaning each.
+
+    walletops.py produces these values and app.py validates them again on
+    the way out -- deliberately, because a component this server does not
+    own must not be able to widen a set by answering a new word. That
+    means the tuples are written twice, and the next person to add a
+    member will add it to one file: a word walletops starts writing would
+    then be scrubbed to "unknown" by the relay, silently, with the
+    operator reading a downgraded record and nothing failing.
+
+    It also pins the thing this round was about: each set carries a word
+    for UNDETERMINED, and the empty string is reserved for exactly one
+    other meaning -- the question does not arise.
+    """
+
+    def test_the_three_sets_are_the_same_in_both_files(self):
+        self.assertEqual(set(walletops.RECIPIENT_KINDS),
+                         set(gui_app.RECIPIENT_KINDS))
+        self.assertEqual(set(walletops.DELIVERY_ATTEMPTS),
+                         set(gui_app.DELIVERY_ATTEMPTS))
+        self.assertEqual(set(walletops.DELIVERY_OUTCOMES),
+                         set(gui_app.DELIVERIES))
+
+    def test_every_set_can_say_undetermined(self):
+        """...in a word, so it never has to say it with a blank."""
+        for name, values in (("RECIPIENT_KINDS", walletops.RECIPIENT_KINDS),
+                             ("DELIVERY_ATTEMPTS",
+                              walletops.DELIVERY_ATTEMPTS),
+                             ("DELIVERY_OUTCOMES",
+                              walletops.DELIVERY_OUTCOMES),
+                             ("STORE_STATES",
+                              walletops.STORE_STATE_VALUES)):
+            with self.subTest(vocabulary=name):
+                self.assertIn(walletops.UNDETERMINED, values)
+
+    def test_not_applicable_is_declared_and_is_in_no_vocabulary(self):
+        """The blank is a MEMBER of each value set and of no vocabulary.
+
+        The vocabularies are the real answers; NOT_APPLICABLE is the
+        declared way of saying there was no question. Both files agree on
+        it, and neither writes it as an answer.
+        """
+        self.assertEqual(walletops.NOT_APPLICABLE, gui_app.NOT_APPLICABLE)
+        self.assertEqual(walletops.UNDETERMINED, gui_app.UNDETERMINED)
+        for vocabulary in (walletops.RECIPIENT_KINDS,
+                           walletops.DELIVERY_ATTEMPTS,
+                           walletops.DELIVERY_OUTCOMES,
+                           walletops.STORE_STATES):
+            self.assertNotIn(walletops.NOT_APPLICABLE, vocabulary)
+        for values in (walletops.RECIPIENT_KIND_VALUES,
+                       walletops.DELIVERY_ATTEMPT_VALUES,
+                       walletops.DELIVERY_VALUES):
+            self.assertIn(walletops.NOT_APPLICABLE, values)
+        # A token row always HAS a store state, so there is no
+        # not-applicable for it and the set says so.
+        self.assertNotIn(walletops.NOT_APPLICABLE,
+                         walletops.STORE_STATE_VALUES)
 
 
 class TestTheRefusedValueListsDoNotDrift(unittest.TestCase):
@@ -5654,3 +5893,327 @@ class TestTheFormAndTheSupervisorAgree(unittest.TestCase):
                           status["last_start_sources"][field])
         self.assertIn("some-other-mint",
                       status["last_start_sources"]["mint_id"])
+
+
+# ======================================================================
+# ROUND 6 -- the row a recovered payment leaves, on the wire
+# ======================================================================
+class TestARecoveredPaymentOnTheWire(RealMintCase):
+    """Real mint, real walletops, real HTTP: the fields an operator reads.
+
+    The component tests drive this too, but the wire is where it is read
+    and where a relay can quietly blank a field the component filled in.
+    """
+
+    mint_id = "recovered-mint"
+
+    def strand_a_payment(self, name, amount_mc=5000, to="bob"):
+        """Interrupt a payment the way the transport interrupts one.
+
+        The exchange goes out, the MINT COMMITS IT, and the response is
+        dropped: §5.1's crash-in-flight. walletops.pay() raises without
+        returning a single string, the op is left `planned`, and
+        POST /api/wallet/recover settles it against the ledger into a
+        committed `pay` that handed nothing to anybody.
+
+        Driven against the wallet FILE the server manages, because there
+        is no way to make a socket die mid-request from the client side
+        of this API -- and it is the same file the routes below read.
+        """
+        from aicash.wallet import MintClient
+        walletops = sys.modules["walletops"]
+
+        class DropTheAnswer(MintClient):
+            def _transport(self, method, path, body, extra_headers=None):
+                out = super()._transport(method, path, body, extra_headers)
+                if path == "/v3/exchange":
+                    raise OSError("simulated response loss after delivery")
+                return out
+
+        path = os.path.join(self.workdir, "wallets", name + ".db")
+        base = "http://127.0.0.1:%d" % self.mint_port
+        ops = walletops.WalletOps(path, base)
+        try:
+            ops._open()
+            ops._wallet.client = DropTheAnswer(base)
+            with self.assertRaises(walletops.WalletOpsError) as cm:
+                ops.pay(amount_mc, to=to)
+            self.assertEqual(cm.exception.cause, "mint_unreachable")
+        finally:
+            ops.close()
+
+    def test_the_wire_says_what_the_record_knows(self):
+        self.ok(self.post("/api/wallet/create", {"name": "alice"}), "create")
+        issued = self.ok(self.post("/api/mint/issue",
+                                   {"amount_mc": 50000, "count": 1}), "issue")
+        self.ok(self.post("/api/wallet/receive",
+                          {"name": "alice", "tokens": issued["tokens"]}),
+                "fund")
+        before = self.ok(self.get("/api/wallet/summary?name=alice"),
+                         "summary")["balance_mc"]
+
+        self.strand_a_payment("alice", 5000, to="bob")
+        summary = self.ok(self.post("/api/wallet/recover", {"name": "alice"}),
+                          "recover")
+        self.assertEqual(summary["result"]["ops_confirmed"], 1)
+
+        rows = self.ok(self.get("/api/wallet/history?name=alice"),
+                       "history")["history"]
+        pays = [r for r in rows if r["kind"] == "pay"]
+        self.assertEqual(len(pays), 1, rows)
+        row = pays[0]
+        # Every closed field carries a value from its set, and neither of
+        # the two this round gave a word to is blank.
+        self.assertIn(row["recipient_kind"],
+                      gui_app.RECIPIENT_KINDS + (gui_app.NOT_APPLICABLE,))
+        self.assertIn(row["delivery_attempt"],
+                      gui_app.DELIVERY_ATTEMPTS + (gui_app.NOT_APPLICABLE,))
+        self.assertNotEqual(row["recipient_kind"], "")
+        self.assertNotEqual(row["delivery_attempt"], "")
+        # ...and they say what the product actually knows
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        self.assertEqual(row["delivery"], "undelivered")
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
+        self.assertIn("nothing was handed over", row["detail"])
+
+        # The value is in the balance, not in anybody else's hands, and
+        # the two panels say the same thing about the same op_id.
+        out = self.ok(self.get("/api/wallet/outstanding?name=alice"),
+                      "outstanding")
+        self.assertEqual(out["payments"], [])
+        self.assertEqual(out["recovered_mc"], 5000)
+        recovered = [r for r in out["recovered_ops"]
+                     if r["op_id"] == row["op_id"]]
+        self.assertEqual(len(recovered), 1)
+        for field in ("recipient", "recipient_kind", "delivery",
+                      "delivery_cause", "delivery_attempt"):
+            self.assertEqual(recovered[0][field], row[field], field)
+        after = self.ok(self.get("/api/wallet/summary?name=alice"),
+                        "summary after")["balance_mc"]
+        # the burn is real -- the mint committed the exchange -- and the
+        # rest of the payment came back into the spendable balance
+        self.assertLess(before - after, 5000)
+
+    def test_the_wire_names_a_stranded_payment_before_recover_runs(self):
+        """THE ROW AN OPERATOR ACTUALLY STARES AT DURING AN OUTAGE.
+
+        Every other test in this class reads the row AFTER
+        POST /api/wallet/recover has turned the stranded op into a
+        committed payment.  That is the easy half.  The hours before
+        recover() can run -- with the mint down, which is exactly when a
+        payment gets stranded -- are when the operator has to decide
+        whether to send it again, and that decision needs the name.
+
+        It was on disk the whole time, in this module's own intent table,
+        and the wire said ``recipient: ""`` until recover() ran.
+        """
+        self.ok(self.post("/api/wallet/create", {"name": "carl"}), "create")
+        issued = self.ok(self.post("/api/mint/issue",
+                                   {"amount_mc": 50000, "count": 1}), "issue")
+        self.ok(self.post("/api/wallet/receive",
+                          {"name": "carl", "tokens": issued["tokens"]}),
+                "fund")
+        self.strand_a_payment("carl", 5000, to="dana")
+
+        rows = self.ok(self.get("/api/wallet/history?name=carl"),
+                       "history")["history"]
+        pending = [r for r in rows if r["kind"] == "pay_pending"]
+        self.assertEqual(len(pending), 1, rows)
+        row = pending[0]
+        # WHO IT WAS FOR -- known, durable, and now printed.
+        self.assertEqual(row["recipient"], "dana")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        self.assertNotEqual(row["recipient_kind"], gui_app.NOT_APPLICABLE)
+        self.assertIn(row["recipient_kind"], gui_app.RECIPIENT_KINDS)
+        self.assertIn("meant for dana", row["detail"])
+        # ...and NOT a claim that anything was delivered: no money moved,
+        # so all three delivery fields say the question does not arise.
+        self.assertEqual(row["delivery"], gui_app.NOT_APPLICABLE)
+        self.assertEqual(row["delivery_cause"], gui_app.NOT_APPLICABLE)
+        self.assertEqual(row["delivery_attempt"], gui_app.NOT_APPLICABLE)
+        self.assertIn("no value left the wallet", row["detail"])
+
+        # AND THE SAME ANSWER AFTERWARDS.  One durable fact, one op_id:
+        # the product must not forget a name and then remember it.
+        self.ok(self.post("/api/wallet/recover", {"name": "carl"}), "recover")
+        after = [r for r in self.ok(
+            self.get("/api/wallet/history?name=carl"), "history again"
+        )["history"] if r["op_id"] == row["op_id"]]
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["kind"], "pay")
+        self.assertEqual((after[0]["recipient"], after[0]["recipient_kind"]),
+                         (row["recipient"], row["recipient_kind"]))
+
+    def test_the_receive_route_does_not_rewrite_a_bearer_payment(self):
+        """THE FLOW gui/README.md DOCUMENTS, END TO END OVER HTTP.
+
+        Pay with no ``to``, paste the strings into another wallet, and let
+        POST /api/wallet/receive route the observation back to the payer's
+        record -- the walkthrough the README ships.  That route always
+        knows the name of the wallet it credited, so it always passes one,
+        and the payer's row used to come back claiming the operator had
+        named that wallet (``recipient_kind: "wallet"``) and that the
+        paying wallet had attempted a delivery (``attempted``).  Neither
+        happened.  Both values are inside their closed sets, which is why
+        a membership sweep could not see it.
+        """
+        for name in ("erin", "frank"):
+            self.ok(self.post("/api/wallet/create", {"name": name}), "create")
+        issued = self.ok(self.post("/api/mint/issue",
+                                   {"amount_mc": 50000, "count": 1}), "issue")
+        self.ok(self.post("/api/wallet/receive",
+                          {"name": "erin", "tokens": issued["tokens"]}),
+                "fund")
+        paid = self.ok(self.post("/api/wallet/pay",
+                                 {"name": "erin", "amount_mc": 5000}), "pay")
+        self.assertEqual(paid["recipient_kind"], "bearer")
+        self.assertEqual(paid["recipient"], "")
+        got = self.ok(self.post("/api/wallet/receive",
+                                {"name": "frank", "tokens": paid["tokens"],
+                                 "payer": "erin", "op_id": paid["op_id"]}),
+                      "receive")
+        self.assertTrue(got["recorded"]["recorded"], got["recorded"])
+        self.assertEqual(got["recorded"]["delivery"], "delivered")
+
+        rows = [r for r in self.ok(self.get("/api/wallet/history?name=erin"),
+                                   "history")["history"]
+                if r["op_id"] == paid["op_id"]]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["delivery"], "delivered")      # the new fact
+        self.assertEqual(row["recipient_kind"], "bearer")   # the old ones
+        self.assertEqual(row["recipient"], "")
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
+        # ...and the wallet that took the strings is still said out loud
+        self.assertIn("frank", row["detail"])
+
+
+# The pointer a recovery panel makes at the History table under it.
+# MEASURED DEFECT, against a live app.py and page.html's real JavaScript:
+# `recovered_ops` is a WHOLE-WALLET figure and the History table asks
+# limit=50, so on a wallet with 50 operations newer than the recovery the
+# panel said "It is marked recovered in the History table." over a table of
+# 50 rows containing no such row -- 69 rows, op 2442f039 in recovered_ops,
+# `/recovered/` false over the whole rendered table. The product had the
+# op id in hand and sent the operator to look for a row instead.
+PAGE_POINTER_HARNESS = r'''/* usage: node pointer.js <page.html> */
+"use strict";
+const fs = require("fs");
+function el(id) {
+  return {id: id, textContent: "", innerHTML: "", value: "", disabled: false,
+    hidden: false, className: "", open: false, dataset: {}, style: {},
+    listeners: {}, addEventListener() {}, querySelectorAll() { return []; }};
+}
+const nodes = new Map();
+globalThis.document = {getElementById(id) {
+  if (!nodes.has(id)) nodes.set(id, el(id));
+  return nodes.get(id); }};
+globalThis.window = {}; globalThis.navigator = {};
+globalThis.localStorage = {getItem: () => null, setItem() {}};
+globalThis.setInterval = () => 0;
+globalThis.fetch = async () => ({ok: false, status: 599,
+  json: async () => ({error: {reason: "not_found", detail: "x"}})});
+const html = fs.readFileSync(process.argv[2], "utf8");
+new Function(html.match(/<script>\n([\s\S]*)<\/script>/)[1])();
+const one = {state: "known", recovered_mc: 6000,
+             recovered_ops: [{op_id: "aaaa1111", amount_mc: 6000}]};
+const two = {state: "known", recovered_mc: 9000,
+             recovered_ops: [{op_id: "aaaa1111", amount_mc: 6000},
+                             {op_id: "bbbb2222", amount_mc: 3000}]};
+const none = {state: "known", recovered_mc: 6000, recovered_ops: []};
+const S = (...ids) => new Set(ids);
+console.log(JSON.stringify({
+  one_in:      window.recoveredClause(one, "alice", S("aaaa1111")),
+  one_out:     window.recoveredClause(one, "alice", S("zzzz")),
+  two_in:      window.recoveredClause(two, "alice", S("aaaa1111", "bbbb2222")),
+  two_partial: window.recoveredClause(two, "alice", S("aaaa1111")),
+  two_out:     window.recoveredClause(two, "alice", S()),
+  unread:      window.recoveredClause(one, "alice", null),
+  unnamed:     window.recoveredClause(none, "alice", S())}));
+process.exit(0);
+'''
+
+
+class TestTheRecoveryPanelDoesNotPointAtARowThatIsNotThere(unittest.TestCase):
+    """A pointer at the History table is a claim, and it can be false.
+
+    The panel and the table are two windows chosen on different rules --
+    whole-wallet against newest-50 -- so "wider" is not "contains". The
+    sentence is now made only for the ops the table is actually showing;
+    the ones it is not showing are named by op id, which is the thing an
+    operator can search the wallet's own record on.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not NODE:
+            raise unittest.SkipTest(
+                "node is not installed; page.html's JavaScript cannot be "
+                "executed here. The server tests still run.")
+        cls.tmp = tempfile.mkdtemp(prefix="guipointer-")
+        harness = os.path.join(cls.tmp, "pointer.js")
+        with io.open(harness, "w", encoding="utf-8") as handle:
+            handle.write(PAGE_POINTER_HARNESS)
+        page = os.path.join(REPO, "gui", "page.html")
+        proc = subprocess.run([NODE, harness, page],
+                              capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            raise AssertionError("page.html would not run:\n" + proc.stderr)
+        cls.out = json.loads(proc.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def test_the_ordinary_case_still_points_at_the_table(self):
+        """The row IS there, so saying so is true -- and stays word for word.
+
+        gui/README.md quotes this sentence verbatim; a reworded version
+        would leave the manual quoting something the product never says.
+        """
+        self.assertTrue(
+            self.out["one_in"].endswith(
+                " It is marked recovered in the History table."),
+            self.out["one_in"])
+        self.assertTrue(
+            self.out["two_in"].endswith(
+                " Each one is marked recovered in the History table."),
+            self.out["two_in"])
+
+    def test_an_op_outside_the_window_is_not_claimed_to_be_in_it(self):
+        """The defect, pinned: no pointer at a row the table is not showing."""
+        for key in ("one_out", "two_out"):
+            said = self.out[key]
+            self.assertNotIn("marked recovered in the History table", said)
+            self.assertIn("NOT in the History table below", said)
+            self.assertIn("newest 50 operations only", said)
+
+    def test_the_op_id_is_printed_instead_of_the_missing_pointer(self):
+        """Having the answer and not printing it is the whole defect class."""
+        self.assertIn("aaaa1111", self.out["one_out"])
+        for op in ("aaaa1111", "bbbb2222"):
+            self.assertIn(op, self.out["two_out"])
+
+    def test_a_partly_visible_set_names_only_the_ones_that_are_missing(self):
+        """Neither half of a mixed answer may be spoken for by the other."""
+        said = self.out["two_partial"]
+        self.assertIn("bbbb2222", said)
+        self.assertNotIn("aaaa1111", said)
+        self.assertIn("NO row in the History table below", said)
+        self.assertIn("The rest are marked recovered in the table.", said)
+
+    def test_rows_that_were_never_read_are_not_spoken_for_either(self):
+        """`shown` is null when this page has not read the rows in this pass.
+
+        Absent rows and rows known to be absent are different findings, and
+        the weaker one must not borrow the stronger one's sentence.
+        """
+        said = self.out["unread"]
+        self.assertIn("have not been read in this pass", said)
+        self.assertNotIn("marked recovered in the History table", said)
+        self.assertNotIn("NOT in the History table below", said)
+
+    def test_a_server_that_named_no_operation_is_unchanged(self):
+        """The pre-existing branch keeps its own sentence."""
+        self.assertIn("names no operation", self.out["unnamed"])

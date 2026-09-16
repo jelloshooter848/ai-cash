@@ -115,14 +115,17 @@ the store::
     change_mc        what came back into the wallet
     recipient        the name it was meant for, when there was one
     recipient_kind   "wallet" (a named recipient) | "bearer" (strings
-                     handed back to the caller, no recipient named)
+                     handed back to the caller, no recipient named) |
+                     "unknown" (a payment with no record: it had one or
+                     the other and nothing here says which)
     delivery         "delivered" | "undelivered" | "unknown"
     delivery_cause   one of CAUSES, unchanged, for a delivery that ended
                      in something OBSERVED — including an ``unknown``
                      one, where ``mint_unreachable`` is the exact word
                      for "nobody answered"; "" when nothing was observed
-    delivery_attempt "attempted" | "not_attempted" — did this wallet ever
-                     try?  A narrower question than ``delivery``
+    delivery_attempt "attempted" | "not_attempted" | "unknown" (nothing
+                     was recorded) — did this wallet ever try?  A
+                     narrower question than ``delivery``
     note             the sentence, as recorded at the time
 
 ``delivery`` is a CLOSED set of three and ``unknown`` is a REAL member of
@@ -469,8 +472,14 @@ are the exact shapes a caller may rely on)
                   ``unspent_mc`` when every string in the report carries
                   the mint's own word and ``None`` otherwise.  The five
                   record fields are read from the
-                  payment record beside the store and are ``""`` /
-                  ``"unknown"`` for a payment nothing was recorded for.
+                  payment record beside the store and read ``unknown`` in
+                  each closed-set one for a payment nothing was recorded
+                  for -- never ``""``, which on these fields means "this
+                  row is not a payment, so the question does not arise".
+                  ``recovered_ops`` carries the SAME five fields (plus
+                  ``op_id`` and ``amount_mc``) as a payment listed here,
+                  so an operator matching one of its op_ids against
+                  ``history()`` reads one answer and not two.
                   FIVE keys per token, ``key`` and ``store_state``
                   included.  ``store_state`` is from STORE_STATES and is
                   THIS WALLET's word about the string (``handed_over`` /
@@ -504,24 +513,57 @@ are the exact shapes a caller may rely on)
                   "recipient": str, "recipient_kind": str,
                   "delivery": str, "delivery_cause": str,
                   "delivery_attempt": str}]``, newest
-                  first.  The five record fields are ``""`` on every row
-                  that is not a COMMITTED payment (nothing was delivered,
-                  so there is no outcome to state); on one that is, they
-                  are what the payment record holds, and ``unknown``
-                  whenever no record was written.  ``ts_ms`` is ALWAYS
+                  first.  THE THREE DELIVERY FIELDS (``delivery``,
+                  ``delivery_cause``, ``delivery_attempt``) are ``""`` on
+                  every row that is not a COMMITTED payment: nothing was
+                  delivered, so there is no outcome to state.  THE TWO
+                  RECIPIENT FIELDS follow a different rule, because a
+                  ``pay`` that did not commit is still a PAYMENT and
+                  "who was this for" still arises on it: they are ``""``
+                  only on a row that is not a ``pay`` at all, and on a
+                  ``pay_pending`` / ``pay_failed`` row they carry the
+                  name ``pay()`` wrote down when it raised — or
+                  ``unknown`` where nothing was recorded.  On a committed
+                  payment all five are what the payment record holds,
+                  with ``unknown`` -- the word, never ``""`` -- in each
+                  closed-set one whenever no record was written.  THOSE
+                  TWO STATES ARE DIFFERENT and a caller may rely on
+                  telling them apart: ``""`` is NOT_APPLICABLE,
+                  ``unknown`` is UNDETERMINED, and see
+                  RECIPIENT_KIND_VALUES / DELIVERY_ATTEMPT_VALUES /
+                  DELIVERY_VALUES for the complete set each may hold.
+                  A committed ``pay`` that handed NOTHING over -- one
+                  ``recover()`` settled after the transport stranded it --
+                  reads ``undelivered`` / ``not_attempted``, names the
+                  recipient the request named, and says in ``detail``
+                  that nothing was handed over and where the value went;
+                  it is the one committed payment whose value is in
+                  ``summary()["balance_mc"]`` and not in anybody else's
+                  hands.  ``ts_ms`` is ALWAYS
                   ``TS_UNKNOWN`` — an ``int`` equal to ``0`` meaning "this
                   store records no clock", never a real time and never the
-                  epoch; see the history section above.  ``kind`` is drawn from
-                  a CLOSED set — a caller may switch on it exhaustively::
+                  epoch; see the history section above.  ``kind`` is
+                  ONE OF THESE NINE or, if a NEWER wallet build wrote an
+                  op kind this one does not know, that kind verbatim with
+                  the same three suffixes::
 
                       receive   receive_failed   receive_pending
                       pay       pay_failed       pay_pending
                       refused   refused_failed   refused_pending
 
-                  plus, only if a NEWER wallet build writes an op kind
-                  this one does not know, that kind verbatim with the same
-                  three suffixes.  Treat an unrecognised ``kind`` as
-                  "some operation", read ``detail``, and do not crash.
+                  So it is NOT a closed set and a caller must not switch
+                  on it exhaustively: the ninth branch is "a kind this
+                  build has not heard of".  It is deliberately passed
+                  through rather than coerced to a word from the list —
+                  relabelling somebody else's operation would be
+                  inventing a fact, which is the one thing this module
+                  will not do — and that is exactly why the guarantee is
+                  weaker here than for ``cause`` or the record fields,
+                  which ARE closed and are coerced.  Treat an
+                  unrecognised ``kind`` as "some operation", read
+                  ``detail``, and do not crash.  The suffix, unlike the
+                  stem, IS closed: one of ``""``, ``_failed``,
+                  ``_pending``.
                   ``amount_mc`` is ALWAYS a non-negative magnitude: there
                   is no sign convention, the direction lives in ``kind``
                   (``receive``/``refused`` in, ``pay`` out), and it is
@@ -567,8 +609,10 @@ from aicash.wallet import (  # noqa: E402
     Wallet,
 )
 
-__all__ = ["CAUSES", "DELIVERY_ATTEMPTS", "DELIVERY_OUTCOMES",
-           "RECIPIENT_KINDS", "TS_UNKNOWN", "WalletOps", "WalletOpsError"]
+__all__ = ["CAUSES", "DELIVERY_ATTEMPTS", "DELIVERY_ATTEMPT_VALUES",
+           "DELIVERY_OUTCOMES", "DELIVERY_VALUES", "NOT_APPLICABLE",
+           "RECIPIENT_KINDS", "RECIPIENT_KIND_VALUES", "TS_UNKNOWN",
+           "UNDETERMINED", "WalletOps", "WalletOpsError"]
 
 
 # ---------------------------------------------------------------------------
@@ -921,14 +965,53 @@ def _unavailable(exc: Exception, base_url: str,
 # the payment record (see "WHAT A PAYMENT RECORD CARRIES" above)
 # ---------------------------------------------------------------------------
 
+#: TWO THINGS THAT ARE NOT ANSWERS, and the reason every closed set below
+#: names them explicitly instead of leaving a hole for them.
+#:
+#: A field whose vocabulary is pinned has to carry a value FROM that
+#: vocabulary at the moment it is written, and a reader has to be able to
+#: tell these two apart::
+#:
+#:     NOT_APPLICABLE  the question does not arise.  A ``receive`` row has
+#:                     no delivery, so it has no delivery OUTCOME either,
+#:                     and inventing one would be inventing a fact.
+#:     UNDETERMINED    the question DOES arise and nothing here answers
+#:                     it.  A payment whose record was never written has a
+#:                     recipient and an attempt; this wallet just does not
+#:                     know what they were.
+#:
+#: They are different rows, they send an operator to different places, and
+#: ONE value for both is what this round removed: ``recipient_kind ""`` on
+#: a recovered payment meant "nothing was recorded" while ``recipient_kind
+#: ""`` on a ``receive`` row meant "there is no recipient to have a kind",
+#: and nothing on screen could tell which.  ``delivery`` had already been
+#: built this way -- ``""`` when no money moved, ``unknown`` when it moved
+#: and nobody watched -- and the other two fields now follow it exactly
+#: rather than inventing a second spelling for the same two states.
+#:
+#: NOT_APPLICABLE is the empty string BY DECLARATION, not by omission: it
+#: is a member of every ``*_VALUES`` tuple below, it is written for
+#: exactly one reason, and ``gui/page.html`` renders a payment that did
+#: not commit off it ("nothing left" rather than "unknown").
+NOT_APPLICABLE = ""
+
+#: The word this module already uses for "it arose and nothing here
+#: determines it" -- a real member of CAUSES and of DELIVERY_OUTCOMES
+#: since round 4, and now of the other two vocabularies as well.
+UNDETERMINED = "unknown"
+
 #: THE closed set of delivery outcomes.  ``unknown`` is a real member: it
 #: is what an interrupted delivery leaves behind, and it renders as
 #: unknown rather than as the likelier-sounding story.
 DELIVERY_OUTCOMES = ("delivered", "undelivered", "unknown")
 
-#: What a recipient field means.  ``""`` is the fourth state and means
-#: NOTHING WAS RECORDED, which is not the same as "no recipient".
-RECIPIENT_KINDS = ("wallet", "bearer")
+#: What a recipient field means.  ``unknown`` is a REAL member and means
+#: NOTHING WAS RECORDED -- a payment was made, somebody or nobody was
+#: named, and this wallet has no row that says which.  It is not the same
+#: as "no recipient" (that is ``bearer``, a thing that HAPPENED) and it is
+#: not the same as NOT_APPLICABLE (no payment, so no recipient field to
+#: fill).
+RECIPIENT_KINDS = ("wallet", "bearer", "unknown")
 
 #: DID THIS WALLET EVER TRY?  A separate, narrower question from
 #: ``delivery``, and the one that splits the four situations that used to
@@ -946,11 +1029,56 @@ RECIPIENT_KINDS = ("wallet", "bearer")
 #:                                                        tried, nobody
 #:                                                        answered
 #:
+#:     wallet          undelivered not_attempted ""     the payment was
+#:                                                        stranded in
+#:                                                        flight and
+#:                                                        recover() put
+#:                                                        the value back:
+#:                                                        nothing was ever
+#:                                                        handed to
+#:                                                        anybody
+#:     wallet          delivered   not_attempted ""     named, handed the
+#:                                                        strings over by
+#:                                                        some other
+#:                                                        route, and the
+#:                                                        recipient side
+#:                                                        of this GUI
+#:                                                        watched them
+#:                                                        land
+#:     bearer          delivered   not_attempted ""     the same, for
+#:                                                        strings nobody
+#:                                                        was named for:
+#:                                                        the kind stays
+#:                                                        `bearer`, and
+#:                                                        the wallet that
+#:                                                        took them is
+#:                                                        named in the
+#:                                                        note, not in
+#:                                                        `recipient`
+#:
+#: THE LAST TWO ARE WHY ``delivery_attempt`` IS NOT DERIVABLE from
+#: ``delivery``.  ``settle_delivery()`` is driven from the RECIPIENT's
+#: side, where the paying wallet tried nothing; it used to write
+#: ``attempted`` there anyway, which made this column say the opposite of
+#: its own definition on the one path ``gui/app.py`` actually drives.
+#: Only ``pay()`` answers it, once, from ``deliver is not None``.
+#:
 #: "Never sent" and "sent and lost" send an operator to different
 #: components, so they are different rows in machine-readable fields and
-#: not merely different free text.  ``""`` is the fourth value and means
-#: NOTHING WAS RECORDED, exactly as it does for ``recipient_kind``.
-DELIVERY_ATTEMPTS = ("not_attempted", "attempted")
+#: not merely different free text.  ``unknown`` is the third value and
+#: means NOTHING WAS RECORDED, exactly as it does for ``recipient_kind``:
+#: a payment with no record was attempted or was not, and reading that
+#: hole as ``not_attempted`` would be this module answering a question it
+#: never asked anybody.
+DELIVERY_ATTEMPTS = ("not_attempted", "attempted", "unknown")
+
+#: THE COMPLETE value set of each field, NOT_APPLICABLE included, so that
+#: "comes from a closed set" is checkable by a caller and by a test rather
+#: than being a claim in a docstring.  Nothing this module puts in one of
+#: these fields, on any path, is outside the matching tuple.
+RECIPIENT_KIND_VALUES = RECIPIENT_KINDS + (NOT_APPLICABLE,)
+DELIVERY_ATTEMPT_VALUES = DELIVERY_ATTEMPTS + (NOT_APPLICABLE,)
+DELIVERY_VALUES = DELIVERY_OUTCOMES + (NOT_APPLICABLE,)
 
 #: WHAT BECAME OF THE VALUE A RECIPIENT REFUSED — decided per cause, never
 #: asserted across all of them.  The record used to say "the refused value
@@ -1012,7 +1140,36 @@ _JOURNAL_DDL = (
     " delivery       TEXT NOT NULL,"      # one of DELIVERY_OUTCOMES
     " delivery_cause TEXT NOT NULL,"      # "" or one of CAUSES
     " note           TEXT NOT NULL,"      # the sentence, as recorded
-    " delivery_attempt TEXT NOT NULL DEFAULT '')"  # DELIVERY_ATTEMPTS
+    " delivery_attempt TEXT NOT NULL DEFAULT 'unknown')"  # DELIVERY_ATTEMPTS
+)
+
+#: WHAT THE OPERATOR ASKED FOR, written at the moment a payment is
+#: STRANDED rather than when one commits -- a second table because it
+#: answers a second question.
+#:
+#: ``pay()`` knows the recipient from its first line.  When the exchange
+#: is stranded in flight it raises without returning a string and without
+#: writing a payment record (there is no payment yet to record), and until
+#: this round that name was dropped on the floor: ``recover()`` would
+#: later settle the op against the ledger, the row would turn into a
+#: committed ``pay``, and the recipient the operator had typed was gone
+#: for good.  The money did not go anywhere -- so the name is not a fact
+#: about where value went, and it must never be rendered as one -- but it
+#: IS the fact about what was attempted, and it is the only thing that
+#: tells one stranded payment from another months later.
+#:
+#: Read for exactly one kind of row: a committed payment that handed
+#: NOTHING over.  It can never widen into "who a payment went to",
+#: because for any op that handed value over there is a real payment
+#: record and this table is not consulted at all.
+_INTENT_TABLE = "walletops_payment_intents"
+_INTENT_DDL = (
+    f"CREATE TABLE IF NOT EXISTS {_INTENT_TABLE} ("
+    " op_id          TEXT PRIMARY KEY,"   # the wallet_ops row this describes
+    " mint_id        TEXT NOT NULL,"
+    " amount_mc      INTEGER NOT NULL,"   # what was asked to be paid
+    " recipient      TEXT NOT NULL,"      # "" for bearer strings
+    " recipient_kind TEXT NOT NULL)"      # one of RECIPIENT_KINDS
 )
 
 #: Columns added after the table first shipped.  A record file written by
@@ -1021,10 +1178,14 @@ _JOURNAL_DDL = (
 #: fail — silently, because every write here is best effort, which would
 #: turn "we added a field" into "this wallet records nothing any more".
 #: Each is added with a DEFAULT so the existing rows read as "not
-#: recorded" rather than as a value nobody wrote.
+#: recorded" rather than as a value nobody wrote.  The default is the
+#: WORD for that -- ``unknown``, a real member of DELIVERY_ATTEMPTS --
+#: and not ``''``: an old row is a payment that was or was not attempted
+#: and nothing in the file says which, which is undetermined, and reading
+#: it as ``not_attempted`` would answer for it.
 _JOURNAL_ADDED = (
     (f"ALTER TABLE {_JOURNAL_TABLE} ADD COLUMN delivery_attempt"
-     " TEXT NOT NULL DEFAULT ''"),
+     " TEXT NOT NULL DEFAULT 'unknown'"),
 )
 
 #: The record is named after the store and sits in the same directory, so
@@ -1040,18 +1201,35 @@ _JOURNAL_MODE = 0o600
 #: recipient, not a delivery anybody watched, and said in those words.
 _NO_RECORD = {
     "recipient": "",
-    "recipient_kind": "",
+    # UNDETERMINED, not NOT_APPLICABLE: this row IS a payment, so it had a
+    # recipient of one kind or the other and an attempt was or was not
+    # made.  The file simply does not say.  These two fields read ""
+    # until this round, which is the same string the row next door uses
+    # for "no payment here at all".
+    "recipient_kind": UNDETERMINED,
     "delivery": "unknown",
     "delivery_cause": "",
-    "delivery_attempt": "",
+    "delivery_attempt": UNDETERMINED,
     "note": "no delivery record was written for this payment, so where it"
             " went is not known here",
 }
 
 #: The same five fields for a row where the question does not arise: an
 #: operation that moved no money has no delivery to have an outcome.
-_NO_DELIVERY = {"recipient": "", "recipient_kind": "", "delivery": "",
-                "delivery_cause": "", "delivery_attempt": "", "note": ""}
+#: EVERY field here is NOT_APPLICABLE and none of them is ever UNDETERMINED
+#: -- that is the whole distinction, and it is why these two dicts are
+#: written out separately instead of one defaulting into the other.
+#:
+#: THE TWO RECIPIENT FIELDS ARE A STARTING POINT, NOT THE ANSWER, on a
+#: ``pay`` row.  ``_history_row`` takes this dict for every kind and then
+#: overwrites ``recipient``/``recipient_kind`` on a ``pay`` that did not
+#: commit, from ``_planned_recipient``: no money moved, so the three
+#: DELIVERY fields stay NOT_APPLICABLE, but the payment was addressed to
+#: somebody and that question does arise.  A ``receive``, a ``refused``
+#: and an unknown kind keep all five as written here.
+_NO_DELIVERY = {"recipient": "", "recipient_kind": NOT_APPLICABLE,
+                "delivery": NOT_APPLICABLE, "delivery_cause": NOT_APPLICABLE,
+                "delivery_attempt": NOT_APPLICABLE, "note": ""}
 
 #: What a payment's record says before anything has been delivered.  Each
 #: is a complete sentence about a KNOWN situation — "bearer strings were
@@ -1104,22 +1282,50 @@ def _outcome_for(cause: str) -> str:
 #: the output back in the spendable pool -- strings ``pay()`` never
 #: returned, so that payment handed nothing over and is reported under
 #: ``recovered_mc`` rather than as money somebody else is holding.  A
-#: state this build does not know reads ``""`` -- unrecognised, not
-#: reinterpreted.
+#: state this build does not know reads ``unknown`` -- undetermined, not
+#: reinterpreted, and NOT ``""``: the store column is NOT NULL, so every
+#: token HAS a state and the question always arises.  Only a newer wallet
+#: build can produce one, which is why the tuple below is the whole of
+#: what impl/aicash/wallet.py writes today.
 STORE_STATES = ("handed_over", "spent_out", "confirmed", "pending", "orphan")
+
+#: ...and the complete value set, undetermined included.  NOT_APPLICABLE
+#: is deliberately absent: there is no token row without a store state.
+STORE_STATE_VALUES = STORE_STATES + (UNDETERMINED,)
 
 
 def _clean_store_state(value) -> str:
-    """Coerce into STORE_STATES.  Anything else is ``""`` (unrecognised)."""
+    """Coerce into STORE_STATES.  Anything else is ``unknown``."""
     text = str(value or "").strip()
-    return text if text in STORE_STATES else ""
+    return text if text in STORE_STATES else UNDETERMINED
 
 
 def _clean_attempt(value) -> str:
-    """Coerce into DELIVERY_ATTEMPTS.  Anything else is ``""`` — which
-    means NOTHING WAS RECORDED, not "it was not attempted"."""
+    """Coerce into DELIVERY_ATTEMPTS.
+
+    Anything else — missing, empty, a word from a newer build — is
+    ``unknown``: NOTHING FROM THE VOCABULARY WAS RECORDED.  It is
+    deliberately not ``not_attempted``, which is a positive statement that
+    this wallet never tried, and deliberately not ``""``, which on these
+    rows means "there is no delivery for the question to be about".  The
+    empty string reaching this function at all is a row an older build
+    wrote before the column existed: it is undetermined, and says so.
+    """
     text = str(value or "").strip()
-    return text if text in DELIVERY_ATTEMPTS else ""
+    return text if text in DELIVERY_ATTEMPTS else UNDETERMINED
+
+
+def _clean_recipient_kind(value) -> str:
+    """Coerce into RECIPIENT_KINDS.  Anything else is ``unknown``.
+
+    The same rule as ``_clean_attempt`` and for the same reason: on a
+    PAYMENT row the question "who was this for" always arises, so a hole
+    there is undetermined and never ``""``.  Rows with no payment at all
+    never come through here — they get NOT_APPLICABLE from
+    ``_NO_DELIVERY`` — which is what keeps the two states apart.
+    """
+    text = str(value or "").strip()
+    return text if text in RECIPIENT_KINDS else UNDETERMINED
 
 
 def _refused_value_clause(cause: str) -> str:
@@ -1260,8 +1466,42 @@ class _PaymentJournal:
              _clean_attempt(record.get("delivery_attempt"))),
         )
 
-    def settle(self, op_id: str, delivery: str, cause: str, note,
-               recipient: str = "", recipient_kind: str = "") -> bool:
+    def intend(self, op_id: str, mint_id: str, amount_mc: int,
+               recipient: str, recipient_kind: str) -> None:
+        """Write down WHO a payment that never committed was meant for.
+
+        Called from ``pay()``'s failure path, where the op is stranded in
+        the store and this module still holds the name the caller passed.
+        It is NOT a payment record and is never read as one: ``begin()``
+        writes those, after the money has actually moved, into a different
+        table.  This row says only "somebody asked for this, and this is
+        who they named" — the one fact about a stranded payment that
+        nothing else on the machine can reconstruct afterwards.
+
+        READ FROM THE MOMENT IT IS WRITTEN, on both surfaces that can show
+        a stranded payment: ``history()`` reads it for every ``pay`` that
+        is not ``done`` (the ``pay_pending`` row an operator stares at
+        during an outage) AND for a committed ``pay`` that handed nothing
+        over, and ``unredeemed_payments()`` reads it for the same
+        recovered ops.  Writing it and then not reading it until
+        ``recover()`` had run was the product holding an answer and
+        printing "" — the string that means the question does not arise —
+        about a payment addressed to a named wallet.
+
+        INSERT OR IGNORE: an op_id is planned once, and the first thing
+        written about it is what was asked for.
+        """
+        if not op_id:
+            return
+        self._write(
+            f"INSERT OR IGNORE INTO {_INTENT_TABLE}"
+            " (op_id, mint_id, amount_mc, recipient, recipient_kind)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (str(op_id), str(mint_id or ""), int(amount_mc or 0),
+             str(recipient or ""), _clean_recipient_kind(recipient_kind)),
+        )
+
+    def settle(self, op_id: str, delivery: str, cause: str, note) -> bool:
         """Write down what a delivery attempt actually showed.  ONCE.
 
         ``WHERE ... AND delivery = 'unknown'`` is not an optimisation: a
@@ -1272,10 +1512,27 @@ class _PaymentJournal:
         that is right only sometimes.  A row nobody settled keeps the
         ``unknown`` ``begin`` gave it.
 
-        ``recipient`` is filled in only where NOTHING was named — the
-        bearer case, where this GUI later watched the strings credited to
-        a wallet it knows the name of.  It never overwrites a name that
-        was recorded at payment time.
+        THREE COLUMNS AND ONLY THREE.  An OUTCOME is the only thing an
+        observation establishes, and this statement used to write three
+        more:
+
+        * ``recipient`` and ``recipient_kind`` say WHO THE OPERATOR ASKED
+          FOR, and that was settled at payment time by the wallet that
+          made the payment.  Filling them in from an observer's name
+          turned ``bearer`` -- a fact this wallet knew, recorded from
+          ``to=None`` -- into ``wallet``, a row saying the operator named
+          somebody they never named.  Both values are inside their closed
+          sets and both are false about the payment, which is why set
+          membership never caught it.  Where the strings actually landed
+          is a different question and is answered where it belongs: in
+          the note, which names the wallet that took them.
+        * ``delivery_attempt`` answers "did THIS WALLET ever try?" and is
+          written once, by ``begin()``, from ``deliver is not None`` --
+          the only moment anything knows.  ``settle_delivery()`` is driven
+          by the RECIPIENT's side of this GUI, where the paying wallet
+          tried nothing, so writing ``attempted`` from here contradicted
+          the field's own definition.  Nothing here has anything to add to
+          it, so it is left as recorded.
 
         Returns whether a row was actually updated, so a caller can say
         "recorded" or "there was no record to settle" instead of guessing.
@@ -1284,16 +1541,11 @@ class _PaymentJournal:
             return False
         return self._write(
             f"UPDATE {_JOURNAL_TABLE} SET delivery = ?, delivery_cause = ?,"
-            " note = ?, delivery_attempt = 'attempted',"
-            " recipient = CASE WHEN recipient = '' THEN ? ELSE recipient END,"
-            " recipient_kind = CASE WHEN recipient = ''"
-            "                      THEN ? ELSE recipient_kind END"
+            " note = ?"
             " WHERE op_id = ? AND delivery = 'unknown'",
             (_clean_delivery(delivery),
              _clean_cause(cause) if cause else "",
              _no_secrets(note)[:_SENTENCE_MAX],
-             str(recipient or ""),
-             str(recipient_kind or "") if recipient else "",
              str(op_id)),
         )
 
@@ -1323,6 +1575,7 @@ class _PaymentJournal:
                                         # write below still stands or fails
                                         # on its own merits
             conn.execute(_JOURNAL_DDL)
+            conn.execute(_INTENT_DDL)
             if not fresh:
                 for statement in _JOURNAL_ADDED:
                     try:
@@ -1384,19 +1637,76 @@ class _PaymentJournal:
                         "change_mc": int(row[4] or 0),
                         "token_count": int(row[5] or 0),
                         "recipient": str(row[6] or ""),
-                        "recipient_kind": str(row[7] or ""),
+                        # Coerced, not relayed: a row an older build
+                        # wrote (or one the settle bug above blanked)
+                        # carries "" here, and "" on a PAYMENT row is the
+                        # string that means two different things.  It
+                        # reads ``unknown`` -- undetermined -- which is
+                        # what it is.
+                        "recipient_kind": _clean_recipient_kind(row[7]),
                         "delivery": _clean_delivery(row[8]),
                         "delivery_cause": (_clean_cause(row[9])
                                            if row[9] else ""),
                         "note": str(row[10] or ""),
                         # A file written before this column existed is
-                        # read here, not refused: the field reads "" --
-                        # nothing recorded -- and every other fact in the
+                        # read here, not refused: every other fact in the
                         # row survives. A SELECT naming a missing column
                         # raises, and every row in the file would then
                         # read "unknown".
+                        # A file written before this column existed
+                        # reads ``unknown`` here, exactly as a row inside
+                        # a migrated file does: both are "nothing was
+                        # recorded", and neither is silently reinterpreted
+                        # as ``not_attempted``.
                         "delivery_attempt": (_clean_attempt(row[11])
-                                             if len(row) > 11 else ""),
+                                             if len(row) > 11
+                                             else UNDETERMINED),
+                    }
+        except Exception:               # noqa: BLE001 - see class docstring
+            return out
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:       # noqa: BLE001
+                    pass
+        return out
+
+    def intents(self, op_ids: list) -> dict:
+        """{op_id: {"recipient", "recipient_kind"}} for stranded payments.
+
+        READ-ONLY and NEVER created, like ``records()``.  Called for one
+        narrow set of ops — committed payments that handed nothing over
+        and have no payment record — so an ordinary history page, where
+        that set is empty, does not open this file at all.
+
+        A journal file written before this table existed has no table,
+        which is not an error: it is the answer "nothing was recorded",
+        and every row it would have covered reads ``unknown``.
+        """
+        if not op_ids or not os.path.exists(self.path):
+            return {}
+        out: dict = {}
+        conn = None
+        try:
+            uri = "file:" + urllib.request.pathname2url(self.path) + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+            for start in range(0, len(op_ids), _SQL_CHUNK):
+                chunk = op_ids[start:start + _SQL_CHUNK]
+                marks = ",".join("?" * len(chunk))
+                try:
+                    rows = conn.execute(
+                        "SELECT op_id, recipient, recipient_kind FROM"
+                        f" {_INTENT_TABLE} WHERE op_id IN ({marks})",
+                        tuple(chunk)).fetchall()
+                except sqlite3.OperationalError as exc:
+                    if "no such table" not in str(exc).lower():
+                        raise
+                    return out
+                for row in rows:
+                    out[str(row[0])] = {
+                        "recipient": str(row[1] or ""),
+                        "recipient_kind": _clean_recipient_kind(row[2]),
                     }
         except Exception:               # noqa: BLE001 - see class docstring
             return out
@@ -2277,7 +2587,22 @@ class WalletOps:
                 # returns, "the mint said no" and "the mint never heard of
                 # it" are the same row.  Nothing is written to the payment
                 # record: no money moved, so there is no payment to record.
+                stranded = list(self._planned or [])
                 self._settle_cause(exc.cause, exc.detail, "pay")
+                # ...AND WHO IT WAS FOR, which is a different fact and is
+                # about to be lost.  A stranded pay op can still be settled
+                # by recover() into a committed `pay` row months later, and
+                # at that point nothing on this machine remembers the name
+                # the operator typed: the recipient is not in the store (it
+                # is not a protocol fact), the strings were never returned,
+                # and there is no payment record because no payment was
+                # made.  The row then read "no recipient recorded" about a
+                # payment that named one.  This does NOT claim value went
+                # anywhere -- see _delivery_note, where it is rendered only
+                # alongside "nothing was handed over".
+                for op in stranded:
+                    self._journal.intend(op, live, amount_mc,
+                                         recipient, kind)
                 raise
             # Committed: every op this call planned is `done`, so there is
             # nothing to explain — just stop watching.
@@ -2461,6 +2786,17 @@ class WalletOps:
         op_id — an op this wallet never paid, a payment already settled,
         or no record file at all.  It is not an error and never raises
         over an outcome: the money moved either way.
+
+        ``recipient`` NAMES THE OBSERVER, not the payment.  It goes into
+        the sentence ("delivered to the recipient 'bob'") and nowhere
+        else: the record's ``recipient``/``recipient_kind`` are what the
+        PAYER asked for, they were settled when the payment was made, and
+        a wallet that took a set of bearer strings is not somebody the
+        operator named.  Nor does this touch ``delivery_attempt``, which
+        asks whether the PAYING wallet tried and is answered only by
+        ``pay()``.  A bearer payment this route watches land therefore
+        reads ``bearer`` / ``delivered`` / ``not_attempted``, all three of
+        which are true of it.
         """
         op_id = str(op_id or "")
         name = str(recipient or "").strip()
@@ -2475,9 +2811,12 @@ class WalletOps:
                         "nothing was observed about this delivery, so"
                         " nothing was recorded about it")}
         with self._entered():
-            recorded = self._journal.settle(
-                op_id, delivery, cause, note,
-                recipient=name, recipient_kind="wallet" if name else "")
+            # ONLY the outcome.  The name this route watched is already in
+            # ``note`` (``who``, above, is what every sentence there is
+            # built around); it is NOT written into ``recipient``, which
+            # records who the operator asked for.  See
+            # ``_PaymentJournal.settle``.
+            recorded = self._journal.settle(op_id, delivery, cause, note)
         return {"op_id": op_id, "recorded": bool(recorded),
                 "delivery": delivery, "delivery_cause": cause,
                 "delivery_detail": note}
@@ -2574,13 +2913,15 @@ class WalletOps:
         their own balance, against a mint whose signed supply snapshot
         only ever knew about one of them.  Their value is reported under
         its own name instead -- ``recovered_mc``, with ``recovered_ops``
-        naming the op_ids, which is what lets a reader match the ``pay``
-        rows ``history()`` prints for them against a report that hands
-        over nothing.  TWO independent marks identify such an op and
-        either is enough: this module's own cause row, written against the
-        op at the instant ``pay()`` raised (``walletops_op_causes``), and
-        a role ``payment`` output sitting in ``confirmed``, a state
-        ``_resolve_success`` can never produce for a payment output.
+        naming the op_ids AND carrying the same five record fields those
+        rows carry, which is what lets a reader match the ``pay`` rows
+        ``history()`` prints for them against a report that hands over
+        nothing -- field for field, not by op_id and hope.  TWO
+        independent marks identify such an op and either is enough: this
+        module's own cause row, written against the op at the instant
+        ``pay()`` raised (``walletops_op_causes``), and a role ``payment``
+        output sitting in ``confirmed``, a state ``_resolve_success`` can
+        never produce for a payment output.
 
         WHERE THAT IS IMPRECISE, stated rather than left to be found: the
         cause row is written by THIS module, so a pay stranded by some
@@ -2778,6 +3119,28 @@ class WalletOps:
             # the same words history() uses for it: the two views of one
             # payment must not be able to say different things.
             records = self._journal.records([p["op_id"] for p in payments])
+            # ...AND THE SAME FIVE FIELDS ON THE OPS THIS REPORT EXCLUDES.
+            # A recovered op is listed here by op_id and amount and
+            # nowhere else, and history() prints a row for the very same
+            # op_id: the two must agree field for field, or an operator
+            # matching one against the other reads two answers about one
+            # payment.  The values come from the same place history()
+            # reads them from and are built by the same function.
+            recovered_ids = [r["op_id"] for r in scan["recovered_ops"]]
+            recovered_intents = (self._journal.intents(recovered_ids)
+                                 if recovered_ids else {})
+            recovered_records = (self._journal.records(recovered_ids)
+                                 if recovered_ids else {})
+            for item in scan["recovered_ops"]:
+                note = _no_handover_note(
+                    recovered_records.get(item["op_id"]),
+                    recovered_intents.get(item["op_id"]), None)
+                item.update(
+                    recipient=note["recipient"],
+                    recipient_kind=note["recipient_kind"],
+                    delivery=note["delivery"],
+                    delivery_cause=note["delivery_cause"],
+                    delivery_attempt=note["delivery_attempt"])
             by_state = {"unspent": 0, "spent": 0, "unknown": 0, None: 0}
             listed_mc = 0
             listed_outstanding_mc = 0
@@ -3049,9 +3412,42 @@ class WalletOps:
         for, whether it was delivered, and — for one that was not — the
         cause, so that a row read three months later says which component
         to go and look at.  A payment with no record reads ``unknown``,
-        never ``delivered``.  Every other row carries ``""`` in those five
-        fields: an operation that moved no money has no delivery whose
-        outcome could be stated, and stating one would be inventing it.
+        never ``delivered``.  A row that moved no money carries ``""`` in
+        the three DELIVERY fields: there was no delivery whose outcome
+        could be stated, and stating one would be inventing it.
+
+        A PAY THAT DID NOT COMMIT still answers "who was this for".  Its
+        three delivery fields are ``""`` — nothing moved — but
+        ``recipient`` / ``recipient_kind`` carry what the request asked
+        for, read back from the row ``pay()`` wrote at the instant it
+        raised, and ``detail`` says it in the same breath as "no value
+        left the wallet".  That fact is durable and is on no other
+        surface on the machine: before this, a stranded payment to a
+        named wallet rendered with an empty recipient for as long as it
+        stayed stranded and grew one the moment ``recover()`` settled it,
+        so the product forgot a name it was holding and then remembered
+        it.  Where nothing was recorded the field reads ``unknown``,
+        never ``""``.
+
+        ``""`` AND ``unknown`` ARE NOT THE SAME ANSWER and this method is
+        where the difference is produced.  ``""`` is NOT_APPLICABLE — the
+        question does not arise, because the row is not a committed
+        payment.  ``unknown`` is UNDETERMINED — it is a committed payment
+        and nothing here says who for or whether anybody tried.  One
+        string for both made a recovered payment indistinguishable from a
+        ``receive``.
+
+        AND ONE COMMITTED PAYMENT IS NOT A PAYMENT AT ALL: a ``pay`` the
+        transport stranded and ``recover()`` settled afterwards.  The op
+        is ``done``, so every other rule here would print "paid out 5000
+        mc" — but ``pay()`` raised without returning a string and
+        ``recover()`` put the outputs back in the spendable pool, so
+        nothing was handed to anybody.  Detected by the same two marks
+        ``unredeemed_payments()`` uses (a role ``payment`` output in
+        ``confirmed``, or this module's own cause row against a ``done``
+        op) and reported as ``undelivered`` / ``not_attempted`` with the
+        recipient the request named and a ``detail`` that says where the
+        value actually is.
 
         ``cause`` is ``""`` for an op that committed and otherwise one of
         CAUSES, read back from what was recorded AT THE TIME OF FAILURE —
@@ -3064,9 +3460,11 @@ class WalletOps:
         newest by sqlite insertion order, not by time.  ``TS_UNKNOWN``
         *is* the integer ``0``, but it means UNKNOWN, never 1970 — it
         prints as ``unknown`` and ``row["ts_ms"] is TS_UNKNOWN`` is the
-        exact test.  Do not render it as a date.  ``kind`` is drawn from
-        the closed set listed in the module docstring; ``amount_mc`` is
-        always a non-negative magnitude, direction lives in ``kind``.
+        exact test.  Do not render it as a date.  ``kind`` is one of the
+        nine listed in the module docstring OR an op kind a newer build
+        wrote, passed through verbatim — it is NOT closed, so handle the
+        unrecognised case; ``amount_mc`` is always a non-negative
+        magnitude, direction lives in ``kind``.
 
         Reads the store READ-ONLY inside ONE explicit read transaction
         (``_ro_snapshot``), so the page a caller gets is one consistent
@@ -3101,7 +3499,7 @@ class WalletOps:
                         if not ops:
                             return []
                         op_ids = [o[0] for o in ops]
-                        out_by_op = _outputs_by_op(conn, op_ids)
+                        out_by_op, unhanded = _outputs_by_op(conn, op_ids)
                         causes = _causes_by_op(conn, op_ids)
                 finally:
                     conn.close()
@@ -3112,10 +3510,51 @@ class WalletOps:
             # can be is absent, which reads as "not recorded" and never as
             # "delivered".
             records = self._journal.records(op_ids)
+            # WHICH COMMITTED PAYMENTS HANDED NOTHING OVER.  The same two
+            # marks unredeemed_payments() uses, read off reads this method
+            # already made: a role `payment` output back in `confirmed`
+            # (recover() put it in the spendable pool, so it never left),
+            # and this module's own cause row, which _settle_cause writes
+            # only against an op that was NOT done when pay() raised --
+            # and pay() raises without returning a single string.  Either
+            # is enough; both mean nobody outside this wallet file ever
+            # saw those secrets.  Spelled here exactly as it is spelled
+            # there so the two views of one payment cannot disagree.
+            nothing_handed = {
+                op_id for op_id, kind, state, _plan in ops
+                if kind == "pay" and state == "done"
+                and (op_id in unhanded or op_id in causes)
+            }
+            # ...AND EVERY PAY THAT HAS NOT COMMITTED.  The row an
+            # operator actually stares at during an outage is this one,
+            # for the hours before recover() can run, and it is the row
+            # they decide from whether to send the payment again.  The
+            # name is in the intent table either way -- pay() wrote it
+            # down at the instant it raised -- so a row that reported it
+            # only after recover() had turned the op into a committed
+            # payment was the product visibly forgetting a fact and then
+            # remembering it.  A `pay` that did not commit is a PAYMENT:
+            # "who was this for" arises on it, and answering "" -- the
+            # string that means the question does not arise -- about a
+            # payment addressed to a named wallet whose name is one SELECT
+            # away was the same defect this round exists to close.
+            stranded = {op_id for op_id, kind, state, _plan in ops
+                        if kind == "pay" and state != "done"}
+            # Asked for ONLY where an answer is missing: on an ordinary
+            # page both sets are empty and the record file is not opened
+            # twice.  (A pay that never committed never has a payment
+            # record -- begin() writes one only after the money moved --
+            # so `records` subtracts nothing from `stranded` in practice
+            # and is checked anyway rather than assumed.)
+            wanted = [op for op in (nothing_handed | stranded)
+                      if op not in records]
+            intents = self._journal.intents(wanted) if wanted else {}
         return [
             _history_row(op_id, kind, state, request_json,
                          out_by_op.get(op_id, {}), causes.get(op_id),
-                         records.get(op_id))
+                         records.get(op_id),
+                         handed_over=op_id not in nothing_handed,
+                         intent=intents.get(op_id))
             for op_id, kind, state, request_json in ops
         ]
 
@@ -3125,24 +3564,40 @@ class WalletOps:
 # ---------------------------------------------------------------------------
 
 
-def _outputs_by_op(conn, op_ids: list) -> dict:
-    """{op_id: {role: total_mc}} for many ops in ONE grouped query.
+def _outputs_by_op(conn, op_ids: list) -> tuple[dict, set]:
+    """({op_id: {role: total_mc}}, {op_ids that handed nothing over}).
 
     Deliberately not one query per row: ``history()`` is polled, and a
-    per-row query is both an N+1 and a different snapshot per row.
+    per-row query is both an N+1 and a different snapshot per row.  The
+    second answer rides on the SAME grouped query for the same reason —
+    it is one more aggregate over rows this statement already visits, not
+    a second pass over the table.
+
+    THE SECOND ANSWER is the mark ``unredeemed_payments()`` uses, spelled
+    the same way so the two views of one payment cannot disagree: a role
+    ``payment`` output sitting in ``confirmed`` is a state
+    ``_resolve_success`` can never produce for a payment output, so it
+    means ``Wallet.recover()`` settled a stranded pay op and put the value
+    back in the spendable pool — the strings were never handed to
+    anybody.  ``history()`` adds this module's own cause row to it, which
+    is the other independent mark.
     """
     out: dict = {}
+    unhanded: set = set()
     for start in range(0, len(op_ids), _SQL_CHUNK):
         chunk = op_ids[start:start + _SQL_CHUNK]
         marks = ",".join("?" * len(chunk))
         rows = conn.execute(
-            "SELECT op_id, role, COALESCE(SUM(amount_mc), 0) FROM"
+            "SELECT op_id, role, COALESCE(SUM(amount_mc), 0),"
+            " MAX(CASE WHEN state = 'confirmed' THEN 1 ELSE 0 END) FROM"
             f" wallet_tokens WHERE op_id IN ({marks}) GROUP BY op_id, role",
             tuple(chunk),
         ).fetchall()
-        for op_id, role, total in rows:
+        for op_id, role, total, any_confirmed in rows:
             out.setdefault(op_id, {})[str(role)] = int(total or 0)
-    return out
+            if str(role) == "payment" and any_confirmed:
+                unhanded.add(str(op_id))
+    return out, unhanded
 
 
 @contextlib.contextmanager
@@ -3233,7 +3688,8 @@ def _causes_by_op(conn, op_ids: list) -> dict:
 
 
 def _history_row(op_id, kind, state, request_json, out_by_role: dict,
-                 cause_row=None, record=None) -> dict:
+                 cause_row=None, record=None, *, handed_over: bool = True,
+                 intent=None) -> dict:
     inputs = _plan_inputs(request_json)
     face_in, unparsed = 0, 0
     for tok in inputs:
@@ -3258,16 +3714,44 @@ def _history_row(op_id, kind, state, request_json, out_by_role: dict,
     if kind == "pay":
         paid = out_by_role.get("payment", 0)
         change = out_by_role.get("change", 0)
-        if committed:
+        if committed and not handed_over:
+            # COMMITTED, AND NOTHING LEFT.  recover() settled a pay op the
+            # transport stranded: the op is `done`, so every other branch
+            # here would print "paid out 5000 mc" about money that is
+            # sitting in the spendable balance.  The amount stays the
+            # payment's own permanent figure -- it is what
+            # unredeemed_payments() reports this op under, and the two
+            # must key and total alike -- and the sentence says what
+            # became of it.
+            delivery = _delivery_note(record, handed_over=False,
+                                      intent=intent, cause_row=cause_row)
+            amount, detail = paid, (
+                f"payment of {paid} mc was stranded in flight, {burn_txt}"
+                f" — {delivery['note']}"
+            )
+        elif committed:
             delivery = _delivery_note(record)
             amount, detail = paid, (
                 f"paid out {paid} mc, {burn_txt}, {change} mc change"
                 f" returned to the wallet — {delivery['note']}"
             )
         else:
+            # DID NOT COMMIT, AND STILL A PAYMENT.  No money moved, so
+            # every delivery field stays NOT_APPLICABLE -- there is no
+            # delivery for an outcome to be about.  But "who was this
+            # for" DOES arise on a payment, pay() wrote the answer down
+            # at the instant it raised, and printing "" there said the
+            # question did not arise about a payment addressed to a named
+            # wallet.  The name is stated in the same breath as "no value
+            # left the wallet", exactly as it is on the recovered row, so
+            # it can never be read as a claim that value reached anybody.
+            planned = _planned_recipient(intent)
+            delivery["recipient"] = planned["recipient"]
+            delivery["recipient_kind"] = planned["recipient_kind"]
             amount, detail = 0, (
                 f"payment of {paid} mc did not commit"
                 f" ({note}); no value left the wallet"
+                f" — {planned['note']}"
             )
     elif kind == "receive":
         n = len(inputs)
@@ -3341,14 +3825,21 @@ def _delivery_from_error(exc, who: str, op_id: str) -> tuple[str, str, str]:
     cause = _clean_cause(getattr(exc, "cause", None))
     said = getattr(exc, "detail", "") or getattr(exc, "reason", "") or exc
     if _outcome_for(cause) == "unknown":
-        # Nobody answered.  The OUTCOME is undetermined (§5.1) but the
-        # cause is not: "nobody answered" is the most precise word there
-        # is for it, it is in the pinned vocabulary, and throwing it away
-        # made this row byte-identical to a payment never attempted.
+        # The OUTCOME is undetermined (§5.1) but the cause is not, and the
+        # two causes that land here are undetermined for OPPOSITE reasons.
+        # mint_unreachable means nobody answered.  unknown means something
+        # answered and established nothing -- so saying "nothing answered"
+        # there denies an answer this very note then goes on to quote,
+        # which is how one sentence came to contradict itself four words
+        # in.  Same outcome, different evidence, different sentence.
+        if cause == "unknown":
+            happened = (f"{who} was sent this payment and the attempt came"
+                        f" back saying nothing either way")
+        else:
+            happened = f"{who} was sent this payment and nothing answered"
         return "unknown", cause, _note_with_quote(
-            f"{who} was sent this payment and nothing answered — whether it"
-            f" was credited there is undetermined; check with the mint"
-            f" before paying again (op {op_id}).", said)
+            f"{happened} — whether it was credited there is undetermined;"
+            f" check with the mint before paying again (op {op_id}).", said)
     return "undelivered", cause, _note_with_quote(
         f"{who} did not take this payment — {_refused_value_clause(cause)}"
         f" (op {op_id}; unredeemed_payments() says which of its strings are"
@@ -3390,7 +3881,104 @@ def _delivery_from_result(result, who: str, op_id: str) -> tuple[str, str, str]:
         f" live now)", "")
 
 
-def _delivery_note(record) -> dict:
+def _whose_clause(who: str, kind: str) -> str:
+    """"Who was this payment for", in the weakest true words there are.
+
+    Three answers, not two, because ``bearer`` and "nothing was recorded"
+    are different facts and the sentence has to keep them apart just as
+    ``recipient_kind`` does.  Said ONLY beside a statement that nothing
+    was handed over, here and in ``_history_row``'s did-not-commit
+    branch, so a name can never be read as a claim about where value
+    went.
+    """
+    if who:
+        return f"it was meant for {who}"
+    if kind == "bearer":
+        return "no recipient was named"
+    return "no record says who it was meant for"
+
+
+def _planned_recipient(intent) -> dict:
+    """Who a payment that NEVER COMMITTED was asked to go to.
+
+    The source is the intent row ``pay()`` wrote at the instant it
+    raised, and it is the only place on the machine that still holds the
+    name: the recipient is not a protocol fact, so it is not in the
+    store; no strings were returned; and there is no payment record,
+    because no payment was made.
+
+    NO INTENT ROW is ``unknown`` -- UNDETERMINED -- and never ``""``.
+    The row is a payment, so the question arises; what is missing is the
+    answer, which is what ``_clean_recipient_kind`` already says about a
+    hole on a payment row.  ``""`` there would claim the question does
+    not arise about a payment somebody asked for.
+    """
+    who = str((intent or {}).get("recipient") or "")
+    kind = _clean_recipient_kind((intent or {}).get("recipient_kind"))
+    return {"recipient": who, "recipient_kind": kind,
+            "note": _whose_clause(who, kind)}
+
+
+def _no_handover_note(record, intent, cause_row) -> dict:
+    """The five record fields for a payment that HANDED NOTHING OVER.
+
+    The row exists, the op is ``done``, and the value is back in this
+    wallet's spendable pool because ``recover()`` settled an operation the
+    transport stranded.  Every field here is a fact, and each is the
+    weakest true one:
+
+    * ``delivery`` is ``undelivered`` and not ``unknown`` — the strings
+      this payment planned were never returned to any caller and are in
+      this wallet's own token table, so "whether it reached anybody is
+      undetermined" is a softer claim than the evidence supports.
+    * ``delivery_attempt`` is ``not_attempted``, for the same reason and
+      with the same evidence: there was nothing to attempt a delivery
+      with.
+    * ``delivery_cause`` is NOT_APPLICABLE.  No delivery was made, so no
+      delivery failed, so nothing failed with a cause.  What stranded the
+      PAYMENT is a different question and is named in the sentence.
+    * the recipient is whatever was recorded — the payment record if
+      somehow one exists, otherwise the name ``pay()`` wrote down when it
+      raised.  It is stated only ever in the same breath as "nothing was
+      handed over", because it is a fact about what was ASKED FOR and
+      never one about where value went.
+    """
+    who = str((record or {}).get("recipient")
+              or (intent or {}).get("recipient") or "")
+    kind = _clean_recipient_kind((record or {}).get("recipient_kind")
+                                 or (intent or {}).get("recipient_kind"))
+    stranded_by = _clean_cause(cause_row[0]) if cause_row else ""
+    whose = _whose_clause(who, kind)
+    return {
+        "recipient": who,
+        "recipient_kind": kind,
+        "delivery": "undelivered",
+        "delivery_cause": NOT_APPLICABLE,
+        "delivery_attempt": "not_attempted",
+        "note": (
+            f"nothing was handed over: {whose}, and its token strings were"
+            f" never returned to anybody"
+            + ("" if not stranded_by else
+               " (what stranded the payment was never recorded)"
+               if stranded_by == UNDETERMINED
+               else f" (stranded by {stranded_by})")
+            # PAST TENSE, AND IT STAYS TRUE.  "the value IS in this
+            # wallet's spendable balance" stopped being true the moment
+            # the operator spent those coins on the next payment -- and
+            # the row is permanent, so it went on asserting it.  What
+            # happened (the value was returned) is a fact about an event
+            # and is true forever; where the money is now is a question
+            # for summary(), which is read live.
+            + ". recover() settled the operation against the mint's ledger"
+              " and the value was returned to this wallet's spendable"
+              " balance; unredeemed_payments() reports this op as"
+              " recovered rather than as money somebody else is holding"
+        ),
+    }
+
+
+def _delivery_note(record, *, handed_over: bool = True, intent=None,
+                   cause_row=None) -> dict:
     """The five record fields plus a clause, for ONE committed payment.
 
     THE OTHER HALF OF THE ROUND-4 FIX.  A row that said only "paid out
@@ -3405,11 +3993,13 @@ def _delivery_note(record) -> dict:
     or by a process that died before it could write: the money left, and
     where it went is not recorded here.
     """
+    if not handed_over:
+        return _no_handover_note(record, intent, cause_row)
     if not record:
         return dict(_NO_RECORD)
     out = {
         "recipient": str(record.get("recipient", "")),
-        "recipient_kind": str(record.get("recipient_kind", "")),
+        "recipient_kind": _clean_recipient_kind(record.get("recipient_kind")),
         "delivery": _clean_delivery(record.get("delivery")),
         "delivery_cause": (_clean_cause(record.get("delivery_cause"))
                            if record.get("delivery_cause") else ""),

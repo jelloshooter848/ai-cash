@@ -30,9 +30,15 @@ from aicash.tokencodec import (format_token, ledger_key,        # noqa: E402
 from aicash.wallet import MintClient, Wallet                 # noqa: E402
 
 try:                                    # run as `python3 -m unittest gui.test_walletops`
-    from gui.walletops import WalletOps, WalletOpsError
+    from gui.walletops import (DELIVERY_ATTEMPT_VALUES, DELIVERY_VALUES,
+                               NOT_APPLICABLE, RECIPIENT_KIND_VALUES,
+                               STORE_STATE_VALUES, UNDETERMINED,
+                               WalletOps, WalletOpsError)
 except ImportError:                     # run from inside gui/
-    from walletops import WalletOps, WalletOpsError          # noqa: F401
+    from walletops import (DELIVERY_ATTEMPT_VALUES,          # noqa: F401
+                           DELIVERY_VALUES, NOT_APPLICABLE,
+                           RECIPIENT_KIND_VALUES, STORE_STATE_VALUES,
+                           UNDETERMINED, WalletOps, WalletOpsError)
 
 MINT_ID = "guitestmint"
 ADMIN = "operator-secret"
@@ -562,13 +568,13 @@ class TestHistory(MintFixture):
             for field in ("recipient", "recipient_kind", "delivery",
                           "delivery_cause", "delivery_attempt"):
                 self.assertIsInstance(e[field], str)
-            # A closed set, "" included: "nothing was recorded" is a real
-            # value and anything outside the three would widen it.
-            self.assertIn(e["delivery_attempt"],
-                          ("", "attempted", "not_attempted"))
-            self.assertIn(e["delivery"], ("", "delivered", "undelivered",
-                                          "unknown"))
-            self.assertIn(e["recipient_kind"], ("", "wallet", "bearer"))
+            # A closed set, and the module's OWN declaration of it:
+            # asserting a tuple copied into this file would go on passing
+            # after the module started emitting a value the tuple does not
+            # contain, which is the exact defect these fields have.
+            self.assertIn(e["delivery_attempt"], DELIVERY_ATTEMPT_VALUES)
+            self.assertIn(e["delivery"], DELIVERY_VALUES)
+            self.assertIn(e["recipient_kind"], RECIPIENT_KIND_VALUES)
             self.assertTrue(e["delivery_cause"] == "" or
                             e["delivery_cause"] in _causes())
             # Everything here committed, so there is no cause to give.
@@ -1643,14 +1649,12 @@ class TestOutstandingPayments(MintFixture):
                               "recipient", "recipient_kind", "delivery",
                               "delivery_cause", "delivery_attempt"})
             self.assertIn(payment["delivery_attempt"],
-                          ("", "attempted", "not_attempted"))
+                          DELIVERY_ATTEMPT_VALUES)
             for token in payment["tokens"]:
                 self.assertEqual(set(token),
                                  {"token", "amount_mc", "key", "state",
                                   "store_state"})
-                self.assertIn(token["store_state"],
-                              ("", "handed_over", "spent_out", "confirmed",
-                               "pending", "orphan"))
+                self.assertIn(token["store_state"], STORE_STATE_VALUES)
 
     def test_no_second_copy_of_the_money_is_written_anywhere(self):
         """The decision: read the store back, never write the strings down.
@@ -1772,6 +1776,24 @@ def _record_rows(store_path):
             " recipient, recipient_kind, delivery, delivery_cause, note,"
             " delivery_attempt"
             f" FROM walletops_payments").fetchall()
+    finally:
+        conn.close()
+
+
+def _wipe_intents(store_path):
+    """Delete the intent table beside a store, keeping everything else.
+
+    A pay stranded by some OTHER tool driving the same wallet file leaves
+    no row there, and that is the state this simulates: the question
+    still arose, and nothing answers it.
+    """
+    import sqlite3
+    path = store_path[:-3] + ".payments.db" if store_path.endswith(".db") \
+        else store_path + ".payments.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DELETE FROM walletops_payment_intents")
+        conn.commit()
     finally:
         conn.close()
 
@@ -2166,21 +2188,53 @@ class TestPaymentRecord(MintFixture):
         row = self.pay_row(alice, out["op_id"])
         self.assertEqual(row["delivery"], "delivered")
         self.assertEqual(row["recipient"], "bob")
-        self.assertEqual(row["delivery_attempt"], "attempted")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        # DID THIS WALLET EVER TRY?  No: it was given no deliver= and the
+        # observation came from the recipient's side of this GUI.  This
+        # line used to assert "attempted", which is the field saying the
+        # opposite of its own definition -- and it is the difference
+        # between "never sent" and "sent and lost", which send an operator
+        # to different components.
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
 
-    def test_settle_delivery_names_a_bearer_payment_it_watched_land(self):
+    def test_a_named_observer_cannot_rewrite_a_bearer_payment(self):
+        """THE ARM ``gui/app.py`` ACTUALLY DRIVES.
+
+        POST /api/wallet/receive always knows the name of the wallet it
+        just credited, so it always passes one; this is the only arm of
+        the CASE the product reaches.  It used to rewrite two closed-set
+        fields into members that are not true of the payment:
+        ``recipient_kind`` said the operator named a wallet (they named
+        nobody: ``bearer`` was a fact THIS wallet knew at payment time),
+        and ``recipient`` named that wallet as the one asked for.  Both
+        values are inside their sets, which is why a membership sweep
+        could not see it.
+
+        What the observer watched is not lost — it is in the note, where
+        it belongs: the record says WHO WAS ASKED FOR, the note says where
+        the strings landed.
+        """
         alice = self.funded("alice")
         bob = self.ops("bob")
         out = alice.pay(5_000)                      # no recipient named
         self.assertEqual(out["recipient_kind"], "bearer")
-        bob.receive(out["tokens"])
-        alice.settle_delivery(out["op_id"],
-                              result={"rejected": [], "accepted_mc": 4_950},
-                              recipient="bob")
+        got = bob.receive(out["tokens"])
+        self.assertEqual(got["rejected"], [])
+        noted = alice.settle_delivery(out["op_id"], result=got,
+                                      recipient="bob")
+        self.assertTrue(noted["recorded"])
         row = self.pay_row(alice, out["op_id"])
-        self.assertEqual(row["recipient"], "bob")
-        self.assertEqual(row["recipient_kind"], "wallet")
-        self.assertEqual(row["delivery"], "delivered")
+        self.assertEqual(row["delivery"], "delivered")      # the new fact
+        self.assertEqual(row["recipient_kind"], "bearer")   # the old ones
+        self.assertEqual(row["recipient"], "")
+        # ...and THIS wallet never tried to deliver anything
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
+        # ...while the wallet that took the strings is still on the row
+        self.assertIn("bob", row["detail"])
+        # and every value is still inside its declared set
+        self.assertIn(row["recipient_kind"], RECIPIENT_KIND_VALUES)
+        self.assertIn(row["delivery"], DELIVERY_VALUES)
+        self.assertIn(row["delivery_attempt"], DELIVERY_ATTEMPT_VALUES)
 
     def test_settle_delivery_on_an_op_with_no_record_records_nothing(self):
         alice = self.funded("alice")
@@ -2228,12 +2282,434 @@ class TestPaymentRecord(MintFixture):
         row = self.pay_row(alice, out["op_id"])
         self.assertEqual(row["recipient"], "bob")       # still readable
         self.assertEqual(row["delivery"], "unknown")
-        self.assertEqual(row["delivery_attempt"], "")   # nothing recorded
+        # NOTHING WAS RECORDED, and that is a word -- not "" (which on
+        # these rows means "this is not a payment, so the question does
+        # not arise") and not "not_attempted" (which would answer, on an
+        # old row's behalf, a question nobody asked it).
+        self.assertEqual(row["delivery_attempt"], UNDETERMINED)
+        self.assertIn(row["delivery_attempt"], DELIVERY_ATTEMPT_VALUES)
         # ...and a later write migrates the file rather than failing
         alice.pay(1_000, to="carol")
         rows = {r[5]: r[10] for r in _record_rows(self.path("alice"))}
         self.assertEqual(rows["carol"], "not_attempted")
-        self.assertEqual(rows["bob"], "")
+        # the migration's own DEFAULT says it too, in the file itself
+        self.assertEqual(rows["bob"], UNDETERMINED)
+
+    # -- interrupted, then recovered: the row nothing was handed over ----
+
+    def strand_a_payment(self, ops, amount_mc=5_000, **kw):
+        """Interrupt a payment the way the transport really interrupts one.
+
+        ``DeliverThenDropClient`` puts the exchange on the wire, lets the
+        MINT COMMIT IT, and drops the response — §5.1's crash-in-flight,
+        and the only way to reach the row this section is about.  ``pay()``
+        raises without returning a single string, the op is left
+        ``planned``, and ``recover()`` afterwards settles it against the
+        ledger into a committed ``pay`` that handed nothing to anybody.
+        """
+        ops._open()                     # bind, so there is a client to swap
+        ops._wallet.client = DeliverThenDropClient(self.base)
+        try:
+            with self.assertRaises(WalletOpsError) as cm:
+                ops.pay(amount_mc, **kw)
+            self.assertEqual(cm.exception.cause, "mint_unreachable")
+        finally:
+            ops._wallet.client = MintClient(self.base)
+        return cm.exception
+
+    def test_a_recovered_payment_carries_no_field_outside_its_closed_set(self):
+        """THE DEFECT THIS SECTION EXISTS TO CLOSE.
+
+        Interrupt a payment, recover it, and read the row.  Until this
+        round it came back with ``recipient_kind: ""`` and
+        ``delivery_attempt: ""`` — neither of which is in either
+        vocabulary, and both of which are the SAME string the row next
+        door uses for "this is not a payment, so the question does not
+        arise".  A missing value wearing a value's clothes, which is the
+        defect this project has now closed three times elsewhere.
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        self.assertEqual(alice.recover()["ops_confirmed"], 1)
+
+        row = self.pay_row(alice)
+        self.assertIn(row["recipient_kind"], RECIPIENT_KIND_VALUES)
+        self.assertIn(row["delivery_attempt"], DELIVERY_ATTEMPT_VALUES)
+        self.assertIn(row["delivery"], DELIVERY_VALUES)
+        # ...and specifically NOT the blank that meant two things
+        self.assertNotEqual(row["recipient_kind"], NOT_APPLICABLE)
+        self.assertNotEqual(row["delivery_attempt"], NOT_APPLICABLE)
+        # The product knew all three of these before it printed the row.
+        self.assertEqual(row["delivery"], "undelivered")
+        self.assertEqual(row["delivery_attempt"], "not_attempted")
+        self.assertEqual(row["delivery_cause"], NOT_APPLICABLE)
+        self.assertIn("nothing was handed over", row["detail"])
+
+    def test_a_recovered_payment_still_names_who_it_was_meant_for(self):
+        """The name the operator typed is a fact about what was ATTEMPTED.
+
+        It is not a fact about where value went — nothing went anywhere —
+        and the row says both in one breath.  Dropping it to "" threw away
+        the only thing that tells one stranded payment from another, and
+        nothing on this machine could reconstruct it afterwards: it is not
+        in the store (a recipient is not a protocol fact), the strings
+        were never returned, and there is no payment record because there
+        was no payment.
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        alice.recover()
+        row = self.pay_row(alice)
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        # ...and the sentence never lets the name read as a destination
+        self.assertIn("nothing was handed over", row["detail"])
+        self.assertIn("meant for bob", row["detail"])
+        self.assertIn("spendable balance", row["detail"])
+
+    def test_a_stranded_bearer_payment_records_bearer_not_a_blank(self):
+        alice = self.funded("alice")
+        self.strand_a_payment(alice)            # no recipient named
+        alice.recover()
+        row = self.pay_row(alice)
+        self.assertEqual(row["recipient_kind"], "bearer")
+        self.assertEqual(row["recipient"], "")
+        self.assertIn("no recipient was named", row["detail"])
+
+    def test_a_recovered_row_is_not_the_same_row_as_a_delivered_payment(self):
+        """Distinguishable in MACHINE-READABLE fields, not only in prose."""
+        alice = self.funded("alice", face=200_000)
+        bob = self.ops("bob")
+        good = alice.pay(5_000, to="bob", deliver=bob.receive)
+        self.assertEqual(good["delivery"], "delivered")
+        self.strand_a_payment(alice, to="bob")
+        alice.recover()
+
+        rows = {r["op_id"]: r for r in alice.history() if r["kind"] == "pay"}
+        self.assertEqual(len(rows), 2)
+        shapes = {(r["recipient_kind"], r["delivery"], r["delivery_attempt"])
+                  for r in rows.values()}
+        self.assertEqual(shapes, {("wallet", "delivered", "attempted"),
+                                  ("wallet", "undelivered", "not_attempted")})
+        # Both name bob; only one of them is a claim about where money is.
+        self.assertEqual({r["recipient"] for r in rows.values()}, {"bob"})
+        self.assertIn("delivered to", rows[good["op_id"]]["detail"])
+        self.assertNotIn("nothing was handed over",
+                         rows[good["op_id"]]["detail"])
+
+    def test_the_two_views_of_a_recovered_payment_agree_field_for_field(self):
+        """history() and unredeemed_payments() describe one op.
+
+        The last round stopped the recovered value being counted twice;
+        this one stops the two reports describing it differently.  An
+        operator matches them by op_id, and two panels answering one
+        question two ways is the defect both of them exist to have ended.
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        alice.recover()
+        row = self.pay_row(alice)
+        out = alice.unredeemed_payments()
+        self.assertEqual(out["recovered_mc"], 5_000)
+        self.assertEqual([p["op_id"] for p in out["payments"]], [])
+        recovered = [r for r in out["recovered_ops"]
+                     if r["op_id"] == row["op_id"]]
+        self.assertEqual(len(recovered), 1)
+        for field in ("recipient", "recipient_kind", "delivery",
+                      "delivery_cause", "delivery_attempt"):
+            self.assertEqual(recovered[0][field], row[field], field)
+        self.assertEqual(recovered[0]["amount_mc"], row["amount_mc"])
+
+    def test_a_stranded_payment_that_never_recovers_claims_no_delivery(self):
+        """The neighbouring row, so the fix cannot leak into it.
+
+        Until recover() runs the op is `planned`: no money moved that this
+        wallet knows of, so there is no DELIVERY for a question to be
+        about, and all three delivery fields are NOT_APPLICABLE rather
+        than a claim about a payment that may not exist.
+
+        The two RECIPIENT fields are the opposite case, and this test used
+        to assert the defect: a `pay_pending` row IS a payment, "who was
+        this for" arises on it, and the answer is one SELECT away in this
+        module's own intent table.  NOT_APPLICABLE there said the question
+        did not arise about a payment addressed to a named wallet.
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        rows = [r for r in alice.history() if r["kind"].startswith("pay")]
+        self.assertEqual([r["kind"] for r in rows], ["pay_pending"])
+        for field in ("delivery", "delivery_cause", "delivery_attempt"):
+            self.assertEqual(rows[0][field], NOT_APPLICABLE, field)
+        self.assertEqual(rows[0]["recipient"], "bob")
+        self.assertEqual(rows[0]["recipient_kind"], "wallet")
+        self.assertIn(rows[0]["recipient_kind"], RECIPIENT_KIND_VALUES)
+        # ...and the name is never sayable except beside "no value left"
+        self.assertIn("no value left the wallet", rows[0]["detail"])
+        self.assertIn("meant for bob", rows[0]["detail"])
+        self.assertEqual(rows[0]["cause"], "mint_unreachable")
+        # ...and nothing was written to the PAYMENT record for it
+        self.assertEqual(_record_rows(self.path("alice")), [])
+
+    def test_a_stranded_pay_names_one_recipient_throughout(self):
+        """THE PRODUCT MUST NOT FORGET A NAME AND THEN REMEMBER IT.
+
+        One durable fact, one op_id, two readings of the same row minutes
+        apart: the state an operator stares at during an outage, and the
+        state after recover() settles it.  They used to disagree —
+        ``recipient: ""`` while stranded, ``recipient: "bob"`` afterwards
+        — off the SAME intent row, which was already on disk both times.
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        self.strand_a_payment(alice, to="carol")
+        self.strand_a_payment(alice)                    # bearer
+
+        def named(w):
+            return {r["op_id"]: (r["recipient"], r["recipient_kind"])
+                    for r in w.history() if r["kind"].startswith("pay")}
+
+        before = named(alice)
+        self.assertEqual(sorted(before.values()),
+                         [("", "bearer"), ("bob", "wallet"),
+                          ("carol", "wallet")])
+        alice.recover()
+        after = named(alice)
+        self.assertEqual(before, after)
+        # ...and none of the stranded rows claimed a delivery outcome
+        self.assertEqual(
+            {r["delivery"] for r in alice.history()
+             if r["kind"] == "pay_pending"}, set())
+
+    def test_a_stranded_payment_with_no_intent_row_is_undetermined(self):
+        """No answer is ``unknown``, never ``""``.
+
+        A pay stranded by some other tool driving the same wallet file
+        leaves no intent row.  The question still arose — somebody asked
+        for this payment — so the row says it does not know, in the word
+        that means that, and not in the string that means "there was no
+        payment here".
+        """
+        alice = self.funded("alice")
+        self.strand_a_payment(alice, to="bob")
+        _wipe_intents(self.path("alice"))
+        row = [r for r in alice.history()
+               if r["kind"] == "pay_pending"][0]
+        self.assertEqual(row["recipient"], "")
+        self.assertEqual(row["recipient_kind"], UNDETERMINED)
+        self.assertNotEqual(row["recipient_kind"], NOT_APPLICABLE)
+        self.assertIn("no record says who it was meant for", row["detail"])
+        self.assertEqual(row["delivery"], NOT_APPLICABLE)
+
+    def test_every_closed_set_field_of_every_history_row_is_in_its_set(self):
+        """THE SWEEP, driven rather than reasoned about.
+
+        Nine payments across every path that writes one of these fields —
+        bearer, named, delivered, refused, interrupted, unanswered, a
+        payment with its record deleted, one stranded, one stranded and
+        recovered — read back through history() and through
+        unredeemed_payments(), asserting only that every value came from
+        the set the module itself declares.
+        """
+        alice = self.funded("alice", face=400_000)
+        bob = self.ops("bob")
+        alice.pay(5_000)                                    # bearer
+        alice.pay(5_000, to="bob")                          # named, no deliver
+        alice.pay(5_000, to="bob", deliver=bob.receive)     # delivered
+
+        def refuse(_tokens):
+            raise WalletOpsError("mint said no", "refused outright",
+                                 "mint_rejected")
+        alice.pay(5_000, to="bob", deliver=refuse)          # undelivered
+
+        def interrupted(_tokens):
+            raise KeyboardInterrupt("operator hit ctrl-c")
+        with self.assertRaises(KeyboardInterrupt):
+            alice.pay(5_000, to="bob", deliver=interrupted)
+
+        def raises_oddly(_tokens):
+            raise RuntimeError("something else entirely")
+        alice.pay(5_000, to="bob", deliver=raises_oddly)    # unknown/unknown
+
+        self.strand_a_payment(alice, to="carol")            # pay_pending
+        alice.recover()                                     # -> recovered
+        self.strand_a_payment(alice, to="dave")             # left pending
+
+        rows = alice.history()
+        self.assertGreaterEqual(len([r for r in rows
+                                     if r["kind"] == "pay"]), 6)
+        for row in rows:
+            with self.subTest(kind=row["kind"], op=row["op_id"][:8]):
+                self.assertIn(row["recipient_kind"], RECIPIENT_KIND_VALUES)
+                self.assertIn(row["delivery"], DELIVERY_VALUES)
+                self.assertIn(row["delivery_attempt"],
+                              DELIVERY_ATTEMPT_VALUES)
+                self.assertTrue(row["delivery_cause"] == NOT_APPLICABLE
+                                or row["delivery_cause"] in _causes())
+                self.assertTrue(row["cause"] == NOT_APPLICABLE
+                                or row["cause"] in _causes())
+                # NOT_APPLICABLE means "the question does not arise", and
+                # which questions arise depends on the row.  A PAYMENT --
+                # committed or not -- always had a recipient or was
+                # deliberately bearer, so `recipient_kind` is never the
+                # blank on one.  A DELIVERY only exists where money
+                # actually moved, so the three delivery fields are blank
+                # on every pay that did not commit.  This split is the
+                # sweep's whole point: it used to lump `pay_pending` and
+                # `pay_failed` in with `receive` and so asserted the
+                # defect -- "no recipient here" about a payment whose
+                # recipient this module had written down.
+                if row["kind"].startswith("pay"):
+                    self.assertNotEqual(row["recipient_kind"],
+                                        NOT_APPLICABLE)
+                if row["kind"] == "pay":
+                    self.assertNotEqual(row["delivery_attempt"],
+                                        NOT_APPLICABLE)
+                if row["kind"] in ("pay_pending", "pay_failed"):
+                    self.assertEqual(row["delivery_attempt"], NOT_APPLICABLE)
+                    self.assertEqual(row["delivery"], NOT_APPLICABLE)
+                    self.assertEqual(row["delivery_cause"], NOT_APPLICABLE)
+                if row["kind"] == "receive":
+                    self.assertEqual(row["recipient"], NOT_APPLICABLE)
+                    self.assertEqual(row["recipient_kind"], NOT_APPLICABLE)
+                    self.assertEqual(row["delivery_attempt"], NOT_APPLICABLE)
+                    self.assertEqual(row["delivery"], NOT_APPLICABLE)
+
+        out = alice.unredeemed_payments()
+        for payment in list(out["payments"]) + list(out["recovered_ops"]):
+            with self.subTest(op=payment["op_id"][:8]):
+                self.assertIn(payment["recipient_kind"],
+                              RECIPIENT_KIND_VALUES)
+                self.assertIn(payment["delivery"], DELIVERY_VALUES)
+                self.assertIn(payment["delivery_attempt"],
+                              DELIVERY_ATTEMPT_VALUES)
+                self.assertNotEqual(payment["recipient_kind"],
+                                    NOT_APPLICABLE)
+                self.assertNotEqual(payment["delivery_attempt"],
+                                    NOT_APPLICABLE)
+                for token in payment.get("tokens", ()):
+                    self.assertIn(token["store_state"], STORE_STATE_VALUES)
+                    self.assertIn(token["state"],
+                                  ("unspent", "spent", "unknown", None))
+
+    def test_every_recipient_kind_is_what_the_caller_actually_asked_for(self):
+        """THE SWEEP ASKED THE WEAKER QUESTION, so this one asks the other.
+
+        "Is this value inside its declared tuple" cannot see a value that
+        is in the tuple and false about the payment — which is what both
+        of this round's defects were.  So every row here is checked
+        against the ground truth held OUTSIDE the product: the ``to=``
+        the test itself passed.  ``wallet`` iff a name was given,
+        ``bearer`` iff none was, on every path that writes the field and
+        in every state a payment can be read in.
+        """
+        alice = self.funded("alice", face=400_000)
+        bob = self.ops("bob")
+        asked = {}                      # op_id -> what the caller asked for
+
+        def record(out, to):
+            asked[out["op_id"]] = "wallet" if to else "bearer"
+            return out
+
+        record(alice.pay(5_000, to="bob"), "bob")               # named
+        record(alice.pay(5_000), None)                          # bearer
+        record(alice.pay(5_000, to="bob", deliver=bob.receive), "bob")
+        out = record(alice.pay(5_000), None)                    # bearer...
+        alice.settle_delivery(out["op_id"],                     # ...observed
+                              result=bob.receive(out["tokens"]),
+                              recipient="bob")
+
+        def refuse(_tokens):
+            raise WalletOpsError("no", "refused", "mint_rejected")
+        record(alice.pay(5_000, to="carol", deliver=refuse), "carol")
+        # (no bearer + deliver= arm: pay() refuses that combination -- a
+        # delivery to nobody in particular is not a thing it will record)
+
+        # stranded and left pending, stranded and recovered, both ways
+        for to in ("dave", None):
+            exc = self.strand_a_payment(alice, to=to)
+            del exc
+        pending = {r["op_id"] for r in alice.history()
+                   if r["kind"] == "pay_pending"}
+        self.assertEqual(len(pending), 2)
+        for op_id in pending:
+            row = [r for r in alice.history() if r["op_id"] == op_id][0]
+            asked[op_id] = "wallet" if "dave" in row["detail"] else "bearer"
+        before = {op: asked[op] for op in pending}
+        alice.recover()
+
+        rows = {r["op_id"]: r for r in alice.history(limit=500)}
+        self.assertGreaterEqual(len(asked), 7)
+        for op_id, wanted in asked.items():
+            with self.subTest(op=op_id[:8], asked=wanted):
+                row = rows[op_id]
+                self.assertEqual(row["recipient_kind"], wanted)
+                # and the NAME field says a name exactly when one was asked
+                self.assertEqual(bool(row["recipient"]), wanted == "wallet")
+        # ...and the two stranded ones answer the same after recover()
+        for op_id, wanted in before.items():
+            self.assertEqual(rows[op_id]["recipient_kind"], wanted)
+
+    def test_delivery_attempt_is_only_ever_answered_by_the_payer(self):
+        """``attempted`` iff ``pay()`` was given a ``deliver=``.
+
+        The field's definition is "did THIS WALLET ever try?", so it has
+        exactly one writer and exactly one moment: ``begin()``, from
+        ``deliver is not None``.  Everything downstream -- a refusal, a
+        success, an observation routed back from the recipient's side of
+        this GUI -- watches an OUTCOME and has nothing to add to it.
+        """
+        alice = self.funded("alice", face=400_000)
+        bob = self.ops("bob")
+        tried, did_not = [], []
+
+        tried.append(alice.pay(5_000, to="bob", deliver=bob.receive))
+
+        def refuse(_tokens):
+            raise WalletOpsError("no", "refused", "mint_rejected")
+        tried.append(alice.pay(5_000, to="bob", deliver=refuse))
+
+        did_not.append(alice.pay(5_000, to="bob"))      # named, not sent
+        did_not.append(alice.pay(5_000))                # bearer
+
+        for out in list(did_not):                       # then observed
+            alice.settle_delivery(out["op_id"],
+                                  result=bob.receive(out["tokens"]),
+                                  recipient="bob")
+
+        rows = {r["op_id"]: r for r in alice.history(limit=500)}
+        for out in tried:
+            self.assertEqual(rows[out["op_id"]]["delivery_attempt"],
+                             "attempted", out["op_id"])
+        for out in did_not:
+            self.assertEqual(rows[out["op_id"]]["delivery_attempt"],
+                             "not_attempted", out["op_id"])
+            # ...and the observation WAS recorded, in the field for it
+            self.assertEqual(rows[out["op_id"]]["delivery"], "delivered")
+
+    def test_a_nameless_observer_cannot_erase_a_recorded_bearer_kind(self):
+        """A permanent record may gain certainty, never lose it.
+
+        ``settle_delivery`` fills in a recipient only where NOTHING was
+        named — and it used to fill in the KIND on the same condition,
+        with whatever the caller passed.  An observer that watched a
+        bearer payment land but could not say into which wallet passed
+        "", so ``bearer`` — a fact recorded at payment time, from
+        something this wallet knew — was overwritten with the string that
+        means "nothing was recorded".
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000)                      # bearer, kind recorded
+        self.assertEqual(self.pay_row(alice, out["op_id"])["recipient_kind"],
+                         "bearer")
+        bob.receive(out["tokens"])
+        noted = alice.settle_delivery(
+            out["op_id"], result={"rejected": [], "accepted_mc": 4_950})
+        self.assertTrue(noted["recorded"])
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["delivery"], "delivered")      # the new fact
+        self.assertEqual(row["recipient_kind"], "bearer")   # the old one
+        self.assertIn(row["recipient_kind"], RECIPIENT_KIND_VALUES)
 
     # -- interruption: the honest unknown --------------------------------
 
@@ -2366,8 +2842,18 @@ class TestPaymentRecord(MintFixture):
         row = self.pay_row(alice, out["op_id"])
         self.assertEqual(row["delivery"], "unknown")
         self.assertEqual(row["recipient"], "")
-        self.assertEqual(row["recipient_kind"], "")
+        # UNDETERMINED, not NOT_APPLICABLE. A payment was made, so it had
+        # a recipient of one kind or the other and an attempt was or was
+        # not made; this wallet has no row that says which. The `receive`
+        # row two lines down has no recipient field to fill at all, and
+        # the two must not be the same string.
+        self.assertEqual(row["recipient_kind"], UNDETERMINED)
+        self.assertEqual(row["delivery_attempt"], UNDETERMINED)
         self.assertIn("not known", row["detail"])
+        other = [r for r in alice.history() if r["kind"] == "receive"][0]
+        self.assertEqual(other["recipient_kind"], NOT_APPLICABLE)
+        self.assertEqual(other["delivery_attempt"], NOT_APPLICABLE)
+        self.assertNotEqual(row["recipient_kind"], other["recipient_kind"])
 
     def test_a_corrupt_record_file_reads_unknown_and_does_not_raise(self):
         alice = self.funded("alice")
@@ -2409,10 +2895,13 @@ class TestPaymentRecord(MintFixture):
         self.assertTrue(rows)
         for row in rows:
             self.assertNotEqual(row["kind"], "pay")     # it did not commit
+            # No delivery happened, so nothing here states an outcome...
             self.assertEqual(row["delivery"], "")
-            self.assertEqual(row["recipient"], "")
-            self.assertEqual(row["recipient_kind"], "")
             self.assertEqual(row["delivery_cause"], "")
+            self.assertEqual(row["delivery_attempt"], "")
+            # ...but it was still a payment, and it was still for bob.
+            self.assertEqual(row["recipient"], "bob")
+            self.assertEqual(row["recipient_kind"], "wallet")
             self.assertIn(row["cause"], _causes())
         # ...and no record was written for a payment that never happened.
         self.assertEqual(_record_rows(self.path("alice")), [])

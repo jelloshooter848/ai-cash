@@ -327,6 +327,12 @@ let payTargetChosen = false;
 let historyHtml = "";
 let historyNote = "";
 let historyName = null;
+/* The rows this page last read, the moment it read them, and the wallet
+   they are about (historyName, above). Kept so the table can be repainted
+   against a value account that lands after them without re-reading the
+   wallet's history -- see paintHistory(). */
+let historyRows = null;
+let historyReadAt = 0;
 /* Value this wallet has handed out that NOBODY HAS REDEEMED, per wallet
    name, read back from the server's own GET /api/wallet/outstanding. A
    balance is NOT the whole of what a wallet is answerable for: every
@@ -958,6 +964,11 @@ function when(ms) {
   const d = new Date(ms);
   return isNaN(d.getTime()) ? "-" : d.toLocaleString();
 }
+/* A wall clock for a stamp beside a figure. Same shape as the one the
+   supply panel prints; "" for a moment this page never recorded. */
+function clock(ms) {
+  return ms ? new Date(ms).toLocaleTimeString() : "";
+}
 function since(ms) {
   if (!ms) return "";
   let s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -1181,6 +1192,31 @@ window.recipientOf = recipientOf;
 window.deliveryOf = deliveryOf;
 window.deliveryCell = deliveryCell;
 window.deliveryMissing = deliveryMissing;
+/* The recovered-payment rule, reachable for the same reason the rest of
+   this block is: a distinction the page draws only inside a row it builds
+   is a distinction a test cannot pin, and this one is the difference
+   between "a stranger may hold my money" and "nothing happened". */
+window.recoveredEntry = recoveredEntry;
+window.recoveredComplete = recoveredComplete;
+window.recoveredClause = recoveredClause;
+window.recoveredPointerWords = recoveredPointerWords;
+window.shownHistoryOps = shownHistoryOps;
+window.handedOverClause = handedOverClause;
+window.unaccountedClause = unaccountedClause;
+window.paidOutWords = paidOutWords;
+window.historyRowHtml = historyRowHtml;
+window.refreshHistory = refreshHistory;
+/* The row-level rules this round added, and the pairing test the strongest
+   of them stands on. Exposed for the same stated reason as everything else
+   in this block: a distinction drawn only inside a string a function
+   returns is a distinction no test can pin. */
+window.attemptOf = attemptOf;
+window.attemptWords = attemptWords;
+window.valueAccountPaired = valueAccountPaired;
+window.undeterminedWords = undeterminedWords;
+window.undeterminedClause = undeterminedClause;
+window.paintHistory = paintHistory;
+window.PAIR_GAP_MS = PAIR_GAP_MS;
 window.UNREDEEMED_LIMIT = UNREDEEMED_LIMIT;
 window.reconcileSupply = reconcileSupply;
 window.supplyLines = supplyLines;
@@ -1222,10 +1258,44 @@ function summariseUnredeemed(data) {
                // server did not say.
                payment_count: null, handed_over_mc: null,
                unlisted_outstanding_mc: null, recovered_mc: null,
+               // WHICH payments that figure is, op by op. Whole-wallet and
+               // never windowed -- walletops builds it while scanning
+               // EVERY pay op and `limit` cuts only the payments list --
+               // so a pay op absent from it is a pay op that handed its
+               // strings over, and that is the one fact that tells the
+               // two rows in the history table apart.
+               recovered_ops: [],
+               // THE SERVER'S OWN SELF-CHECK. app.py publishes it as
+               // "handed over and in none of the four buckets: 0 on every
+               // path the component can reach, and a non-zero is its own
+               // bug said out loud rather than absorbed" -- and this page
+               // absorbed it, which is the one thing that turns saying it
+               // out loud back into silence. null means the server did not
+               // publish it; a zero here is the server's word, not a
+               // default.
+               unaccounted_mc: null,
+               // WHEN THIS RECORD WAS READ, stamped by readUnredeemed the
+               // moment the answer landed. The strongest sentences in the
+               // History table are licensed by a payment's ABSENCE from
+               // `recovered_ops`, and absence in a read taken before a
+               // recovery is not absence now -- so a row has to be able to
+               // ask how old this is. null until it is stamped.
+               read_ms: null,
                ops: [], count: 0, total_mc: 0,
                unspent_mc: 0, unspent_count: 0,
                spent_mc: 0, spent_count: 0,
+               // TWO KINDS OF NOT-KNOWN, and the wire has always kept them
+               // apart: `unstated_mc` is value in strings the mint ANSWERED
+               // about and has no ledger entry for -- a different mint's
+               // database, most often -- and `unchecked_mc` is value in
+               // strings the mint was not asked about, or answered about
+               // only some of. app.py publishes the two under their own
+               // names and says in a comment why; this page summed both
+               // into one "state undetermined" bucket, which reads as one
+               // gap where there are two, with different repairs: ask the
+               // mint again, versus ask the right mint.
                unstated_mc: 0, unstated_count: 0,
+               unchecked_mc: 0, unchecked_count: 0,
                detail: "", reason: ""};
   const payments = (data && data.payments) || [];
   rec.truncated = (data && typeof data.truncated === "boolean")
@@ -1236,6 +1306,16 @@ function summariseUnredeemed(data) {
   rec.handed_over_mc = num("handed_over_mc");
   rec.unlisted_outstanding_mc = num("unlisted_outstanding_mc");
   rec.recovered_mc = num("recovered_mc");
+  rec.unaccounted_mc = num("unaccounted_mc");
+  // Read exactly as it arrives: an entry with no op_id names no payment
+  // and is dropped, because a row keyed on "" would mark every payment
+  // that carries no op id as recovered.
+  for (const o of ((data && data.recovered_ops) || [])) {
+    const op = String((o && o.op_id) || "");
+    if (!op) continue;
+    rec.recovered_ops.push({op_id: op,
+      amount_mc: (o && typeof o.amount_mc === "number") ? o.amount_mc : null});
+  }
   for (const p of payments) {
     const toks = p.tokens || [];
     let live = 0, liveN = 0;
@@ -1246,8 +1326,15 @@ function summariseUnredeemed(data) {
         rec.unspent_mc += amt; rec.unspent_count++; live += amt; liveN++;
       } else if (t.state === "spent") {
         rec.spent_mc += amt; rec.spent_count++;
-      } else {
+      } else if (t.state === "unknown") {
         rec.unstated_mc += amt; rec.unstated_count++;
+      } else {
+        // `state` null, absent, or a word app.py refused to relay: the mint
+        // was not asked, or gave no answer for this string. NOT folded into
+        // the bucket above -- "the mint has no record of it" and "nobody
+        // asked the mint" are different findings with different repairs,
+        // and the wire draws the line here too.
+        rec.unchecked_mc += amt; rec.unchecked_count++;
       }
     }
     // The record's own fields, carried through as they arrive and never
@@ -1267,9 +1354,12 @@ function summariseUnredeemed(data) {
 function unreadRecord(detail, reason) {
   return {state: "unread", truncated: false, payment_count: null,
           handed_over_mc: null, unlisted_outstanding_mc: null,
-          recovered_mc: null, ops: [], count: 0, total_mc: 0,
+          recovered_mc: null, recovered_ops: [], unaccounted_mc: null,
+          read_ms: null,
+          ops: [], count: 0, total_mc: 0,
           unspent_mc: 0, unspent_count: 0, spent_mc: 0, spent_count: 0,
           unstated_mc: 0, unstated_count: 0,
+          unchecked_mc: 0, unchecked_count: 0,
           detail: detail || "", reason: reason || ""};
 }
 /* The record for a wallet, or the honest absence of one. A wallet this
@@ -1277,13 +1367,220 @@ function unreadRecord(detail, reason) {
 function unredeemedOf(name) {
   return (name && unredeemed[name]) || null;
 }
+/* ---------- interrupted, and put back: the other kind of pay row --------
+   A pay op the transport stranded hands NOTHING to anybody -- pay() raises
+   without returning a single string -- and Recover then settles it against
+   the ledger and puts the coins back in the spendable pool. The wallet's
+   own durable record of it is a committed payment with no delivery record,
+   so it comes out of /api/wallet/history byte-identical to a bearer
+   payment whose strings are in a stranger's hands: "paid out 300 mc ...
+   where it went is not known here", recipient dropped to "".
+
+   Those two rows demand opposite actions, and the field that tells them
+   apart is on the wire and was being parsed and thrown away.
+   /api/wallet/outstanding answers, of the same wallet at the same instant,
+   `recovered_mc` and `recovered_ops` -- the value that never left, and
+   which payments it was. So the rule here:
+     - named in recovered_ops  -> this payment handed nothing over. A
+                                  permanent fact: recover() only ever
+                                  settles an op that returned no string,
+                                  and a payment cannot become one later.
+     - the read-back came back AND its two accounts of the recovered value
+       agree -> a payment NOT named in it did hand its strings over, which
+                is the other half of the distinction and equally permanent.
+     - anything else           -> this page has not been told, and says so
+                                  rather than picking one.
+   Pure: no DOM, no fetch. */
+function recoveredEntry(rec, opId) {
+  const id = String(opId || "");
+  if (!id || !rec || rec.state === "unread") return null;
+  for (const o of (rec.recovered_ops || [])) {
+    if (o.op_id === id) return o;
+  }
+  return null;
+}
+/* Is the list above a COMPLETE account of this wallet's recovered value?
+   Only then may absence from it be read as "this payment handed its
+   strings over". The totals are the check: a server build that publishes
+   the figure and not the list, or a list whose amounts do not add up to
+   the figure, leaves value recovered from some payment this page cannot
+   name -- and the honest answer for every unnamed row is then "not
+   known", not "handed over". */
+function recoveredComplete(rec) {
+  if (!rec || rec.state === "unread") return false;
+  if (typeof rec.recovered_mc !== "number") return false;
+  let sum = 0;
+  for (const o of (rec.recovered_ops || [])) {
+    if (typeof o.amount_mc !== "number") return false;
+    sum += o.amount_mc;
+  }
+  return sum === rec.recovered_mc;
+}
+/* ...and is that account an account of this wallet AS OF THE ROWS IT IS
+   BEING READ BESIDE? `recovered_ops` only ever grows: recover() settles an
+   interrupted op and the record of it is permanent, so a read-back taken
+   AFTER these rows is still a true account of them -- a payment it does
+   not name was not recovered at the earlier moment either. A read-back
+   taken BEFORE them is not. A recovery in between -- by the shipped
+   wallet_cli.py, by a second browser tab, or by this page between its own
+   two reads -- leaves the recovered payment unnamed, and absence is
+   exactly what this table reads as "this payment handed its strings
+   over". That renders a payment whose coins are back in the balance as
+   bearer strings in a stranger's hands and sends the operator off to read
+   out strings that were never created.
+
+   So the positive claims are licensed by a PAIR, not by a record: the
+   rows' own read time and the account's, no further apart than
+   PAIR_GAP_MS -- the same tolerance the supply reconciliation pairs the
+   mint's total and the balances with. Unpaired is not a failure; it is a
+   different, weaker sentence. `atMs` is the moment the ROWS were read.
+   Pure: no DOM, no fetch. */
+function valueAccountPaired(rec, atMs) {
+  if (!recoveredComplete(rec)) return false;
+  if (typeof rec.read_ms !== "number" || typeof atMs !== "number") return false;
+  return rec.read_ms >= atMs - PAIR_GAP_MS;
+}
+/* THE OTHER FIGURE THIS PAGE FETCHES AND NEVER SAID. `handed_over_mc` is
+   the whole-life total: everything this wallet has ever handed to anybody,
+   the payments this read listed and the ones it did not. It was parsed
+   into the record and read back by nothing, so the panels could say "3 of
+   106 payments" and never once say how much money that was -- and a reader
+   with no scale for the window has no way to judge what a floor is a floor
+   of. Said once, after the sentence it gives scale to. "" when the server
+   did not publish it, and "" at zero, where the sentence above already
+   says the wallet has handed nothing out. Pure: no DOM, no fetch. */
+function handedOverClause(rec, name) {
+  if (!rec || rec.state === "unread") return "";
+  if (typeof rec.handed_over_mc !== "number" || rec.handed_over_mc <= 0)
+    return "";
+  const who = name || "this wallet";
+  return " Over its whole life " + who + " has handed out " +
+    mc(rec.handed_over_mc) +
+    (typeof rec.payment_count === "number" && rec.payment_count > 0
+       ? " in " + n(rec.payment_count, "payment", "payments") : "") +
+    " — that is the total the read above is a window on, and it is money " +
+    "that left this wallet, not money in it.";
+}
+/* The server's own self-check, said out loud. Non-zero means the wallet
+   handed value over that landed in none of the four buckets the panel
+   above decomposes -- which is a defect in the reporting, not a statement
+   about the money, and an operator reading a total that does not account
+   for everything has to be told rather than left to sum the parts. Zero on
+   every path either component can reach, so this clause should never
+   appear; if it does, it is the bug naming itself. */
+function unaccountedClause(rec) {
+  if (!rec || rec.state === "unread") return "";
+  if (typeof rec.unaccounted_mc !== "number" || rec.unaccounted_mc <= 0)
+    return "";
+  return " THE PARTS ABOVE DO NOT ACCOUNT FOR EVERYTHING: the server " +
+    "reports " + mc(rec.unaccounted_mc) + " of handed-over value in none " +
+    "of the states this panel lists. That is a defect in the report, not " +
+    "a finding about the money, and it is printed rather than absorbed — " +
+    "treat every figure above as incomplete by at least that much.";
+}
+/* WHERE THE RECOVERED ROW ACTUALLY IS, and whether this page may point at
+   it. `recovered_ops` is a WHOLE-WALLET figure; the History table under it
+   asks limit=50. So the two windows are chosen on different rules, and a
+   payment recovered before the table's edge is named up here and has no
+   row down there. The sentence " It is marked recovered in the History
+   table." was unconditional, and on any wallet with 50 operations newer
+   than the recovery it was simply false -- measured: 69 rows, the op in
+   `recovered_ops`, no row for it in the table, and the page said to go
+   and read one. `shown` is the set of op ids the table is currently
+   showing, or null when this page has not read those rows in this pass;
+   the pointer is made only for the ops that are really in it, and the
+   ones that are not are named by op id instead, which is the thing an
+   operator can actually search on. Pure: no DOM, no fetch. */
+/* The op ids the History table is showing RIGHT NOW, or null when it is
+   showing nothing this page can vouch for -- no rows read, rows belonging
+   to another wallet, or a link this page cannot see app.py through. Not
+   pure (it reads the page's history state on purpose): the pure functions
+   below take its answer as an argument so a test can supply its own. */
+function shownHistoryOps() {
+  if (!historyRows || historyName !== active || linkFailure) return null;
+  const set = new Set();
+  for (const row of historyRows) if (row && row.op_id) set.add(row.op_id);
+  return set;
+}
+function recoveredPointerWords(ops, shown) {
+  if (!ops.length)
+    return " WHICH payments that was is not in this read \u2014 it gives " +
+      "the total and names no operation \u2014 so no row in the History " +
+      "table is marked recovered on its account, and the two cannot be " +
+      "matched up here.";
+  const many = ops.length > 1;
+  if (!shown)
+    return (many ? " Each one is" : " It is") + " marked recovered in " +
+      "this wallet's history, but these rows have not been read in this " +
+      "pass, so this page cannot say whether the History table below is " +
+      "showing " + (many ? "them" : "it") + " right now.";
+  const miss = ops.filter(function (o) { return !shown.has(o.op_id); });
+  if (!miss.length)
+    return (many ? " Each one is" : " It is") +
+      " marked recovered in the History table.";
+  const ids = miss.map(function (o) { return o.op_id; }).join(", ");
+  if (miss.length === ops.length)
+    return (many ? " Their rows are" : " Its row is") + " NOT in the " +
+      "History table below: that table shows the newest 50 operations " +
+      "only, and " + (many ? "these payments are" : "this payment is") +
+      " older than all of them. " + (many ? "Their op ids are " :
+      "Its op id is ") + ids + " \u2014 search the wallet's own record " +
+      "on that, because nothing on this screen will show " +
+      (many ? "those rows" : "that row") + ".";
+  return " " + miss.length + " of them are marked recovered in this " +
+    "wallet's record but have NO row in the History table below, which " +
+    "shows the newest 50 operations only: " + ids + ". The rest are " +
+    "marked recovered in the table.";
+}
+/* The sentence for the whole wallet, wherever a handed-out figure is
+   printed. It is deliberately NOT added to anything: this value is already
+   inside the spendable balance, and an operator who adds it is counting
+   the same coins twice -- which is the defect the wire format was shaped
+   to stop and this page then failed to print. "" when there is none, and
+   "" when the server did not say, because a zero here would be a claim.
+   `shown` is passed through to recoveredPointerWords; see it for why a
+   pointer at the table below is a claim and not a convenience. */
+function recoveredClause(rec, name, shown) {
+  if (!rec || rec.state === "unread") return "";
+  if (typeof rec.recovered_mc !== "number" || rec.recovered_mc <= 0) return "";
+  const who = name || "this wallet";
+  // The entries this page could actually parse an op_id out of: the
+  // pointer below is about rows, and an entry with no op_id names no row.
+  const named = (rec.recovered_ops || []).filter(function (o) {
+    return o && o.op_id; });
+  const ops = named.length;
+  // ops === 0 is a server that published the TOTAL and named no operation
+  // -- or named them in a shape this page dropped, an entry carrying no
+  // op_id. One unattributed figure is not "they", and there is no row in
+  // the History table it can be matched to: `many` covers the plural and
+  // the closing clause below says the pointer is missing instead of
+  // silently leaving it out.
+  const many = ops > 1;
+  return " Separately, and it is not part of any figure above: " +
+    mc(rec.recovered_mc) +
+    (ops ? " in " + n(ops, "payment", "payments") : "") +
+    " never left " + who + " at all — " + (many ? "they were" : "it was") +
+    " interrupted in flight and Recover settled " + (many ? "them" : "it") +
+    " against the mint's ledger, putting the coins back in the spendable " +
+    "balance. Nobody outside this wallet was ever handed a string from " +
+    (many ? "them" : "it") + ", so that value is not money anyone else can " +
+    "take, and it is ALREADY INSIDE the balance — do not add it to " +
+    "anything here." + recoveredPointerWords(named, shown);
+}
 async function readUnredeemed(name) {
   if (!name) return null;
   const r = await api(UNREDEEMED_QUERY + encodeURIComponent(name));
-  unredeemed[name] = r.ok
+  const rec = r.ok
     ? summariseUnredeemed(r.data)
     : unreadRecord(whyText(failCode(r), r.detail), reasonKey(failCode(r)));
-  return unredeemed[name];
+  // STAMPED WITH THE MOMENT IT LANDED, like every other two-source figure
+  // on this page. A record with no clock cannot be paired with the history
+  // rows whose sentences it licenses, and an unpairable record is exactly
+  // the one that let a read taken before a recovery tell an operator to go
+  // looking for bearer strings that were never created.
+  rec.read_ms = Date.now();
+  unredeemed[name] = rec;
+  return rec;
 }
 /* Every wallet, not just the active one: the wallet list is where a reader
    forms their picture of what is in this workdir, and a row that shows
@@ -1327,6 +1624,37 @@ async function refreshUnredeemed(names, polled) {
     }
   } finally { unredeemedBusy = false; }
 }
+/* THE TWO GAPS, NAMED APART. app.py publishes `unstated_mc` and
+   `unchecked_mc` as deliberately separate figures -- the mint answered and
+   has no ledger entry for these, versus the mint was not asked about them
+   -- and this page printed both as "state undetermined", a single phrase
+   that answers neither. They are not the same finding and they do not have
+   the same repair: an unstated string is usually a string from another
+   mint's database and the wallet is pointed at the wrong mint; an
+   unchecked string is a question nobody has put yet, and asking again
+   answers it. Returns one phrase per non-empty bucket, in that order, for
+   the callers that build a sentence out of them. Pure: no DOM, no fetch. */
+function undeterminedWords(rec) {
+  const bits = [];
+  if (!rec) return bits;
+  if (rec.unstated_mc > 0)
+    bits.push(mc(rec.unstated_mc) + " in " +
+      n(rec.unstated_count, "string", "strings") + " the mint answered " +
+      "about and has no ledger entry for \u2014 most often " +
+      (rec.unstated_count === 1 ? "a string" : "strings") +
+      " from a different mint\u2019s database");
+  if (rec.unchecked_mc > 0)
+    bits.push(mc(rec.unchecked_mc) + " in " +
+      n(rec.unchecked_count, "string", "strings") + " the mint was not " +
+      "asked about, or gave no answer for");
+  return bits;
+}
+/* The same two, as a clause to hang off a sentence that has already named
+   the live money. "" when there is neither. */
+function undeterminedClause(rec) {
+  const bits = undeterminedWords(rec);
+  return bits.length ? " A further " + bits.join("; and ") + "." : "";
+}
 /* The short form beside a balance. "" means: read, and there is nothing
    unredeemed -- the only case where saying nothing is the truth. */
 function unredeemedTag(rec) {
@@ -1341,8 +1669,17 @@ function unredeemedTag(rec) {
     return "+ " + atLeast + mc(rec.total_mc) + " handed out, unverified";
   if (rec.unspent_mc > 0)
     return "+ " + atLeast + mc(rec.unspent_mc) + " unredeemed";
-  if (rec.unstated_mc > 0)
-    return "+ " + atLeast + mc(rec.unstated_mc) + " handed out, state undetermined";
+  // Both at once is a real record -- some strings from another mint's
+  // database, some the read never got an answer for -- and one phrase for
+  // the pair told an operator which to chase after neither.
+  if (rec.unstated_mc > 0 || rec.unchecked_mc > 0) {
+    const gaps = [];
+    if (rec.unstated_mc > 0)
+      gaps.push(mc(rec.unstated_mc) + " the mint has no record of");
+    if (rec.unchecked_mc > 0)
+      gaps.push(mc(rec.unchecked_mc) + " the mint was not asked about");
+    return "+ " + atLeast + gaps.join(" and ") + ", handed out";
+  }
   // A FULL page that happens to contain nothing live still says nothing
   // about the payments past it, so "" -- which means "read, and there is
   // nothing unredeemed" -- would be a claim this read cannot support.
@@ -1385,8 +1722,25 @@ function unredeemedHeavy(rec) {
   return !!(rec && rec.state === "known" && rec.unspent_mc > 0);
 }
 /* The same three states in a sentence, for the panels that have room for
-   one. `name` is the wallet it is about. */
-function unredeemedSentence(rec, name) {
+   one. `name` is the wallet it is about.
+
+   TWO QUESTIONS, ONE PANEL, and the second one used to be silent: what
+   this wallet handed out and nobody has redeemed, and what it never handed
+   out because a payment was interrupted and Recover put the coins back.
+   The first is answered below; the second is recoveredClause(), appended
+   by the wrapper so that every branch carries it and none of them can be
+   the one that forgets. */
+function unredeemedSentence(rec, name, shown) {
+  const s = unredeemedValueSentence(rec, name);
+  const bad = unaccountedClause(rec);
+  const more = handedOverClause(rec, name) +
+               recoveredClause(rec, name, shown) + bad;
+  if (!more) return s;
+  // A report that does not add up outranks whatever colour the sentence
+  // would otherwise have carried.
+  return {cls: bad ? "warn bad" : s.cls, text: s.text + more};
+}
+function unredeemedValueSentence(rec, name) {
   const who = name || "this wallet";
   // Every branch below that prints a figure gets the ceiling clause; the
   // "unread" branch does not, because it prints no figure at all.
@@ -1413,16 +1767,13 @@ function unredeemedSentence(rec, name) {
       "value is NOT in the balance above and cannot be spent from here: " +
       "whoever holds " + (rec.unspent_count === 1 ? "that string" : "those strings") +
       " can spend it." +
-      (rec.unstated_mc > 0 ? " A further " + mc(rec.unstated_mc) + " in " +
-        n(rec.unstated_count, "string", "strings") + " has no state the mint " +
-        "could name." : "") + cap};
+      undeterminedClause(rec) + cap};
   }
-  if (rec.unstated_mc > 0) {
-    return {cls: "note bad", text: mc(rec.unstated_mc) + " in " +
-      n(rec.unstated_count, "string", "strings") + " that " + who + " handed " +
-      "out has no state the mint could name, so whether that value is still " +
-      "money is undetermined. Nothing else is unredeemed in what was read." +
-      cap};
+  if (rec.unstated_mc > 0 || rec.unchecked_mc > 0) {
+    return {cls: "note bad", text: "Of the value " + who + " has handed " +
+      "out, " + undeterminedWords(rec).join("; and ") + " \u2014 so whether " +
+      "that value is still money is undetermined. Nothing else is " +
+      "unredeemed in what was read." + cap};
   }
   // NOTHING FOUND is the one answer a capped read must not give plainly:
   // "all of them have been redeemed" is a statement about every payment
@@ -1476,14 +1827,14 @@ function renderUnredeemed() {
   const pay = $("p-unredeemed");
   if (!active) { pay.className = "note"; pay.textContent = ""; }
   else {
-    const s = unredeemedSentence(rec, active);
+    const s = unredeemedSentence(rec, active, shownHistoryOps());
     pay.className = s.cls;
     pay.textContent = unredeemedStale() + s.text;
   }
   const hist = $("h-unredeemed");
   if (!active) { hist.className = "note"; hist.innerHTML = ""; }
   else {
-    const s = unredeemedSentence(rec, active);
+    const s = unredeemedSentence(rec, active, shownHistoryOps());
     // Which payment each unredeemed string came from, so the value can be
     // found again months later: the op id is what the wallet's own record
     // and the read-back below are both keyed by.
@@ -1500,6 +1851,14 @@ function renderUnredeemed() {
   // strings back, and the read-back comes out of the wallet file.
   $("h-show-strings").hidden = !(active && rec && rec.state !== "unread" &&
                              rec.count > 0);
+  // THE TABLE BELOW IS BUILT FROM THIS RECORD TOO. It was the one panel on
+  // this page that never repainted when its second source changed: the
+  // Delivery column and the sentences under the rows come from this
+  // read-back, and a table painted before the read-back landed kept
+  // saying whatever it had said with no account at all. No fetch -- the
+  // rows are the ones already read, and paintHistory declines if they
+  // belong to another wallet.
+  paintHistory();
 }
 /* One payment's line in that list: the handle that finds the value again,
    what of it is still unredeemed, and -- when the record carries them --
@@ -1935,19 +2294,32 @@ function formPolicy() {
   }
   return out;
 }
-/* Four answers, and only the first one lets a derived figure stand:
-     same        the boxes and the policy the figure came from agree, or
-                 the mint is running and the boxes are locked mirroring it
+/* Five answers, and only the first one lets a derived figure stand:
+     same        the mint is RUNNING and the boxes are locked mirroring it
      edited      the boxes hold a DIFFERENT policy than the figure's source
      unreadable  the boxes hold no policy at all
      unread      no policy has ever been read back from a mint here, so
-                 there is nothing for a figure to stand on               */
+                 there is nothing for a figure to stand on
+     stopped     the boxes still hold the last mint's policy, and there is
+                 no mint running to charge it
+
+   `stopped` IS the quote's rule, not a second one. mintKey() has counted
+   "down" as a mint state of its own since round 4 and syncQuoteToMint()
+   voids the pay quote on it, for the reason written above mintKey(): a
+   cost estimate describing something this page can no longer check must
+   not sit on screen looking agreed to. The issue cost line was checking
+   only whether the BOXES had moved, so with the mint stopped and the boxes
+   untouched it kept printing what crediting a wallet "burns" — present
+   tense, under a policy in force — with no mint in existence to burn
+   anything. Same figure, same rule, same answer. */
 function pendingPolicyState() {
   if (mint.running) return "same";   // locked while it runs; applyDescriptor
   const f = formPolicy();            // writes the mint's own policy into them
   if (!f) return "unreadable";
   if (!policy) return "unread";
-  return policyKey(f) === policyKey(policy) ? "same" : "edited";
+  // An edited box is the more specific fact and keeps its own sentence;
+  // otherwise the mint being down is the reason the figure cannot stand.
+  return policyKey(f) === policyKey(policy) ? "stopped" : "edited";
 }
 /* What #f-cost says when no figure may stand. Pure: no DOM, no fetch. */
 function issueCostPending(state, pending) {
@@ -1964,6 +2336,15 @@ function issueCostPending(state, pending) {
     ? "would burn " + policyWords(pending)
     : "would burn nothing at all: a cap of 0 means no burn whatever the " +
       "rate says";
+  if (state === "stopped") {
+    return "What issuing would cost is NOT shown: no mint is running here, " +
+      "so there is no burn policy in force to work it out from and nothing " +
+      "here can issue anything. The figure that stood here was the last " +
+      "mint's, and the settings above are only what the NEXT one would be " +
+      "started with. Started with them, a mint " + words + ". Press Start " +
+      "mint, and this line will say what crediting a wallet really burns, " +
+      "from the mint's own descriptor.";
+  }
   if (state === "unread") {
     return "What issuing would cost is NOT shown: no mint has run here, so " +
       "no burn policy has ever been read back from one and there is nothing " +
@@ -1998,6 +2379,23 @@ function renderIssueCost() {
     el.className = "note bad";
     el.textContent = "What issuing would cost cannot be worked out while " +
       "the mint state is unknown.";
+    return;
+  }
+  // THE FOURTH STATE, and the same rule as the three around it. mintKey()
+  // counts "deaf" as a mint state of its own and syncQuoteToMint() voids
+  // the pay quote on it, because a figure standing on a policy this page
+  // can no longer check must not sit there looking agreed to. renderMint's
+  // deaf branch disables Issue and then left this sentence behind it,
+  // still naming a burn in the present tense against a mint that answers
+  // nothing.
+  if (mint.running && mint.responding === false) {
+    el.className = "note bad";
+    el.textContent = "What issuing would cost is NOT shown: the mint " +
+      "process is running but is not answering this page, so its burn " +
+      "policy cannot be checked and nothing here can issue anything. The " +
+      "figure that stood here came from the last descriptor this page " +
+      "managed to read. Press Refresh once it answers again, or Stop and " +
+      "start it.";
     return;
   }
   const state = pendingPolicyState();
@@ -2054,6 +2452,12 @@ function reconcileSupply(sup, list, recs, mintId, paired) {
              unredeemed_unread: 0, unredeemed_unverified: 0,
              unredeemed_unverified_mc: 0,
              unredeemed_capped: 0, unredeemed_unstated_mc: 0,
+             // ...and the other half of what used to be one bucket. The
+             // record now separates value the mint answered about and has
+             // no entry for from value it was never asked about; summing
+             // only the first here would quietly drop the second out of
+             // the gaps and turn a floor back into a total.
+             unredeemed_unchecked_mc: 0,
              // Handed-out value a truncated read-back could not cover,
              // summed over the wallets whose server said how much it was.
              // It is NOT added to `accounted`: nothing established that
@@ -2106,6 +2510,7 @@ function reconcileSupply(sup, list, recs, mintId, paired) {
     }
     r.unredeemed_mc += rec.unspent_mc;
     if (rec.unstated_mc > 0) { r.unredeemed_unstated_mc += rec.unstated_mc; r.floor = true; }
+    if (rec.unchecked_mc > 0) { r.unredeemed_unchecked_mc += rec.unchecked_mc; r.floor = true; }
     if (rec.truncated) {
       r.unredeemed_capped++; r.floor = true;
       if (typeof rec.unlisted_outstanding_mc === "number")
@@ -2217,8 +2622,11 @@ function supplyLines(r, when, walletsWhen, why, opts) {
          : ", though every payment it left out is one the wallet has " +
            "already retired in full"));
   if (r.unredeemed_unstated_mc)
-    gaps.push(mc(r.unredeemed_unstated_mc) + " in handed-out strings has no " +
-      "state the mint could name");
+    gaps.push(mc(r.unredeemed_unstated_mc) + " in handed-out strings the " +
+      "mint answered about and has no ledger entry for");
+  if (r.unredeemed_unchecked_mc)
+    gaps.push(mc(r.unredeemed_unchecked_mc) + " in handed-out strings the " +
+      "mint was not asked about, or gave no answer for");
   if (r.mint_unstated)
     gaps.push(n(r.mint_unstated, "wallet", "wallets") + " did not say which " +
       "mint " + (r.mint_unstated === 1 ? "it is" : "they are") + " bound to " +
@@ -2235,7 +2643,7 @@ function supplyLines(r, when, walletsWhen, why, opts) {
     ? mc(r.unredeemed_mc) + " more is in bearer strings they handed out " +
       "that the mint says nobody has redeemed"
     : (r.unredeemed_unverified || r.unredeemed_unread ||
-       r.unredeemed_unstated_mc
+       r.unredeemed_unstated_mc || r.unredeemed_unchecked_mc
         ? "nothing can be added for the bearer strings they handed out"
         : "no bearer string they handed out is still unredeemed");
   lines.push(["note", "Against that, what this page can point to: " +
@@ -2375,7 +2783,27 @@ function renderSupply() {
     sup = null;
   }
   if (!sup && !why) {
-    why = mint.running ? "" : "no mint is running here, so none can be asked";
+    // WHY THERE IS NO SNAPSHOT, and `mint.running === false` is not the
+    // answer to that question in three of the four states this page can be
+    // in. The mint is a separate process: when this page cannot reach
+    // app.py, or app.py cannot say what the mint is doing, `running` is
+    // false because NOTHING IS KNOWN -- and the banner a few inches above
+    // this panel says exactly that, that the mint may well be up. The
+    // largest money figure on the page printed "no mint is running here"
+    // over the top of it. Every other sentence on this page asks
+    // linkFailure and mint.unknown before it speaks; so does this one now.
+    why = linkFailure
+      ? failureBecause() + ", so no mint could be asked — this page does " +
+        "not know whether one is running, and this is not a statement that " +
+        "none is"
+      : mint.unknown
+      ? "app.py could not say whether a mint is running here, so none " +
+        "could be asked — a mint started from here runs in its own process " +
+        "and may well be up"
+      : mint.responding === false
+      ? "the mint process is running but is not answering this page, so it " +
+        "could not be asked what it holds"
+      : mint.running ? "" : "no mint is running here, so none can be asked";
   }
   // ONE PASS, OR NO SUBTRACTION: the same pass number on both halves, and
   // two clocks no further apart than PAIR_GAP_MS. The second test is not
@@ -2776,11 +3204,17 @@ function setActive(name) {
   // names balances and unredeemed totals for the wallet it ran against.
   $("h-out").innerHTML = "";
   renderWallets();
+  // ROWS AND VALUE ACCOUNT, AS ONE PAIR, for the wallet just switched to.
+  // refreshHistory reads both -- the rows, then this wallet's value
+  // account -- and repaints the panels above from the second, so nothing
+  // here reads a record of its own. It used to: the rows were read first
+  // and the account after, which guaranteed that the first paint of every
+  // wallet switch was made with the PREVIOUS wallet's account or none at
+  // all, and nothing repainted the table when the real one arrived.
+  $("h-note").textContent = "";
+  $("h-body").innerHTML = '<tr><td colspan="5">Reading ' + esc(name) +
+    '\u2019s history\u2026</td></tr>';
   refreshHistory();
-  // Fresh, for the wallet the operator just switched to: the panels below
-  // are about to describe it, and a record from before the switch would
-  // describe the last one.
-  readUnredeemed(name).then(renderUnredeemed, () => {});
   scheduleQuote();
 }
 async function refreshWallets(opts) {
@@ -3505,7 +3939,11 @@ async function refreshHistory() {
   $("h-note").textContent = "";
   if (linkFailure) { renderHistoryStale(); return; }
   if (!active) { body.innerHTML = '<tr><td colspan="5">No active wallet.</td></tr>'; return; }
-  const r = await api("/api/wallet/history?limit=50&name=" + encodeURIComponent(active));
+  // The wallet this read is ABOUT, held across the awaits below: the
+  // operator can switch wallets while they are in flight, and `active`
+  // would then name a different wallet than the rows describe.
+  const name = active;
+  const r = await api("/api/wallet/history?limit=50&name=" + encodeURIComponent(name));
   if (!r.ok) {
     if (linkFailure) { renderHistoryStale(); return; }
     body.innerHTML = '<tr><td colspan="5" class="bad">' +
@@ -3513,7 +3951,60 @@ async function refreshHistory() {
       '  [' + esc(reasonKey(failCode(r))) + ']</td></tr>';
     return;
   }
-  const rows = r.data.history || [];
+  // THE ROWS, AND THE MOMENT THEY WERE READ. Both are kept, because the
+  // table is built from two sources and the second one -- this wallet's
+  // value account -- can land after these rows do. Keeping them lets the
+  // panel be repainted against the account WITHOUT re-reading the rows,
+  // and lets every sentence built from the pair know how far apart the
+  // two reads were.
+  // A different wallet's rows land here on a switch, and the html painted
+  // from the LAST wallet is still in hand. renderHistoryStale shows that
+  // html whenever it belongs to the active wallet, so leaving it behind
+  // while historyName moves on would put one wallet's rows under another
+  // wallet's name the moment the link dropped between these two reads.
+  if (historyName !== name) { historyHtml = ""; historyNote = ""; }
+  historyRows = r.data.history || [];
+  historyReadAt = Date.now();
+  historyName = name;
+  // THE SECOND READ OF THE PAIR, TAKEN NOW AND AFTER THE ROWS. The
+  // strongest sentences in this table are not in the rows at all: "this
+  // payment handed its strings over" is read out of a payment's ABSENCE
+  // from the wallet's value account, and an account read at some other
+  // moment cannot license it -- a recovery since (by the shipped
+  // wallet_cli.py, by a second browser tab, by this page between its own
+  // two reads) is exactly what such an account leaves out, and absence
+  // then renders a payment whose coins are back in the balance as bearer
+  // strings in a stranger's hands. Every other two-source figure on this
+  // page is pass-paired or stamped stale; this one was neither.
+  //
+  // Read AFTER the rows on purpose: an account taken after them cannot
+  // miss a recovery that had already happened when they were read, so its
+  // silence about a payment is silence about the row in front of it. The
+  // panels above are repainted from the same answer, so the two halves of
+  // the screen cannot describe different moments. A read that fails leaves
+  // an unread record, and every row then says it does not know -- which is
+  // the true sentence, and the table is still painted.
+  if (!linkFailure) {
+    await readUnredeemed(name);
+    renderUnredeemed();
+  }
+  paintHistory();
+}
+/* THE TABLE ITSELF, painted from the rows this page has already read and
+   the value account it holds NOW. No fetch: refreshHistory does the
+   reading, this does the saying, and splitting the two is what lets the
+   panel be repainted when its second source arrives -- which it could not
+   be before, so a wallet switch painted its table from the PREVIOUS
+   wallet's account and nothing put it right when the real one landed. The
+   note and the rows are built together, in one pass, because they are two
+   halves of one account: a repaint that moved only one of them would leave
+   a note and a table from different moments in the same panel. */
+function paintHistory() {
+  if (!historyRows || historyName !== active || linkFailure) return;
+  const body = $("h-body");
+  const rows = historyRows;
+  const readAt = historyReadAt;
+  $("h-note").textContent = "";
   // The wallet's own schema stores no timestamps, so walletops cannot invent
   // them. Today that is true of every row, but a row WITH a time must not
   // turn the explanation off and leave the rest showing bare dashes nobody
@@ -3554,6 +4045,28 @@ async function refreshHistory() {
       " \u201cnot recorded\u201d rather than \u201cdelivered\u201d. A row " +
       "that does not say cannot be read as a row that says yes.";
   }
+  // THE WALLET'S VALUE READ-BACK, which is what tells a payment that
+  // handed nothing over from one whose strings are in somebody's hands.
+  // Read here, once, and handed to every row: the two facts are about the
+  // same wallet at the same moment, and a per-row lookup of a record that
+  // could change mid-loop would let one table hold both answers.
+  const rec = unredeemedOf(active);
+  const back = rows.filter(h => isPayRow(h) && !payDidNotCommit(h) &&
+                                recoveredEntry(rec, h.op_id));
+  if (back.length) {
+    const backMc = back.reduce(
+      (t, h) => t + (typeof h.amount_mc === "number" ? h.amount_mc : 0), 0);
+    $("h-note").textContent += ($("h-note").textContent ? " " : "") +
+      (back.length === 1 ? "One payment below — " + mc(backMc) + " — is"
+                         : back.length + " payments below, " + mc(backMc) +
+                           " in all, are") +
+      " marked \u201crecovered\u201d: " + (back.length === 1 ? "it" : "they") +
+      " handed nothing to anybody and Recover put the coins back in this " +
+      "wallet\u2019s spendable balance. The wallet\u2019s own record of " +
+      (back.length === 1 ? "that payment is" : "those payments is") +
+      " the same shape as a payment whose strings are out there, so the " +
+      "word comes from the value read-back and not from the row.";
+  }
   // WHEN THESE ROWS WERE READ. The history is the one money panel on this
   // page that no poll refreshes -- it is re-read on Refresh history, on a
   // wallet switch and after this page moves money, and at no other moment
@@ -3563,12 +4076,42 @@ async function refreshHistory() {
   // recorded"), so without this the panel could answer neither "when did
   // this happen" nor "when was this read".
   $("h-note").textContent += ($("h-note").textContent ? " " : "") +
-    "Read at " + new Date().toLocaleTimeString() +
+    "Read at " + clock(readAt) +
     ". This table does not refresh itself \u2014 press Refresh history to " +
-    "read it again.";
-  historyHtml = rows.length ? rows.map(historyRowHtml).join("") : "";
+    "read it again." +
+    // ...AND WHEN THE OTHER SOURCE WAS READ. The Delivery column and the
+    // sentences under the rows are built from two reads, not one, and the
+    // second is this wallet's value account. Every other two-source figure
+    // on this page names its clocks; this one named neither, which is how
+    // an account read before a recovery got to speak in a fresh table's
+    // voice. Paired, it says so; unpaired, it says which sentence the
+    // table is therefore NOT making.
+    (!rows.some(h => isPayRow(h) && !payDidNotCommit(h))
+       // Nothing in this table turns on the value account: no committed
+       // payment, so no row asks whether strings were handed over, and a
+       // stamp for a source nothing here reads is noise.
+       ? ""
+       : valueAccountPaired(rec, readAt)
+       ? " Whether each payment handed its strings over comes from this " +
+         "wallet\u2019s value account, read with these rows at " +
+         clock(rec.read_ms) + "."
+       : " Whether a payment handed its strings over comes from this " +
+         "wallet\u2019s value account, and no row below is told that it " +
+         "did: " +
+         ((!rec || rec.state === "unread")
+            ? "this page has not read one."
+            : !recoveredComplete(rec)
+            ? "the one it read does not give a complete account of the " +
+              "value this wallet has had recovered."
+            : clock(rec.read_ms)
+            ? "the one it read is from " + clock(rec.read_ms) + ", before " +
+              "these rows \u2014 a payment recovered since would not be " +
+              "named in it."
+            : "the one it read carries no clock, so it cannot be placed " +
+              "beside these rows."));
+  historyHtml = rows.length
+    ? rows.map(h => historyRowHtml(h, rec, readAt)).join("") : "";
   historyNote = $("h-note").textContent;
-  historyName = active;
   body.innerHTML = historyHtml || '<tr><td colspan="5">Nothing yet.</td></tr>';
 }
 /* ---------- the payment record, as the row carries it ----------
@@ -3677,15 +4220,162 @@ function payUnsettled(h) {
 function deliveryMissing(h) {
   return isPayRow(h) && !deliveryOf(h) && !payDidNotCommit(h);
 }
-function deliveryCell(h) {
+/* `rec` is the wallet's value read-back, and it is what turns "unknown"
+   into a word of its own. A payment the read-back names as recovered
+   handed NOTHING over: "unknown" is not the answer, because there was no
+   delivery to have an outcome, and "undelivered" is the same word a
+   payment whose live strings a recipient refused gets. Only "delivered"
+   cannot stand beside recovered, and that pair is called what it is. */
+function deliveryCell(h, rec) {
   if (!isPayRow(h)) return {cls: "note", word: "\u2014"};
   const d = deliveryOf(h);
+  if (!payDidNotCommit(h) && recoveredEntry(rec, h.op_id)) {
+    return d === "delivered" ? {cls: "warn bad", word: "contradicted"}
+                             : {cls: "note ok", word: "recovered"};
+  }
   if (d) return {cls: DELIVERY[d][0] || "note", word: DELIVERY[d][1]};
   if (payUnsettled(h)) return {cls: "note bad", word: "not settled"};
   if (payDidNotCommit(h)) return {cls: "note", word: "nothing left"};
   return {cls: "note", word: "not recorded"};
 }
-function historyRowHtml(h) {
+/* What a committed pay row says about where its money went, once the value
+   read-back is taken into account. Four answers, and the first two are the
+   ones this table could not tell apart:
+     recovered    named in recovered_ops: nothing was handed over, the
+                  coins are back in the balance, nobody is holding them
+     contradicted named there AND carrying a delivery outcome: two of this
+                  product's own answers about one payment, said out loud
+     handed over  the read-back is a complete account, was read WITH these
+                  rows, and does not name it, so its strings did leave
+                  this wallet
+     ""           not read back, read back incompletely, or read back
+                  before these rows: not known here
+   `atMs` is the moment the rows were read; see valueAccountPaired.
+   Pure: no DOM, no fetch. */
+function paidOutWords(h, rec, d, atMs) {
+  if (!isPayRow(h) || payDidNotCommit(h)) return "";
+  const back = recoveredEntry(rec, h.op_id);
+  // "delivered" is the one outcome that cannot stand beside "recovered":
+  // it means strings were handed to a wallet and credited there, and
+  // nothing settles that back into this balance afterwards. "undelivered"
+  // CAN stand beside it and is not flagged -- a payment stranded before
+  // anything was sent is truthfully both.
+  if (back && d === "delivered") {
+    return "TWO ANSWERS, AND THEY DISAGREE. This row's own record says this " +
+      "payment was delivered, and the value read-back for this wallet names " +
+      "the same payment among the ones that handed nothing over and whose " +
+      "coins Recover put back in the balance. Both cannot be true and this " +
+      "page cannot say which is wrong. Treat the value as possibly in " +
+      "somebody's hands until the strings have been checked.";
+  }
+  if (back) {
+    // WHOSE FIGURE. The read-back's per-payment amount is the one to print
+    // -- unless its own two accounts of the recovered value disagree, in
+    // which case this row's amount is used and the disagreement is said
+    // out loud rather than resolved silently in favour of either.
+    const settled = recoveredComplete(rec);
+    const amount = settled && typeof back.amount_mc === "number"
+      ? mc(back.amount_mc)
+      : (typeof h.amount_mc === "number" ? mc(h.amount_mc) : "the value");
+    return "NOTHING WAS HANDED OVER BY THIS PAYMENT, and nobody is holding " +
+      "money from it. It was interrupted in flight, and Recover settled it " +
+      "against the mint's ledger: " + amount + " went back into this " +
+      "wallet's spendable balance and is counted there now — so it must not " +
+      "be added to it again. No string from it was ever returned to " +
+      "anybody, which is why nothing here can say where the money went: " +
+      "there was nothing to send." +
+      (recipientOf(h) ? " A recipient is named on this row because that is " +
+        "who it was MEANT for, not anybody who received anything."
+        : " Who it was meant for is not on this row, and nothing was sent " +
+          "to them either way.") +
+      (settled ? "" : " The figure is this row's own: the value read-back " +
+        "that named this payment does not add up — its recovered total and " +
+        "its list of recovered payments disagree — so how much came back is " +
+        "taken from the row rather than from it.");
+  }
+  if (!recoveredComplete(rec)) {
+    return "Whether this payment handed its strings over at all, or was " +
+      "interrupted and had its coins put back by Recover, is not known " +
+      "here: this page has not read back the value account for this wallet, " +
+      "or read one that did not name every recovered payment. Those are " +
+      "opposite situations and it is not guessing between them.";
+  }
+  // COMPLETE, BUT NOT OF THIS MOMENT. The sentence below is read out of an
+  // absence, and an absence in an account older than these rows says
+  // nothing: the recovery that would have named this payment may have
+  // happened since. The weaker sentence is the true one, and it names the
+  // clock rather than hiding behind it.
+  if (!valueAccountPaired(rec, atMs)) {
+    return "Whether this payment handed its strings over at all, or was " +
+      "interrupted and had its coins put back by Recover, is not known " +
+      "here: the value account this page holds for this wallet was read " +
+      (typeof atMs === "number" && clock(rec.read_ms)
+         ? "at " + clock(rec.read_ms) + ", before these rows were"
+         : "at a moment this page cannot place beside these rows") +
+      ", and a payment recovered since would not be named in it. Press " +
+      "Refresh history to read the rows and the account together.";
+  }
+  return "This payment did hand its strings over: the value read-back for " +
+    "this wallet accounts for every payment whose coins came back, and this " +
+    "is not one of them. So the strings exist, outside this wallet.";
+}
+/* DID THIS WALLET EVER TRY? The narrower question beside `delivery`, and
+   the one walletops added a machine-readable field for precisely because
+   four situations were byte-identical inside "unknown": strings handed to
+   the caller as bearer; a wallet named and no delivery performed; a
+   delivery started and never answered; a delivery attempted that nobody
+   answered. app.py relays `delivery_attempt` and `delivery_cause` on every
+   row, this page parsed neither into a sentence, and so all four printed
+   the same two lines. The field is a closed set (not_attempted /
+   attempted / unknown); anything else is read as "not recorded", never
+   reinterpreted.
+
+   CALLED ON A COMMITTED PAY ROW AND NOWHERE ELSE, and historyRowHtml is
+   what holds that line. `causeSaid` says the row has already printed the
+   English for `delivery_cause` above this sentence, so the attempted
+   branch points at it instead of repeating it word for word in the same
+   cell. Pure: no DOM, no fetch. */
+const ATTEMPTS = {not_attempted: 1, attempted: 1, unknown: 1};
+function attemptOf(h) {
+  const raw = h && h.delivery_attempt;
+  if (raw === undefined || raw === null || raw === "") return "";
+  const key = reasonKey(raw);
+  return ATTEMPTS[key] ? key : "unknown";
+}
+function attemptWords(h, causeSaid) {
+  // "" and "unknown" are ONE answer on a committed payment. app.py's
+  // clean_attempt defaults an absent field to "" on the history route
+  // because that route also carries receives, where the question does not
+  // arise -- but this function is called only on a payment that committed,
+  // where it always arises, and walletops' own rule for "" is NOTHING WAS
+  // RECORDED rather than "it was not attempted". So the blank gets the
+  // not-recorded sentence, never silence and never the friendlier word.
+  const a = attemptOf(h) || "unknown";
+  if (a === "unknown") {
+    return "Whether this wallet ever attempted a delivery was not " +
+      "recorded, so \u201cnot sent\u201d and \u201csent and lost\u201d " +
+      "cannot be told apart from this row.";
+  }
+  if (a === "attempted") {
+    if (causeSaid)
+      return "This wallet DID attempt the delivery \u2014 the failure named " +
+        "above is the answer that attempt got, not a reason it was never " +
+        "made.";
+    const why = reasonEnglish(h.delivery_cause);
+    return "This wallet DID attempt the delivery" +
+      (why ? ", and " + why + "." : " and nothing came back to record.");
+  }
+  // not_attempted: which of the two depends on who the payment was for,
+  // and the record's own recipient_kind says which -- never the name.
+  const kind = h && h.recipient_kind;
+  return "This wallet never attempted a delivery from here: " +
+    (reasonKey(kind) === "bearer"
+       ? "the strings were handed back to whoever made the payment, to " +
+         "pass on themselves."
+       : "a recipient is named on this row, and nothing was sent to them " +
+         "from this wallet.");
+}
+function historyRowHtml(h, rec, atMs) {
   // `cause` is the key app.py's /api/wallet/history actually emits, and
   // walletops records under. Reading `h.reason` made this whole block
   // dead code: it is undefined on every row the server sends, so no row
@@ -3698,9 +4388,16 @@ function historyRowHtml(h) {
   const code = h.cause || h.reason;
   const why = code
     ? '<b>' + esc(sentence(reasonEnglish(code) || String(code))) + '</b> ' : "";
-  const cell = deliveryCell(h);
+  const cell = deliveryCell(h, rec);
   const bits = recordBits(h);
   const d = isPayRow(h) ? deliveryOf(h) : "";
+  // Did this payment hand anything over at all? The row cannot say -- a
+  // recovered payment and a bearer payment in a stranger's hands are
+  // byte-identical in the wallet's durable record -- so the answer comes
+  // from the wallet's value read-back, which this page already holds.
+  const back = isPayRow(h) && !payDidNotCommit(h)
+    ? recoveredEntry(rec, h.op_id) : null;
+  const gone = paidOutWords(h, rec, d, atMs);
   // Why a delivery failed, from the SAME closed vocabulary every other
   // failure on this page is explained by, and said only where a delivery
   // actually failed.
@@ -3710,31 +4407,86 @@ function historyRowHtml(h) {
   // The sentence after the record line is about finding the money again,
   // and it is only said for the outcomes that mean there is money to find
   // or a question left open about it.
-  const after =
+  // DID IT EVER TRY -- said on a COMMITTED PAY ROW and on nothing else.
+  // The question arises only where a delivery could have happened. A
+  // receive, a refusal, a row of some other kind and a pay that did not
+  // commit have no delivery to have attempted, and each of those rows
+  // already says so in its Delivery cell: an em-dash whose meaning is "no
+  // delivery to speak of", or "nothing left" on a settled `_failed`, or
+  // "not settled" on a `_pending` that Recover is the answer to. Printing
+  // "whether this wallet ever attempted a delivery was not recorded, so
+  // not sent and sent and lost cannot be told apart" under any of them
+  // manufactures an unresolvable question about money the same row says
+  // never moved -- this round's own defect inverted, on the commonest row
+  // in the product. `back` excludes a payment the account names as
+  // recovered, where the attempt is part of `gone`'s story, and
+  // "delivered" excludes the one outcome that settles the question.
+  const tried = (isPayRow(h) && !payDidNotCommit(h) && !back &&
+                 d !== "delivered") ? attemptWords(h, !!why2) : "";
+  // A payment the read-back names as recovered gets `gone` INSTEAD of the
+  // chain below, not after it: every sentence in that chain is about where
+  // strings that left this wallet ended up, and this payment produced
+  // none. Leaving "whether this reached anybody was never established"
+  // under a row whose money is back in the balance is the sentence this
+  // round is here to delete.
+  const after = back ? gone :
     d === "undelivered"
-      ? "The value is in the bearer strings this payment produced: nobody " +
-        "has taken it unless somebody has redeemed them since." + why2 +
-        " Press Show the strings nobody has redeemed above to read them " +
-        "back out of the wallet file."
+      // THE CLAIM, AND THE WEAKER TRUE ONE. "The value is in the bearer
+      // strings this payment produced" is a claim that strings exist, and
+      // a pay op stranded before anything was sent is recorded undelivered
+      // too -- it produced none, and its coins are back in the balance.
+      // Only a value account read WITH these rows separates the two, so
+      // the claim is made when there is one and withheld when there is
+      // not. It used to be gated on completeness alone, which is true of
+      // the ordinary empty account (0 recovered, no operations named) and
+      // so was suppressed in precisely the case that produced the false
+      // sentence: an account read before a recovery this page did not see.
+      ? (valueAccountPaired(rec, atMs)
+          ? "The value is in the bearer strings this payment produced: " +
+            "nobody has taken it unless somebody has redeemed them since." +
+            why2 + " Press Show the strings nobody has redeemed above to " +
+            "read them back out of the wallet file."
+          : "Whether this payment produced any bearer strings at all is " +
+            "not settled here." + why2 + (gone ? " " + gone : "") +
+            " If it did, the value is in them and nobody has taken it " +
+            "unless somebody has redeemed them since: press Show the " +
+            "strings nobody has redeemed above to read out whatever this " +
+            "wallet still holds.")
     : d === "unknown"
       ? "Whether this reached anybody was never established. It is not a " +
-        "record that it failed, and not one that it arrived."
+        "record that it failed, and not one that it arrived." +
+        (gone ? " " + gone : "")
     : payUnsettled(h)
-      ? "This payment was started and never got an answer, so there is no " +
-        "delivery outcome to record yet \u2014 not a record that nothing " +
-        "left. Press Recover to settle it against the mint's ledger; until " +
-        "then whether the money moved is undetermined."
+      // `_pending` is a suffix on the kind, and `receive_pending` carries
+      // it too. That row is an unsettled REDEMPTION: it has no delivery,
+      // which is why its Delivery cell is the em-dash meaning the question
+      // does not arise, and calling it a payment with "no delivery outcome
+      // to record yet" put an open delivery question under a cell that
+      // says there is none. Same fact, said about the right kind of
+      // operation.
+      ? (isPayRow(h)
+          ? "This payment was started and never got an answer, so there is " +
+            "no delivery outcome to record yet \u2014 not a record that " +
+            "nothing left. Press Recover to settle it against the mint's " +
+            "ledger; until then whether the money moved is undetermined."
+          : "This operation was started and never got an answer, so there " +
+            "is no outcome recorded for it \u2014 not a record that nothing " +
+            "happened. Press Recover to settle it against the mint's " +
+            "ledger; until then whether the money moved is undetermined.")
     : (deliveryMissing(h) && !bits.length)
       ? "This row records no recipient and no delivery outcome, so it " +
-        "cannot tell you whether the money reached anybody."
+        "cannot tell you whether the money reached anybody." +
+        (gone ? " " + gone : "")
+    : deliveryMissing(h) ? gone
     : "";
+  const tail = after && tried ? after + " " + tried : (after || tried);
   return '<tr><td>' + esc(h.ts_ms ? when(h.ts_ms) : "not recorded") +
     '</td><td>' + esc(h.kind) +
     '</td><td class="num">' + esc(h.amount_mc === null ? "-" : mc(h.amount_mc)) +
     '</td><td class="' + cell.cls + '">' + esc(cell.word) +
     '</td><td class="note" style="margin:0">' + why + esc(plain(h.detail)) +
     (bits.length ? '<div class="note">' + esc(bits.join(" \u00b7 ")) + '</div>' : "") +
-    (after ? '<div class="note">' + esc(after) + '</div>' : "") +
+    (tail ? '<div class="note">' + esc(tail) + '</div>' : "") +
     '</td></tr>';
 }
 
@@ -3857,7 +4609,19 @@ function recoverCounterLines(res, balance) {
    answer it -- the same GET /api/wallet/outstanding this page already
    calls after a payment -- and both answers are printed, neither dressed
    as the other. Pure: no DOM, no fetch. */
-function unredeemedRecoverLines(rec, name) {
+function unredeemedRecoverLines(rec, name, shown) {
+  const lines = unredeemedRecoverValueLines(rec, name);
+  // ...AND THE VALUE THAT CAME BACK, in the same panel as the value that
+  // did not. recoverCounterLines above says "3 coins from it can be spent
+  // from here" and stops: it never names how much that was, and its
+  // counters are gone the moment this panel is repainted. The read-back
+  // this page has just made carries both, so the figure is printed once
+  // here and permanently on the row in the History table.
+  const more = recoveredClause(rec, name, shown);
+  if (more) lines.push(["note ok", more.replace(/^\s+/, "")]);
+  return lines;
+}
+function unredeemedRecoverValueLines(rec, name) {
   const who = name || "this wallet";
   const aside = "Recovery asks the narrower question and cannot answer " +
     "this one; it is asked separately, of the mint.";
@@ -3900,8 +4664,24 @@ function unredeemedRecoverLines(rec, name) {
   if (rec.unstated_mc > 0) {
     lines.push(["note bad", mc(rec.unstated_mc) + " in " +
       n(rec.unstated_count, "further string", "further strings") + " that " +
-      who + " handed out has no state the mint could name, so whether that " +
-      "value is still money is undetermined."]);
+      who + " handed out came back with no ledger entry at the mint \u2014 " +
+      "it answered, and it has no record of " +
+      (rec.unstated_count === 1 ? "that string" : "those strings") +
+      ", which most often means " +
+      (rec.unstated_count === 1 ? "it belongs" : "they belong") +
+      " to a different mint\u2019s database \u2014 so whether that value " +
+      "is still money is undetermined."]);
+  }
+  // ...and the other gap, which is not the same gap. These strings were
+  // never asked about, so nothing has been established about them at all;
+  // asking the mint again is what answers this one.
+  if (rec.unchecked_mc > 0) {
+    lines.push(["note bad", mc(rec.unchecked_mc) + " in " +
+      n(rec.unchecked_count, "further string", "further strings") + " that " +
+      who + " handed out was not asked about, or the mint gave no answer " +
+      "for " + (rec.unchecked_count === 1 ? "it" : "them") + ", so whether " +
+      "that value is still money is undetermined. That is a question " +
+      "nobody has put yet, not a mint that answered."]);
   }
   if (!lines.length && rec.truncated) {
     // "Nothing is unredeemed either" is a statement about every payment
@@ -3930,9 +4710,9 @@ function unredeemedRecoverLines(rec, name) {
   return lines;
 }
 /* Both answers, in one panel, in the order an operator reads them. */
-function recoverLines(res, balance, rec, name) {
+function recoverLines(res, balance, rec, name, shown) {
   return recoverCounterLines(res, balance)
-    .concat(unredeemedRecoverLines(rec, name));
+    .concat(unredeemedRecoverLines(rec, name, shown));
 }
 
 async function recoverNow() {
@@ -3962,7 +4742,8 @@ async function recoverNow() {
     await refreshMoney(); await refreshHistory(); return;
   }
   $("h-out").innerHTML =
-    recoverLines(r.data.result, r.data.balance_mc, rec, name)
+    recoverLines(r.data.result, r.data.balance_mc, rec, name,
+                 shownHistoryOps())
       .map(l => '<div class="' + l[0] + '">' + esc(l[1]) + '</div>').join("") +
     '<details><summary>The raw counters recovery reported</summary><pre>' +
     esc(JSON.stringify(r.data.result, null, 2)) + '</pre></details>';

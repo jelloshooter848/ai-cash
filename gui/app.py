@@ -224,22 +224,79 @@ _REASON_CAUSE = {
 #: arise (nothing moved, so nothing was delivered).
 DELIVERIES = ("delivered", "undelivered", "unknown")
 
-#: What the recipient field of a payment record means. "" is the fourth
-#: state: nothing was recorded, which is not the same as "no recipient".
-RECIPIENT_KINDS = ("wallet", "bearer")
+#: TWO STATES THAT ARE NOT ANSWERS, and they are not the same state.
+#: ``NOT_APPLICABLE`` is "the question does not arise" -- a ``receive``
+#: row has no delivery, so it has no recipient and no attempt either.
+#: ``UNDETERMINED`` is "it does arise and nothing here answers it" -- a
+#: payment WAS made and this server has no row saying who for. Writing
+#: one string for both is what made a recovered payment and a row that
+#: never had a delivery identical on the wire; ``delivery`` has told them
+#: apart since round 4 and the other two fields now do it the same way.
+#:
+#: WHICH QUESTION ARISES DEPENDS ON THE FIELD, not only on the row. A
+#: ``pay`` that did NOT commit moved no money, so it has no delivery and
+#: all three delivery fields are NOT_APPLICABLE -- but somebody asked for
+#: that payment and named somebody or deliberately named nobody, so
+#: ``recipient_kind`` is never NOT_APPLICABLE on it. walletops.py fills
+#: it from the row it wrote when the payment was interrupted; this file
+#: relays it and does not re-derive it.
+#: See gui/walletops.py, which declares the same two and is where these
+#: values are produced.
+NOT_APPLICABLE = ""
+UNDETERMINED = "unknown"
+
+#: What the recipient field of a payment record means. "unknown" is a
+#: real member: nothing was recorded, which is not the same as "no
+#: recipient" (that is ``bearer``) and not the same as NOT_APPLICABLE
+#: (no payment, so no recipient field to fill).
+RECIPIENT_KINDS = ("wallet", "bearer", "unknown")
 
 #: DID THE PAYING WALLET EVER TRY? Relayed from walletops.py, never
 #: re-derived here. It is what tells apart the situations that all read
 #: ``delivery: "unknown"`` -- a payment never delivered from one that was
 #: attempted and lost -- and those send an operator to different places.
-#: "" is the third value and means nothing was recorded.
-DELIVERY_ATTEMPTS = ("not_attempted", "attempted")
+#: "unknown" is the third value and means nothing was recorded.
+DELIVERY_ATTEMPTS = ("not_attempted", "attempted", "unknown")
 
 
-def clean_attempt(value) -> str:
-    """Coerce into DELIVERY_ATTEMPTS, or "" for nothing recorded."""
-    text = str(value or "").strip()
-    return text if text in DELIVERY_ATTEMPTS else ""
+def clean_attempt(value, default: str = NOT_APPLICABLE) -> str:
+    """Coerce into DELIVERY_ATTEMPTS, relaying which KIND of non-answer.
+
+    Two non-answers, and they are not interchangeable:
+
+    * PRESENT but unreadable -- the component DID answer and this build
+      cannot read the word. The payment exists and had an attempt or did
+      not; nothing here says which, so UNDETERMINED.
+    * ABSENT or blank -- the component said nothing at all, and what that
+      means depends on the endpoint, so the CALLER says. On a history
+      page a row may be a receive, where the question does not arise, so
+      the default is NOT_APPLICABLE; on an endpoint that lists nothing
+      but payments the question always arises and the caller passes
+      UNDETERMINED.
+
+    Both used to collapse into "", which told an operator a payment had
+    no delivery to speak of because a newer walletops.py used a word this
+    build has not learnt.
+    """
+    text = "" if value is None else str(value).strip()
+    if text in DELIVERY_ATTEMPTS:
+        return text
+    return default if not text else UNDETERMINED
+
+
+def clean_recipient_kind(value, default: str = NOT_APPLICABLE) -> str:
+    """Coerce into RECIPIENT_KINDS, by the same rule as clean_attempt.
+
+    A component that answers "sky-writing" HAS answered: the payment had
+    a recipient of some kind and this server cannot read which. That is
+    undetermined, and reporting it as "" -- the string this wire uses for
+    "there was no payment here" -- is the one reading that is certainly
+    wrong.
+    """
+    text = "" if value is None else str(value).strip()
+    if text in RECIPIENT_KINDS:
+        return text
+    return default if not text else UNDETERMINED
 
 
 def clean_delivery(value, default: str = "") -> str:
@@ -1651,14 +1708,17 @@ class Api:
                         "cause": "" if cause in (None, "") else
                                  clean_cause(cause),
                         # The payment record, relayed exactly as recorded.
-                        # "" means the question does not arise (nothing
-                        # moved); "unknown" means it arose and nobody
-                        # knows the answer. Those are different rows and
-                        # this layer must not merge them.
+                        # "" means the question does not arise; "unknown"
+                        # means it arose and nobody knows the answer.
+                        # Those are different rows and this layer must not
+                        # merge them. On a `pay_pending` / `pay_failed`
+                        # row the two RECIPIENT fields are answered and
+                        # the three DELIVERY fields are "": no money
+                        # moved, so there was no delivery -- but it was
+                        # still a payment and it was still for somebody.
                         "recipient": str(row.get("recipient", "")),
-                        "recipient_kind": (row.get("recipient_kind")
-                                           if row.get("recipient_kind")
-                                           in RECIPIENT_KINDS else ""),
+                        "recipient_kind": clean_recipient_kind(
+                            row.get("recipient_kind")),
                         # Absent means the component said nothing about
                         # delivery, which is "" -- the question does not
                         # arise. Present but unrecognised means it DID
@@ -2002,15 +2062,14 @@ class Api:
                 # Relayed exactly as recorded. "unknown" stays unknown
                 # here: this server watched nothing walletops did not.
                 "recipient": str(raw.get("recipient", "")),
-                "recipient_kind": (raw.get("recipient_kind")
-                                   if raw.get("recipient_kind")
-                                   in RECIPIENT_KINDS else ""),
+                "recipient_kind": clean_recipient_kind(
+                    raw.get("recipient_kind"), UNDETERMINED),
                 "delivery": clean_delivery(raw.get("delivery"), "unknown"),
                 "delivery_cause": (
                     "" if not raw.get("delivery_cause")
                     else clean_cause(raw.get("delivery_cause"))),
                 "delivery_attempt": clean_attempt(
-                    raw.get("delivery_attempt")),
+                    raw.get("delivery_attempt"), UNDETERMINED),
                 "delivery_detail": str(raw.get("delivery_detail", ""))}
 
     def _recipient_name(self, to) -> str:
@@ -2200,16 +2259,15 @@ class Api:
                              # payment must not read "delivered" in one
                              # view and "unknown" in the other.
                              "recipient": str(item.get("recipient", "")),
-                             "recipient_kind": (item.get("recipient_kind")
-                                                if item.get("recipient_kind")
-                                                in RECIPIENT_KINDS else ""),
+                             "recipient_kind": clean_recipient_kind(
+                                 item.get("recipient_kind"), UNDETERMINED),
                              "delivery": clean_delivery(item.get("delivery"),
                                                         "unknown"),
                              "delivery_cause": (
                                  "" if not delivery_cause
                                  else clean_cause(delivery_cause)),
                              "delivery_attempt": clean_attempt(
-                                 item.get("delivery_attempt")),
+                                 item.get("delivery_attempt"), UNDETERMINED),
                              "tokens": tokens})
         checked = bool(raw.get("checked"))
         # THE TOTALS, DECOMPOSED BY WHAT THE MINT ACTUALLY SAID. Summed
@@ -2257,9 +2315,31 @@ class Api:
         recovered_ops = []
         for item in (raw.get("recovered_ops") or []):
             if isinstance(item, dict):
-                recovered_ops.append({"op_id": str(item.get("op_id", "")),
-                                      "amount_mc": _as_int(
-                                          item.get("amount_mc"))})
+                # THE SAME FIVE RECORD FIELDS the payments above carry,
+                # relayed by the same rules. history() prints a row for
+                # each of these op_ids and a reader matches the two by
+                # op_id; a recovered payment that reads "meant for bob,
+                # nothing handed over" there and carries no recipient at
+                # all here is one payment answering differently in two
+                # panels, which is the defect this whole endpoint exists
+                # to have stopped.
+                cause = item.get("delivery_cause")
+                recovered_ops.append({
+                    "op_id": str(item.get("op_id", "")),
+                    "amount_mc": _as_int(item.get("amount_mc")),
+                    "recipient": str(item.get("recipient", "")),
+                    "recipient_kind": clean_recipient_kind(
+                        item.get("recipient_kind"), UNDETERMINED),
+                    # Defaulted to "unknown", exactly as the payments
+                    # list two blocks up defaults it: every item on this
+                    # endpoint is a payment, so "" -- the question does
+                    # not arise -- is true of none of them.
+                    "delivery": clean_delivery(item.get("delivery"),
+                                               "unknown"),
+                    "delivery_cause": ("" if not cause
+                                       else clean_cause(cause)),
+                    "delivery_attempt": clean_attempt(
+                        item.get("delivery_attempt"), UNDETERMINED)})
         truncated = raw.get("truncated")
         if not isinstance(truncated, bool):
             # The component did not say. A full page is the only evidence
@@ -2752,6 +2832,22 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _read_body(self) -> dict:
+        # A chunked body has no Content-Length, so the length-based read
+        # below would take it as an empty body and every field would then
+        # look absent -- pointing the caller at the first field the route
+        # validates instead of at the real problem, which is that nothing
+        # was read.  page.html is unaffected (browsers set Content-Length),
+        # but the readme invites direct API use, and an HTTP client that
+        # chunks by default deserves the true answer rather than bad_name.
+        if self.headers.get("Transfer-Encoding"):
+            raise GuiError(
+                400, "chunked_body",
+                "This GUI reads request bodies by Content-Length and does "
+                "not decode chunked transfer encoding, so nothing was read "
+                "from this request. Send the body with a Content-Length "
+                "header. Any field this route would have wanted looks "
+                "absent because the body was discarded, not because you "
+                "omitted it.")
         length = _as_int(self.headers.get("Content-Length"), 0) or 0
         if length > MAX_BODY_BYTES:
             raise GuiError(413, "too_large",

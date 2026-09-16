@@ -19,36 +19,18 @@ python3 gui/app.py
 If `cryptography` is already importable in the interpreter you are about
 to use, it is just the last line.
 
-### From a fresh clone: not yet, and here is the exact reason
-
-**Cloning from GitHub today does not get you this directory.** The
-published `jelloshooter848/ai-cash` HEAD is `c23b44c`; the commit that
-adds `gui/` is local and unpushed. So this —
+### From a fresh clone
 
 ```
-git clone https://github.com/jelloshooter848/ai-cash.git   # no gui/ in it today
+git clone https://github.com/jelloshooter848/ai-cash.git
 cd ai-cash
 python3 gui/app.py
 ```
 
-— ends in `python3: can't open file '.../ai-cash/gui/app.py': [Errno 2]
-No such file or directory`. `git ls-tree --name-only c23b44c` is the whole
-of what a clone gets today — `BOOTSTRAP.md`, `impl/`, `components/`,
-`examples/`, `run_mint.py`, `wallet_cli.py`, `mint_console.py` and the spec
-and design documents — with no `gui/` anywhere in it. Check it yourself
-before trusting any clone recipe:
-
-```
-git ls-remote https://github.com/jelloshooter848/ai-cash.git   # what is published
-git log --oneline --diff-filter=A -- gui/app.py                # when gui/ was added
-git branch -r --contains $(git log -1 --format=%H -- gui/app.py)   # empty = unpushed
-```
-
-Until that third command names a remote branch, get this tree from the
-machine it was built on rather than from a clone. Once `gui/` is pushed,
-the fresh-clone recipe is the block at the top of this section with
-`git clone https://github.com/jelloshooter848/ai-cash.git && cd ai-cash`
-in front of it, and nothing else about it changes.
+If that fails because `gui/` is not in the clone, the commit that adds it
+has not reached the remote yet. `git branch -r --contains $(git log -1
+--format=%H -- gui/app.py)` naming no remote branch is how you tell, and
+getting the tree from the machine it was built on is the workaround.
 
 ### Where it runs from, and what it needs
 
@@ -313,26 +295,88 @@ applies.
   when a debounce timer eventually fires. A click pays the amount from the
   quote on screen, never the number in the box: if the two have drifted
   apart the page refuses, says nothing was paid, and re-quotes.
-- **Eight things void that cost sentence, not two.** The amount and the
-  recipient are the two you cause. The other five are the mint moving
+- **Nine things void the pay quote, not two.** The amount and the
+  recipient are the two you cause. Six more are the mint moving
   underneath you, and they are precisely the ones nothing on screen would
   look stale for, so they get the same answer instead of waiting for the
-  next poll: every cost sentence is stamped with the mint state it was
-  computed under (`mintKey()` in `page.html`) and is thrown away the moment
-  that state changes. The five are **the link to the mint failing**, **the
-  mint stopping**, **the mint being stopped, given a new burn policy, and
-  started again on the same id and port** — where the sentence is not
-  merely old, its arithmetic is now wrong and nothing about it looks stale
-  — **`app.py` no longer being able to say what the mint is doing**, and
-  **the link coming back**, because "nothing can be paid" is itself a stale
-  sentence once it can be. That is seven. The eighth is not staleness at all: a
-  quote is also voided by being **spent**, on the same tick it is used
-  (`invalidateQuote()` in `page.html`, called from both the pay and the
-  issue path), so a second click cannot re-pay an estimate already
-  consumed. The principle under all of them is one
-  sentence: a cost estimate describing a payment this page can no longer
-  check must not sit on screen looking agreed to — so it is removed, not
-  merely made unclickable.
+  next poll: the sentence in `#p-quote` is stamped with the mint state it
+  was computed under (`mintKey()` in `page.html`) and is thrown away the
+  moment that state changes. The six are **the link to the mint
+  failing**, **the mint stopping**, **the mint running but not answering**
+  (`responding: false` — a live process that has stopped replying is a
+  mint this page can no longer check a cost against), **the mint being
+  stopped, given a new burn policy, and started again on the same id and
+  port** — where the sentence is not merely old, its arithmetic is now
+  wrong and nothing about it looks stale — **`app.py` no longer being able
+  to say what the mint is doing**, and **the link coming back**, because
+  "nothing can be paid" is itself a stale sentence once it can be. That is
+  eight. The ninth is not staleness at all: a quote is also voided by
+  being **spent**, on the same tick it is used (`invalidateQuote()` in
+  `page.html`, called from both the pay and the issue path), so a second
+  click cannot re-pay an estimate already consumed. The principle under
+  all of them is one sentence: a cost estimate describing a payment this
+  page can no longer check must not sit on screen looking agreed to — so
+  it is removed, not merely made unclickable.
+
+  Count them against `mintKey()` rather than against this list: every one
+  of the six changes the string it builds — `linkFailure` in either
+  direction, `mint.unknown`, `mint.running`, `mint.responding`, and the
+  `mint_id | port | pid | started_at_ms | policy` tail a restart rewrites.
+  This bullet used to enumerate five and leave out `responding: false`,
+  which `mintKey()` has always included and which the paragraph
+  immediately below reports causing; "eight" was that arithmetic carried
+  through.
+
+  **Measured, this round, by causing each transition** against
+  `page.html`'s real JavaScript under node: from a quote standing on a
+  running mint, the sentence in `#p-quote` was gone and **Pay** was
+  disabled after every one of the link failing, the mint being stopped,
+  the mint being stopped / repolicied / restarted, `/api/mint/status`
+  failing (`mint.unknown`), the mint going **running but not answering**
+  (`responding: false`), and the link coming back. Six for six.
+
+  **Five of those six were caused against the shipped server; one was
+  not, and that is a difference worth stating rather than averaging
+  away.** The link failing, the mint stopping, stop/repolicy/restart,
+  `responding: false` and the link coming back were driven against a real
+  `app.py` over HTTP with a real `run_mint.py` behind it. The
+  `responding: false` one, re-caused for this round: a 60 mc quote stood
+  reading *"Paying 60 mc spends 60 mc of w20's coins. bob ends up with the
+  whole 60 mc; nothing is burned"* with **Pay 60 mc to bob** enabled; the
+  mint process was `kill -STOP`ped; `mintKey()` went from
+  `up|local-test-mint|8892|…` to `deaf|local-test-mint|8892|…` and
+  `#p-quote` became *"The mint process is running but is not answering, so
+  no cost can be checked and nothing can be paid from here. Any cost shown
+  before now is void…"* with **Pay** disabled. **`mint.unknown` is the
+  exception**: it is what the page does when `GET /api/mint/status` itself
+  fails, and a live `app.py` answers that route — so the transition is
+  reachable only by putting a failing server under the page, and it was
+  caused with the node harness against a fake one. Killing `app.py` does
+  **not** get you there: that sets `linkFailure`, which `mintKey()` reads
+  first, and it is a different one of the six.
+- **The issue cost line is voided too, and by its own check, not by
+  `mintKey()`.** The line above **Issue into wallet** is derived from the
+  burn policy, and the burn policy is edited in a form a few pixels above
+  it, so it has one failure the quote cannot have: the boxes moving while
+  the figure stands. `pendingPolicyState()` in `page.html` is its rule,
+  and it answers for the mint state as well as for the boxes. Measured the
+  same way, from a standing "issuing 1,000 mc credits alice 990 mc": the
+  arithmetic was withdrawn and replaced by a sentence naming the reason on
+  **the mint stopping** ("no mint is running here, so there is no burn
+  policy in force to work it out from"), on the mint being **running but
+  not answering**, on **the link failing**, on **`app.py` no longer being
+  able to say what the mint is doing**, and on **the policy boxes being
+  edited away from the policy the figure came from**. On a restart under a
+  new policy it was recomputed from the new descriptor rather than left
+  standing — 1,000 mc credited whole under `rate_ppm 0`.
+
+  Do not read that as one mechanism. It is two, keyed on overlapping
+  facts, and a reader checking only `mintKey()` will not find the second
+  one. Until this round it was genuinely one-and-a-half: a plain **Stop**
+  left the issue line printing "credits alice 990 mc" beside a disabled
+  button, because `pendingPolicyState()` compared the boxes to the policy,
+  and a stop changes neither. That is fixed in the tree these figures were
+  measured on.
 - **The mint's settings are read back from the mint.** The mint id,
   baseline model class and burn policy in the form are overwritten with
   what the running mint actually reports, and what this GUI last started is
@@ -381,7 +425,7 @@ applies.
   stopped** — so on screen there was no difference at all.
   `MintControl.status()` probes the descriptor and reports the answer as
   **`responding`**; `app.py` relays it without inferring it, and the page
-  now renders a third mint state: an amber indicator, *RUNNING BUT NOT
+  now renders a third mint state: a grey indicator, *RUNNING BUT NOT
   ANSWERING* with the reason beside it, a **State** of *not answering*,
   and Pay, Issue, Receive, Recover and token lookup disabled — while Stop
   and Refresh stay live, because those are how an operator gets out of it.
@@ -398,7 +442,7 @@ applies.
   because its own test was `responding === false`. The difference between
   a probe that failed and a probe that could not be addressed is real and
   is carried in `last_error`, which is exactly the field printed beside
-  the amber indicator. Nothing infers `responding` from `last_error` or
+  the grey indicator. Nothing infers `responding` from `last_error` or
   from `running`.
 - **Which is down does not change what a wallet shows.** Both ways give
   every wallet `connected: false`, so that field cannot tell them apart —
@@ -429,54 +473,57 @@ the page. It does one subtraction:
 = the residual
 ```
 
-Worked, on a session driven end to end through this GUI's own HTTP API for
-this round — both functions run under `node` against the live API
-responses, printing the same lines the panel prints. The session issued
-50,000 mc in five 10,000 mc tokens, credited four of them to `alice`, paid
-`bob` with delivery, paid bearer, paid a payee this workdir does not hold
-with `deliver:false`, pasted its own bearer strings back into `carol`,
-pasted a mixed batch of live / already-redeemed / malformed strings,
-pressed Recover, and stopped and restarted the mint under a different burn
-policy:
+Worked, on a session driven end to end through this GUI's own HTTP API and
+re-run for this round — both functions run under `node` against the live
+API responses, printing the same lines the panel prints. The session
+issued 50,000 mc in five 10,000 mc tokens, credited four of them to
+`alice`, paid `bob` with delivery, paid bearer, paid a payee this workdir
+does not hold with `deliver:false`, pasted its own bearer strings back
+into `carol`, pasted a mixed batch of already-redeemed and malformed
+strings, pressed Recover, and stopped and restarted the mint under a
+different burn policy:
 
 ```
-signed snapshot     50,000 ever issued   779 ever burned   49,221 outstanding
-wallets             alice 24,373   bob 8,069   carol 4,729        37,171
-handed over, unredeemed                                            2,050
-accounted                                                         39,221
+signed snapshot     50,000 ever issued   481 ever burned   49,519 outstanding
+wallets             alice 35,554   bob 1,980   carol 1,485        39,019
+handed over, unredeemed                                              500
+accounted                                                         39,519
 residual                                                          10,000
 ```
 
-and the panel's own third line: *"10,000 mc of live money is in no wallet
-on this page and in no string this page can see."* That figure was exactly
-right and exactly explicable: it is the fifth issued token, 10,000 mc, that
-was never credited to a wallet. Its string existed only in the issue result
-panel; the mint keeps hashes and never secrets, so nothing anywhere can
-read it back, and it appears on no other surface on the page. An
-independent ledger kept alongside the session — every unit created, spent,
-burned and received, tracked by hand — came to the same 49,221 mc as the
-mint's signed snapshot at every one of the twelve checkpoints in the run,
-and 37,171 + 2,050 + 10,000 is that number. That is what this panel is for.
+and the panel's own third line, copied out of `supplyLines()`: *"10,000 mc
+of live money is in no wallet on this page and in no string this page can
+see."* That figure was exactly right and exactly explicable: it is the
+fifth issued token, 10,000 mc, that was never credited to a wallet. Its
+string existed only in the issue result panel; the mint keeps hashes and
+never secrets, so nothing anywhere can read it back, and it appears on no
+other surface on the page. 39,019 + 500 + 10,000 is 49,519, the mint's own
+signed outstanding total, and the mint's own three snapshot figures agree
+with each other: 50,000 − 481 = 49,519.
 
-A second reading from the same session, after two wallets had been pushed
-past the read-back window on purpose, shows the floor-and-ceiling
-machinery doing its job:
+A second reading, from a longer workdir where several wallets had been
+pushed past the read-back window, shows the floor-and-ceiling machinery
+doing its job:
 
 ```
-signed snapshot  50,000 issued   881 burned   49,119 outstanding
-wallets                                                    33,419
-handed over and confirmed unredeemed                        3,500
-accounted (a FLOOR)                                        36,919
-residual (a CEILING)                                       12,200
-gap named in the panel: 15,380 mc of handed-out value unasked about
+signed snapshot  51,000 issued   596 burned   50,404 outstanding
+wallets                                                    46,754
+handed over and confirmed unredeemed                          176
+accounted (a FLOOR)                                        46,930
+residual (a CEILING)                                        3,474
+gap named in the panel: 3,524 mc of handed-out value unasked about
 ```
 
-Note that the named gap, 15,380 mc, is **larger** than the residual it
+Note that the named gap, 3,524 mc, is **larger** than the residual it
 qualifies, and that this is not a contradiction: handed-out value that a
 wallet on this same page has since redeemed is inside the balances *and*
 inside that gap, because the paying wallet's own file never learned what
-became of its strings. The panel says so in as many words, because a
-reader who adds the two gets a total the mint's own snapshot contradicts.
+became of its strings. The panel says so in as many words — *"THOSE
+AMOUNTS ARE THE SIZE OF WHAT WAS NOT ESTABLISHED, NOT VALUE TO ADD"* —
+because a reader who adds the two gets a total the mint's own snapshot
+contradicts. The sentences changed with the flag, as promised: *"at least
+46,930 mc in all"* and *"**At most** 3,474 mc of live money is in no
+wallet on this page"*.
 
 Five things it is careful about, and each one is a claim it would otherwise
 be making falsely:
@@ -484,7 +531,10 @@ be making falsely:
 - **The mint's own invariant is checked, not assumed.** `issued − burned ==
   outstanding` is tested against the same signed snapshot the subtraction
   stands on, and a snapshot whose own three numbers disagree is printed as
-  a warning rather than smoothed over.
+  a warning rather than smoothed over. The check was run against live
+  signed snapshots for this file (50,000 − 481 = 49,519; 51,000 − 596 =
+  50,404; 10,000 − 102 = 9,898) and held every time; the warning branch
+  needs a mint that contradicts itself and was not caused here.
 - **No subtraction across two clocks.** The supply and the balances must
   come from one read pass, their timestamps within `PAIR_GAP_MS` (3,000 ms)
   of each other, and the mint's total must read the same immediately before
@@ -494,10 +544,10 @@ be making falsely:
 - **The accounted side is a floor; the residual is therefore a ceiling.** A
   wallet whose balance could not be read, a read-back the mint could not be
   asked about, a read-back the server said did not cover the whole wallet —
-  each sets the floor flag, and the sentences change with it: "at least
-  36,919 mc in all" and "**at most** 12,200 mc of live money is in no
-  wallet". Read the qualifier; it is the difference between a number and a
-  bound.
+  each sets the floor flag, and the sentences change with it: on the second
+  reading above, "at least 46,930 mc in all" and "**at most** 3,474 mc of
+  live money is in no wallet". Read the qualifier; it is the difference
+  between a number and a bound.
 - **A zero is only printed when it is a fact about the mint.** If the mint
   could not be asked about the strings a wallet handed out, the panel does
   not add 0 for them and call it "nobody has redeemed them" — it names the
@@ -505,12 +555,22 @@ be making falsely:
   figure.
 - **Wallets bound to a different mint are left out of the arithmetic
   altogether** and counted separately, because they hold none of this
-  mint's money.
+  mint's money. What was caused for this file is the branch next door:
+  dropping another mint's wallet file into `var/wallets/` and refreshing
+  gave a row this server could not read at all, and the panel set the
+  floor flag and said so — *"1 wallet could not be read, so whatever it
+  holds is missing from the figure above"* — then, with the floor and the
+  mint's total meeting exactly, refused to call that a clean bill:
+  *"That is NOT a statement that nothing is unaccounted for: the figure
+  above is a floor, so the two meeting exactly is as consistent with a gap
+  that was not read as with no gap at all."* The different-mint bucket
+  itself is in `reconcileSupply()` and was not reached that way.
 
 **"Unaccounted" means two different things in this product, and they are
 not comparable.** `gui/walletops.py`'s `unaccounted_mc` is value one wallet
 handed over that the component could put in none of its four buckets; it
-was 0 in every call made for this document and it exists as a tripwire. The
+was 0 in every call made for this document — re-checked this round on five
+wallets, including one with 530 payments — and it exists as a tripwire. The
 panel's residual is the mint's outstanding total minus everything the whole
 page can point to; it is routinely non-zero and a large value there is
 normal on a workdir where anyone has pressed Issue without crediting. A
@@ -856,27 +916,32 @@ route's name does not suggest:
   part of `unlisted_mc` the wallet still shows as handed over.
 
   **And `unredeemed_mc` is `null` whenever that figure is non-zero**, not
-  a confident integer that is short by it. Measured through this HTTP API
-  against a wallet that had made 106 payments, 105 of them live 30 mc
-  bearer payments nobody redeemed:
+  a confident integer that is short by it. Measured through this HTTP API,
+  and re-measured from scratch this round on a wallet built to the same
+  shape — 106 payments, 105 of them live 30 mc bearer payments nobody
+  redeemed, one 50 mc payment delivered and redeemed:
 
   ```
-  GET /api/wallet/outstanding?name=bob&limit=20
+  GET /api/wallet/outstanding?name=carol&limit=20
       unredeemed_mc: null   truncated: true   payment_count: 106
       listed_mc: 600    unlisted_mc: 2600   unlisted_outstanding_mc: 2600
       handed_over_mc: 3200
 
-  GET /api/wallet/outstanding?name=bob&limit=100
+  GET /api/wallet/outstanding?name=carol&limit=100
       unredeemed_mc: null   truncated: true   payment_count: 106
       listed_mc: 3000   unlisted_mc: 200    unlisted_outstanding_mc: 200
       handed_over_mc: 3200          <- same at both: whole life
 
-  gui/walletops.py unredeemed_payments(limit=500)   (no window)
+  gui/walletops.py unredeemed_payments(limit=600)   (no window)
       unredeemed_mc: 3200   truncated: false   unlisted_outstanding_mc: 0
   ```
 
   The true figure at that instant was **3,200**, and no call above states
-  a total it knows is short. Until this round the first two rows read
+  a total it knows is short. Every figure in that block is a re-run, not a
+  transcription: the same wallet, driven to 530 payments, answered
+  `unredeemed_mc: null` at `limit=100` and `unredeemed_mc: 3570,
+  truncated: false, unlisted_outstanding_mc: 0` from the component with no
+  window. Until this round the first two rows read
   `unredeemed_mc: 600` and `unredeemed_mc: 3000` — confident integers with
   no truncation marker — because `route_wallet_outstanding` re-derived the
   headline from the per-token states of the payments it forwarded and
@@ -896,7 +961,17 @@ route's name does not suggest:
   `recover()` put the coins back — so the value is already inside the
   wallet's `balance_mc`. Adding it to the handed-over figures counts the
   same coins on two screens, which is the arithmetic an operator must not
-  be made to do. It was 0 on every wallet measured for this document.
+  be made to do. Caused and measured this round rather than asserted: a
+  60 mc payment stranded in flight against a real mint and then settled by
+  `POST /api/wallet/recover` came back `recovered_mc: 60` with
+  `handed_over_mc: 0`, and the wallet's balance fell by the 1 mc burn and
+  by nothing else. `recovered_ops` carries the same five record fields as
+  a listed payment — `recipient`, `recipient_kind`, `delivery`,
+  `delivery_cause`, `delivery_attempt` — so an op_id matched against
+  `GET /api/wallet/history` reads one answer and not two:
+  `{"op_id": "191854d6-...", "amount_mc": 60, "recipient": "bob",
+  "recipient_kind": "wallet", "delivery": "undelivered",
+  "delivery_cause": "", "delivery_attempt": "not_attempted"}`.
 
   **What the route still does not relay, if you call the component
   directly.** Three figures on every payment: `retired_mc`,
@@ -991,33 +1066,43 @@ supervised process transitions with their own timeouts, and the page gives
 exactly those two longer deadlines — `TIMEOUTS.start` 90 s and
 `TIMEOUTS.stop` 70 s — so the 20 s abort is not their budget. `GET
 /api/mint/logs` reads `var/mint.log` off disk and never touches the mint.)
-Wall-clock against a `SIGSTOP`ped mint, two runs, both columns shown so the
-spread is visible rather than averaged away:
+Wall-clock against a `SIGSTOP`ped mint, three runs, all three columns shown
+so the spread is visible rather than averaged away. Runs 1 and 2 are from
+an earlier round; run 3 was measured this round on the tree being
+published, one route at a time against a mint frozen with `kill -STOP`:
 
 ```
-                                 run 1    run 2   status  what the caller gets
+                                 run 1    run 2    run 3   status  what the caller gets
 under the 20 s abort, so the page shows this server's cause
-  GET  /api/mint/status           2.02 s   2.04 s   200   running:true, responding:false
-  POST /api/mint/issue            8.84 s  10.02 s   502   cause mint_unreachable
-  GET  /api/mint/descriptor      10.07 s  10.85 s   502   cause mint_unreachable
-  GET  /api/token/status         10.02 s  10.02 s   502   cause mint_unreachable
-  GET  /api/wallet/list          12.81 s  14.01 s   200   every row connected:false
-  GET  /api/wallet/summary       14.01 s  12.79 s   504   wallet_not_read
-  GET  /api/wallet/outstanding   14.01 s  12.79 s   504   wallet_not_read
+  GET  /api/mint/status           2.02 s   2.04 s   2.01 s   200   running:true, responding:false
+  POST /api/mint/issue            8.84 s  10.02 s  10.02 s   502   cause mint_unreachable
+  GET  /api/mint/descriptor      10.07 s  10.85 s   8.42 s   502   cause mint_unreachable
+  GET  /api/token/status         10.02 s  10.02 s  10.02 s   502   cause mint_unreachable
+  GET  /api/wallet/list          12.81 s  14.01 s  14.01 s   200   every row connected:false
+  GET  /api/wallet/summary       14.01 s  12.79 s  12.42 s   504   wallet_not_read
+  GET  /api/wallet/outstanding   14.01 s  12.79 s  14.00 s   504   wallet_not_read
 over it, so the page shows ITS OWN give-up message instead
-  POST /api/wallet/quote         35.76 s  38.53 s   400   cause mint_unreachable
-  POST /api/wallet/pay           36.86 s  36.86 s   400   cause mint_unreachable
-  POST /api/wallet/recover       36.92 s  37.66 s   400   cause mint_unreachable
-  POST /api/wallet/receive       36.92 s  36.83 s   400   cause mint_unreachable
-right on the line
-  POST /api/wallet/create                 20.30 s   200   the wallet is created
+  POST /api/wallet/quote         35.76 s  38.53 s  36.36 s   400   cause mint_unreachable
+  POST /api/wallet/pay           36.86 s  36.86 s  34.82 s   400   cause mint_unreachable
+  POST /api/wallet/recover       36.92 s  37.66 s  36.43 s   400   cause mint_unreachable
+  POST /api/wallet/receive       36.92 s  36.83 s  36.44 s   400   cause mint_unreachable
+  POST /api/wallet/create                 20.30 s  32.40 s   200   the wallet is created
 ```
+
+**That last row moved, and the earlier reading of it was the misleading
+one.** This round it measured 32.40 s, 32.43 s and 32.42 s on three
+consecutive creates against the same wedged mint — not a coin flip around
+the page's 20 s abort but comfortably past it, so from the page you get
+`page.html`'s own give-up sentence every time. The wallet is created
+anyway and appears on the next refresh. Why the earlier 20.30 s: not
+established here. Treat the single earlier reading as the one to distrust,
+and re-measure before relying on either.
 
 Four different mechanisms produce those bands, and none of them is a single
 socket timeout:
 
 * **2 s** is `MintControl.probe_timeout_s` alone — one descriptor probe,
-  no wallet and no mint HTTP call. This is what keeps the amber *RUNNING
+  no wallet and no mint HTTP call. This is what keeps the grey *RUNNING
   BUT NOT ANSWERING* indicator responsive while everything else hangs.
 * **~10 s** is `app.py`'s own `MINT_HTTP_TIMEOUT_S` (8 s) plus that probe.
   These three go out through `_mint_http` and nowhere near the wallet.
@@ -1043,17 +1128,17 @@ socket timeout:
 * **`POST /api/wallet/create` is unbounded for a different reason**: it
   makes a file. Abandoning it would let this server answer "not created"
   while the worker it walked away from was still creating the wallet. It
-  measured **20.30 s** against the wedged mint — sitting on the page's
-  20 s abort, so which sentence the operator gets is a coin flip. It
-  succeeds either way; the wallet appears on the next refresh.
+  measured **32.4 s** against the wedged mint, three times running — past
+  the page's 20 s abort, so the page gives up first. It succeeds anyway;
+  the wallet appears on the next refresh, and the row it returns carries
+  `connected: false`.
 
 So: from curl, every row above is reachable and the instruction to read
 `cause` reads plainly. From the page, a wedged mint gets you this server's
-`cause` on **everything except the four money routes**, and on those you
-get `page.html`'s own "nothing answered" sentence instead — and on
-`Create wallet`, either, depending on which side of 20 s it lands. The
-operator is not misled either way; they are simply told less by the slow
-end.
+`cause` on **everything except the four money routes and `Create
+wallet`**, and on those five you get `page.html`'s own "nothing answered"
+sentence instead. The operator is not misled either way; they are simply
+told less by the slow end.
 
 **This is the fastest-moving table in this document** — it is a
 measurement of three timeout constants that live in three different files,
@@ -1142,10 +1227,50 @@ op_id           this payment's id, the same string in both places, and the
                 key /api/wallet/outstanding returns its strings under
 amount_mc       what was paid out
 recipient       the wallet named in `to`, or "" when there was none
-recipient_kind  "wallet" or "bearer"
+recipient_kind  "wallet", "bearer", or "unknown" when no record was written
 delivery        "delivered", "undelivered" or "unknown"
 delivery_cause  for an undelivered one, the cause, from the closed set
 ```
+
+**Two kinds of non-answer, and they are spelled differently on purpose.**
+`""` on one of these fields is NOT_APPLICABLE — the question does not
+arise, which is what a `receive` row's delivery fields hold. `"unknown"`
+is UNDETERMINED — the question arises and this wallet has no row that
+answers it. They are different rows and they send an operator to different
+places, so `recipient_kind` and `delivery_attempt` each carry both, as
+`delivery` already did. `walletops.py` exports the complete sets
+(`RECIPIENT_KIND_VALUES`, `DELIVERY_ATTEMPT_VALUES`, `DELIVERY_VALUES`,
+each its three-member vocabulary plus `NOT_APPLICABLE`) so "comes from a
+closed set" is checkable rather than asserted.
+
+**A payment that did not commit is the row where those two rules pull in
+opposite directions, and it does not get one answer for all five fields.**
+No money moved, so there is no delivery for an outcome to be about:
+`delivery`, `delivery_cause` and `delivery_attempt` are all `""`,
+NOT_APPLICABLE, and that is the honest reading. But *who it was for* does
+arise — somebody typed a name — and `""` there would say the question did
+not. So `recipient` and `recipient_kind` on a `pay_pending` row are the
+planned recipient, read back from the `walletops_payment_intents` row
+`pay()` writes at the instant it raises. Caused this round, against a real
+mint frozen 15-20 ms into a 60 mc payment (the transcript is in *The
+screen and the record say the same thing* below): the row came back
+
+```
+kind pay_pending, amount_mc 0, cause mint_unreachable,
+recipient "bob", recipient_kind "wallet",
+delivery "", delivery_cause "", delivery_attempt "",
+detail "payment of 60 mc did not commit (…); no value left the wallet
+        — it was meant for bob"
+```
+
+and `sqlite3 w20.payments.db "SELECT * FROM walletops_payment_intents"` on
+that same wallet held
+`('6065448d-…','local-test-mint',60,'bob','wallet')`. Until this round the
+row printed `""` for both name fields while that sqlite row already held
+the name — the wallet knowing the answer and no sentence saying it — and
+the name was then lost for good when Recover turned the op into a
+committed `pay`. A payment with no intent row at all (an older wallet
+file) reads `recipient_kind "unknown"`, UNDETERMINED, not `""`.
 
 The pay response adds `burn_mc`, `change_mc`, `balance_mc` and
 `delivery_detail` — the sentence version of the three record fields, and
@@ -1160,10 +1285,10 @@ than merely honest.
 `unknown` is a value there, not a placeholder, and it renders as unknown.
 A payment is recorded as a combination of THREE machine fields —
 `recipient_kind`, `delivery` and `delivery_attempt` — and it takes all
-three to tell the rows apart. `delivery_attempt` is `"not_attempted"` or
-`"attempted"`, written *before* the delivery is tried, and it is the only
-thing separating a delivery nobody ever made from one that was made and
-lost:
+three to tell the rows apart. `delivery_attempt` is `"not_attempted"`,
+`"attempted"` or `"unknown"`, written *before* the delivery is tried, and
+it is the only thing separating a delivery nobody ever made from one that
+was made and lost:
 
 ```
 recipient_kind  delivery      attempt        what it means, and what put it there
@@ -1204,7 +1329,32 @@ wallet          unknown       attempted      `to` was named, the delivery was
                                              was sent this payment and nothing
                                              answered: ... — whether it was
                                              credited there is undetermined".
+wallet          undelivered   not_attempted  THE RECOVERED PAYMENT. The exchange
+                                             was stranded in flight, Recover
+                                             settled it against the mint's ledger
+                                             and the coins went back into this
+                                             wallet's spendable balance. The
+                                             recipient the request named is on
+                                             the row; nothing was ever handed to
+                                             them. This is the one committed
+                                             payment whose value is inside
+                                             summary()["balance_mc"] and in
+                                             nobody else's hands, and
+                                             /api/wallet/outstanding reports it
+                                             under recovered_mc, not as value
+                                             handed over.
+unknown         unknown       unknown        A payment with no record at all —
+                                             a build that could not write one, or
+                                             a record file deleted. Not "bearer":
+                                             it had a recipient or it did not,
+                                             and nothing here says which.
 ```
+
+Every row above except the last was caused and read back this round
+through `POST /api/wallet/pay` and `GET /api/wallet/history` against a
+real mint. The last one is the shape the vocabulary reserves for a missing
+record; it is not something this build produces on its own and it was not
+caused here.
 
 **An `undelivered` row does not by itself mean the money came back.** The
 cause decides, and `walletops._refused_value_clause()` writes the answer
@@ -1244,7 +1394,36 @@ that does not exist is a 404 with nothing paid. A delivery that fails does
 and `delivery` says what became of them — answering 4xx there would tell
 the operator nothing moved, which is false.
 
-### The screen and the record say the same thing, and here is why that took work
+### The screen and the record say the same thing, with one named exception
+
+**Scope, before the argument:** this is about the *payment* surfaces — the
+pay result panel, the history row, and `GET /api/wallet/outstanding` — and
+across those three it holds, including through Recover, which is what took
+the work. The exception is the **recovery summary sentence** in the
+unredeemed panel, which names the value and the number of payments but not
+the recipient, although the page has fetched it. That is set out in full
+below rather than left for a reader to trip over, and it is the one
+sentence in this product still short of the property this section claims.
+
+**A second thing that sentence used to get wrong is now fixed, and it is
+worth stating because it is the same shape.** The recovery summary ended
+`"It is marked recovered in the History table."` — unconditionally.
+`recovered_ops` is a whole-wallet figure and the History table asks
+`limit=50`, so the two windows are chosen on different rules and the wider
+one does not contain the narrower one. Caused here against a live `app.py`:
+a wallet with **69** rows, the recovered payment `2442f039…` named in
+`recovered_ops`, **no** row for it among the 50 the table rendered, and the
+panel telling the operator to go and read a row that was not on the screen
+— while holding the op id that would have found it. `recoveredClause()` now
+takes the set of op ids the table is actually showing
+(`shownHistoryOps()`), makes the pointer only for the ops in it, and for
+the ones outside it prints the op id instead: *"Its row is NOT in the
+History table below: that table shows the newest 50 operations only… Its op
+id is 2442f039-… — search the wallet's own record on that."* Rows this page
+has not read in the pass are a third answer again, and do not borrow either
+sentence. Pinned by
+`gui/test_app.py::TestTheRecoveryPanelDoesNotPointAtARowThatIsNotThere`,
+which fails four ways against the unconditional version.
 
 This section used to document the opposite, and the history is the point.
 The page paid and delivered in **two** calls — `POST /api/wallet/pay` with
@@ -1282,6 +1461,147 @@ plainly that it did not perform the delivery, prints the wallet's own
 recorded sentence (which carries the credited figure) and notes that the
 recipient's balance in the list is read back from the mint. `"The mint
 rejected it"` remains reachable only from cause `mint_rejected`.
+
+**And the path that broke it hardest: Recover.** A payment whose exchange
+is stranded in flight leaves no committed `pay` row — the op sits
+`planned` and the row reads `pay_pending`. `POST /api/wallet/recover` then
+asks the mint's ledger what really happened and settles the op, and the
+settled row used to be written from the store alone: recipient blank,
+`delivery: unknown`, *"no delivery record was written for this payment, so
+where it went is not known here"*. The recovery panel a few pixels above
+it said *"That payment had in fact gone through at the mint before the
+interruption … its coins can be spent from here"*. Two sentences on one
+screen about one payment, the durable one the weaker, and the recipient
+the operator had typed lost — even though the request had carried it and
+`recover()` had just been told by the ledger that nothing was handed to
+anybody.
+
+Caused and re-measured for this round on the tree being published, with
+nothing stubbed: a real `app.py` over HTTP, a real `run_mint.py` behind
+it, real wallet files. A `POST /api/wallet/pay` of 60 mc with `to: bob`
+was fired at the server and the mint process was `SIGSTOP`ped 20 ms later
+— after the wallet had read the descriptor and written its plan (§5.1
+persist-before-send), before its exchange could be answered.
+
+**How long that call takes, because the number matters if you rerun it.**
+It returned `400 mint_unreachable` after **92.6 s, 92.5 s and 92.5 s** on
+three runs of exactly that procedure. That is *not* the `POST
+/api/wallet/pay` row in the wedged-mint timing table above (36.86 / 36.86 /
+34.82 s): that row starts with the mint **already** frozen, so one 30 s
+`MintClient` deadline is the whole cost, while a payment interrupted
+mid-flight pays that deadline about three times over. An earlier draft of
+this section quoted the 36 s figure here, which is the wrong table for this
+scenario.
+The strand window is small — at 30 ms the exchange has already committed
+and you get a delivered-or-undetermined `pay` row instead, and at 20 ms it
+stranded on every attempt here. Budget a minute and a half, and check the
+`kind` you got rather than assuming.
+
+The strand was caused twice, because two surfaces needed watching: once
+straight at the API (wallet `w20`) and once through `page.html`'s own
+**Pay** button under node against the same live server (wallet `pg1`).
+Same procedure, same figures; the two wallet names below say which run a
+line came from.
+
+**What the row said before Recover**, which is the state a reader reaches
+by interrupting a payment and *not* pressing Recover:
+
+```
+GET /api/wallet/history     kind pay_pending, amount_mc 0, cause
+                            mint_unreachable, recipient "bob",
+                            recipient_kind "wallet", delivery "",
+                            delivery_cause "", delivery_attempt "",
+                            "payment of 60 mc did not commit (...); no
+                            value left the wallet - it was meant for bob"
+sqlite3 pg1.payments.db     walletops_payment_intents holds
+                            ('faeeffac-...','local-test-mint',60,'bob',
+                            'wallet')
+the pay panel #p-out        "...the money may have left pg1, and bob may
+                            be holding it."
+```
+
+The three delivery fields are `""` — NOT_APPLICABLE — because no money
+moved, and the two name fields are the recipient, because somebody typed
+one. Both name `bob`, and so does the sqlite row underneath them. That
+last agreement is new in this round: the row used to print `""` for the
+name while `walletops_payment_intents` already held `'bob'` on disk, which
+is the same defect as the Recover one, one state earlier.
+
+**One honest wrinkle in that, reachable and worth knowing.** The page
+stops waiting at 20 s; the wallet's own call runs to ~92 s. Read the
+history in between — which is what pressing **Refresh** after the timeout
+banner does — and the row is there but not yet filled in: no cause, and
+*"no value left the wallet — no record says who it was meant for"*. That
+is not the wallet withholding a name it has; `pay()` writes the cause and
+the intent row at the instant it raises, and it has not raised yet. The
+row fills in on the next read (measured: the same op came back with
+`cause mint_unreachable`, `recipient "bob"`, `recipient_kind "wallet"`
+once the worker finished). It says *"no record says who it was meant
+for"*, which is true at that moment, rather than guessing.
+
+The mint was then resumed, so the queued exchange really did commit, and
+**Recover** was pressed. What the surfaces then said:
+
+```
+POST /api/wallet/recover    ops_resolved 1, ops_confirmed 1,
+                            outputs_confirmed 6, outputs_orphaned 0,
+                            inputs_restored 0, inputs_lost 0
+the history row             pay, 60 mc, recipient bob, recipient_kind
+                            wallet, delivery undelivered, delivery_attempt
+                            not_attempted, "payment of 60 mc was stranded
+                            in flight, burn 0 mc - nothing was handed over:
+                            it was meant for bob, and its token strings
+                            were never returned to anybody (stranded by
+                            mint_unreachable). recover() settled the
+                            operation against the mint's ledger and the
+                            value was returned to this wallet's spendable
+                            balance; unredeemed_payments() reports this op
+                            as recovered rather than as money somebody else
+                            is holding"
+GET /api/wallet/outstanding handed_over_mc 0, payment_count 0,
+                            recovered_mc 60, and recovered_ops[0] =
+                            {op_id, amount_mc 60, recipient "bob",
+                            recipient_kind "wallet", delivery
+                            "undelivered", delivery_cause "",
+                            delivery_attempt "not_attempted"} - the same
+                            five record fields as the row above
+the recovery panel          "60 mc in 1 payment never left w20 at all - it
+                            was interrupted in flight and Recover settled
+                            it against the mint's ledger, putting the coins
+                            back in the spendable balance. Nobody outside
+                            this wallet was ever handed a string from it,
+                            so that value is not money anyone else can
+                            take, and it is ALREADY INSIDE the balance - do
+                            not add it to anything here. It is marked
+                            recovered in the History table."
+```
+
+**The durable record and the JSON that reports it now say the same thing
+about one payment, and the recovery panel still does not name the
+recipient.** That is a gap in the product, not a claim this file gets to
+make, so it is written down here rather than glossed: `recoveredClause()`
+in `page.html` builds that sentence from `recovered_mc` and the *number*
+of recovered ops, and `summariseUnredeemed()` a few hundred lines above it
+keeps only `op_id` and `amount_mc` out of each `recovered_ops` entry — so
+the recipient the page fetched one call earlier is dropped before the
+sentence is written. Driven against the live server for this round, the
+panel read exactly as quoted above and a `/bob/i` test over the whole
+sentence returned **false**, while the `GET /api/wallet/outstanding`
+response it was built from carried `recipient: "bob"`. `unredeemedOpWords()`
+does read `o.recipient` for handed-over payments, which is what makes the
+omission a gap rather than a policy. Press **Recover** once and you will
+see a history row saying *to bob* under a recovery panel that names
+nobody: the row is the record, and the panel is a summary that is missing
+a field it had.
+
+So: **two surfaces of the three carry the recipient — the durable history
+row and `GET /api/wallet/outstanding` — and they agree field for field.**
+`delivery: undelivered` with `delivery_attempt: not_attempted` is the
+shape reserved for it: something is recorded as not delivered without
+anything being recorded as tried. Note what is *not* claimed — that the
+value came back is stated because the ledger was asked, not because the
+exchange failed; an `undelivered` row means the money came back only when
+the cause says so, which is the next subsection.
 
 Two things worth knowing about the edges:
 
@@ -1357,3 +1677,98 @@ Three kinds, because this component makes three kinds of claim:
 * **The money.** One end-to-end run — real mint, real wallets, real
   components, through this API — asserting that the figure the page shows
   before the click is the figure the mint produces after it.
+
+## What in this file was measured, and what was not
+
+This document has shipped four factual errors in six rounds — bad
+arithmetic in the section about the number people get wrong most, an
+opening claim wider than what shipped, a self-contradiction about file
+permissions, and a promised property (screen and record agreeing) that did
+not hold through Recover. Every one was found by a reader rather than by
+us. That is a fact about this file, not four accidents, so the rule now is
+that a sentence here asserting a property of the product is either
+something somebody caused and watched, or it is not in the file.
+
+**Five more were caught in this round's own draft, before it shipped, and
+they are listed because the pattern is the point.** (1) *"Eight things void
+the pay quote"* enumerated five mint transitions where `mintKey()` has six,
+and contradicted the measurement paragraph directly below it, which
+reported causing six. (2) The Recover transcript said the stranded `POST
+/api/wallet/pay` *"returned `mint_unreachable` after 36 s"*; rerunning the
+stated procedure returns at about 92 s, and 36 s is what a pay costs
+against a mint that was **already** frozen when the call started — a figure
+borrowed from the wrong table. (3) The same transcript reported
+`outputs_confirmed 18`; the scenario as written produces 6. (4) *"One
+payment, three surfaces, one answer, and the recipient is on all of them"*
+was contradicted by the transcript four lines above it: the recovery panel
+names no recipient. (5) The sentence below claiming both suites green named
+a GUI test count that matched no tree. Four of the five are arithmetic or a
+transcribed number, and the fifth is the section's own headline claim
+disagreeing with its own quoted evidence; all five are catchable by reading
+two adjacent paragraphs or by running one command.
+
+**Caused and read back for this round**, against a real `app.py`, a real
+mint and real wallet files, through this HTTP API: the four-step tour and
+every figure in it (990 credited, 18 coins, quote `burn 3 / change 7 /
+inputs 310`, alice 990 → 687, bob 297); the single-1,000-mc-coin example
+(burn 10, 690 change, 297 received, 13 destroyed); the `rate_ppm 10001`
+and `exempt_below_mc 9` refusals, byte for byte, with no process spawned
+and no `mint.log`; the whole authentication and origin section (43-char
+key, `HttpOnly; SameSite=Strict; Path=/`, 401 without the cookie, the key
+refused in an API query string, 403 on `Host`/`Origin`/`Referer`/
+`Sec-Fetch-Site`, and the same three 403s under `--no-auth` with the
+banner on stderr); `--host` refusing a routable address; the
+`ModuleNotFoundError` path under an interpreter without `cryptography`,
+including the `signing.py` line 24 traceback in `mint.log`; every quoted
+error string in *The JSON API*; `[CLAMPED]` against real data (500 history
+rows from 530, 100 outstanding payments, 2,000 log lines from 2,828, and
+`limit=abc` falling back to the default); the stopped-mint 409s and the
+wedged-mint 400/502 split; the `unredeemed_mc: null` measurement,
+re-created from scratch on a fresh 106-payment wallet and matching every
+figure printed above; the reconciliation session and its 10,000 mc
+residual; `gui-state.json` deleted under a running mint; the
+`last_start_ignored_note` reproduction; file modes, including a
+`payments.db` chmodded to 0644 and repaired to 0600 by the next payment;
+that eight GETs changed nothing in the workdir but `mint.log`; six of the
+seven record shapes in the delivery table, each by causing it; both
+cost-sentence rules across six mint transitions (five of the six against
+the shipped server, `mint.unknown` against a fake one — see that bullet);
+and the stranded-payment Recover comparison in full, re-caused from
+scratch for this round: three strands at `SIGSTOP` + 20 ms returning
+`400 mint_unreachable` at 92.6 / 92.5 / 92.5 s, the `pay_pending` row and
+the `walletops_payment_intents` sqlite row under it, the row's unfilled
+intermediate state while the wallet's own call is still running, Recover
+answering `ops_resolved 1 / ops_confirmed 1 / outputs_confirmed 6`, the
+settled history row, the `recovered_ops` entry, and the recovery panel
+read back out of `page.html`'s real JavaScript against that same live
+server — including the `/bob/i` test over the panel that returns false,
+which is why this file no longer claims three surfaces.
+
+**Not caused, and therefore not claimed as measured.** Runs 1 and 2 of the
+timing table are inherited from an earlier round and were not re-taken;
+only run 3 was, and the `POST /api/wallet/create` row changed when it was.
+Why that route once measured 20.30 s is not established. The
+`unknown`/`unknown`/`unknown` record shape was not produced — no build
+here writes it. `responding: false` was caused by freezing a mint, not by
+the other route into it (a live process with no recorded port). The
+`mint.unknown` quote-voiding transition was **not** caused against the
+shipped server and cannot be: it is what the page does when `GET
+/api/mint/status` fails, and a live `app.py` answers that route, so it was
+driven with the node harness against a deliberately failing fake server.
+Treat it as a claim about `page.html`'s logic rather than about a session
+you can reproduce with `run_mint.py`. The
+reconciliation panel's different-mint bucket and its
+disagreeing-snapshot warning were not reached. The gates
+on `../mint_console.py`, the page's own stale-quote and all-rejected-paste
+rules, and Stop/Start preserving the burn policy are covered by
+`gui/test_console_auth.py` and `gui/test_app.py` rather than by a session
+driven by hand for this file; both suites were run green on the tree these
+sentences describe — `cd impl && python3 -m unittest discover -s tests -t .`
+gave **394 tests, OK**, and `python3 -m unittest discover -s gui -t .` from
+the repo root gave **521 tests, OK**, no failures and no skips, the GUI run
+taking about five and a half minutes. (515 before this round; the six new
+ones are
+`TestTheRecoveryPanelDoesNotPointAtARowThatIsNotThere`, above.) A test count is the one figure in this file that
+a later commit invalidates without making anything else here wrong, so run
+the command rather than trusting the number: an earlier draft of this
+sentence said 506, which matched neither this tree nor its parent.
