@@ -1,64 +1,199 @@
 # aicash operator GUI
 
 A local web page for running one aicash mint and moving money between
-wallets on your own machine. It exists so that seeing aicash work does not
-require a terminal, a second terminal, or reading the spec.
+wallets on your own machine. Starting it is one terminal command, below.
+Everything after that — start a mint, create wallets, create money, pay
+from one wallet to another, watch what the burn destroys — happens on the
+page: no second terminal, no curl, and no reading the spec.
 
 ## Start it
 
+From this tree, at the repo root:
+
 ```
-cd aicash/gui
-python3 app.py
+python3 -m venv .venv && . .venv/bin/activate
+pip install cryptography
+python3 gui/app.py
 ```
 
-It prints a URL. Open it in a browser:
+If `cryptography` is already importable in the interpreter you are about
+to use, it is just the last line.
+
+### From a fresh clone: not yet, and here is the exact reason
+
+**Cloning from GitHub today does not get you this directory.** The
+published `jelloshooter848/ai-cash` HEAD is `c23b44c`; the commit that
+adds `gui/` is local and unpushed. So this —
+
+```
+git clone https://github.com/jelloshooter848/ai-cash.git   # no gui/ in it today
+cd ai-cash
+python3 gui/app.py
+```
+
+— ends in `python3: can't open file '.../ai-cash/gui/app.py': [Errno 2]
+No such file or directory`. `git ls-tree --name-only c23b44c` is the whole
+of what a clone gets today — `BOOTSTRAP.md`, `impl/`, `components/`,
+`examples/`, `run_mint.py`, `wallet_cli.py`, `mint_console.py` and the spec
+and design documents — with no `gui/` anywhere in it. Check it yourself
+before trusting any clone recipe:
+
+```
+git ls-remote https://github.com/jelloshooter848/ai-cash.git   # what is published
+git log --oneline --diff-filter=A -- gui/app.py                # when gui/ was added
+git branch -r --contains $(git log -1 --format=%H -- gui/app.py)   # empty = unpushed
+```
+
+Until that third command names a remote branch, get this tree from the
+machine it was built on rather than from a clone. Once `gui/` is pushed,
+the fresh-clone recipe is the block at the top of this section with
+`git clone https://github.com/jelloshooter848/ai-cash.git && cd ai-cash`
+in front of it, and nothing else about it changes.
+
+### Where it runs from, and what it needs
+
+`python3 gui/app.py` works from any directory — the workdir it uses by
+default is `gui/var` beside `app.py`, not something under the directory
+you happened to be in.
+
+`cryptography` is the only dependency: the mint signs its descriptor with
+an Ed25519 key. Everything else is Python 3.12 and the standard library.
+Nothing is downloaded at runtime, there is no build step, and the page
+loads no script from anywhere but this server.
+
+Options: `--port` (default 8799), `--workdir` (default `gui/var`),
+`--host` (must be a loopback address — see below), `--no-auth` (tests
+only — see below).
+
+### The URL it prints is the password
 
 ```
   aicash operator GUI
   workdir   .../aicash/gui/var
   wallets   .../aicash/gui/var/wallets
 
-  OPEN      http://127.0.0.1:8799/   <- open this in a browser
+  OPEN      http://127.0.0.1:8799/?k=<43 random characters, new every start>   <- open this in a browser
 ```
 
-Python 3.12 and the standard library, plus the `cryptography` package the
-mint itself uses for its Ed25519 signing key. Nothing is downloaded, there
-is no build step, and the page loads no script from anywhere but this
-server.
+Open **that whole line**, `?k=` and all. The key is 32 random bytes
+generated fresh on every start and kept only in memory: it is not written
+to a file, a log line or any response body, so this terminal is the only
+place it exists. Opening the URL once trades it for a session cookie and
+every button on the page then works; a `/` without the right key, and
+every `/api/*` request without the cookie, is a 401. Lost the URL? There
+is no recovery and none is wanted: Ctrl-C and start again for a new key.
 
-Options: `--port` (default 8799), `--workdir` (default `gui/var`),
-`--host` (must be a loopback address — see below).
+### If pressing Start mint says `ModuleNotFoundError`
+
+Without `cryptography` installed, `python3 gui/app.py` still starts and
+the page still opens — the GUI itself is pure stdlib. The failure lands
+on the first press of **Start mint**, in red under the button:
+
+```
+the mint crashed while it was starting up.
+ModuleNotFoundError: No module named 'cryptography'
+```
+
+and `gui/var/mint.log` ends with the traceback it came from:
+
+```
+  File ".../impl/aicash/signing.py", line 24, in <module>
+    from cryptography.exceptions import InvalidSignature
+ModuleNotFoundError: No module named 'cryptography'
+```
+
+The fix is `pip install cryptography` **into the interpreter that is
+running `app.py`** (the mint is launched with that same interpreter, so a
+system-wide install while the GUI runs inside a venv does nothing). You do
+not have to restart the GUI: install it, press **Start mint** again.
 
 ## What to do once it is open
 
-The page is one screen with three numbered sections, all visible at once.
+The page is one screen with three numbered sections, all visible at once
+— mint, wallets, send & receive. The tour is four steps.
 
-1. **Mint.** Press **Start mint**. The defaults — mint id `local-test-mint`,
-   baseline `baseline-v1`, port 8787, no burn — are fine. The button comes
-   back when the mint is actually answering, not when the process was
-   launched. Underneath are the mint's descriptor, its log tail, and the
-   **operator funding** control that creates money.
+1. **Mint.** Press **Start mint**. Change nothing: the defaults are mint id
+   `local-test-mint`, baseline `baseline-v1`, port 8787, and a burn policy
+   that is **already switched on** — `rate_ppm 10000`, `cap_mc 1000`,
+   `exempt_below_mc 10`, which is 1% capped at 1,000 mc with exchanges of
+   10 mc and under exempt. The page says the same thing under **Mint
+   settings**: "These start at a demo value, not at zero." That is the
+   policy every figure below was measured under, so leaving it alone is
+   what makes the rest of this tour match. If you ever want a mint where a
+   payment moves its whole amount, set the rate and the cap to 0 — but not
+   `exempt_below_mc`, which the mint refuses below 10. The button comes
+   back when the mint is actually answering, not when the
+   process was launched. Underneath are the mint's descriptor, its log
+   tail, and the **operator funding** control that creates money.
 2. **Wallets.** Create two, say `alice` and `bob`. Click one to make it the
    *active* wallet: the one that pays and receives in section 3.
-3. **Send & receive.** With `alice` active, put money in her (section 1's
-   funding control, "into wallet: alice"), then pay `bob`: type an amount,
-   choose `wallet: bob`, read the cost line, press Pay. Both balances move.
+3. **Fund alice.** In section 1's funding control, amount `1000`, count
+   `1`, into wallet `alice`. Two things happen on that one click, and only
+   the first is on the button: the mint **creates** 1,000 mc that did not
+   exist, and then alice **redeems** it, which is an exchange like any
+   other and is therefore burned. Under a 1% policy alice ends up with
+   **990 mc**, not 1,000. The result line afterwards says exactly that —
+   created, burned, credited — but the warning beside the button mentions
+   only the creation, so know the second half before you press it.
+4. **Pay bob.** With `alice` active, type `300`, choose `wallet: bob`, read
+   the cost line, press Pay. Both balances move: alice 990 → 687, bob 297.
+   Where the missing 6 mc went is the next section.
 
 The whole demo is about a minute.
 
 ## The burn is charged twice, and the page says so
 
-This is the one number it is easy to get wrong, so it is worth stating
-plainly. A §7.3 burn is assessed **once per `/v3/exchange` call**, and a
-payment between two wallets is *two* calls:
+This is the one number it is easy to get wrong, so here is a walkthrough
+that was run rather than reasoned about. A §7.3 burn is assessed **once
+per `/v3/exchange` call**, on the **sum of that call's inputs** — not on
+the amount you typed. A payment between two wallets is *two* calls:
 
 * the paying wallet splits its coins into the tokens it hands over — burn
-  one, on the sum of the inputs it spent;
-* the receiving wallet redeems those tokens — burn two, on their sum.
+  one, on the sum of the coins it had to spend to cover the payment;
+* the receiving wallet redeems those tokens — burn two, on their face sum.
 
-So with a 1% policy capped at 1,000 mc, paying 300 mc takes **303 mc** out
-of the payer and leaves the recipient with **297 mc**: 6 mc destroyed, not
-3. The cost line under the amount box shows both halves before you commit,
+Run the four steps above against a mint on the default policy — 1% capped
+at 1,000 mc, exempt below 10 mc — and this is what the mint does:
+
+```
+issue 1,000 mc, credit alice   1,000 created, 990 credited, 10 burned
+alice now holds                9 x 100 + 9 x 10 = 990 mc in 18 coins
+pay 300 to bob
+  coins spent (inputs)         100 + 100 + 100 + 10 = 310 mc
+  burn one                     3 mc      (1% of 310 = 3.1, rounded down)
+  paid out                     300 mc    (3 tokens)
+  change back to alice         7 mc      (7 x 1 mc coins)
+  alice                        990 -> 687   (303 mc left the wallet)
+bob redeems the 3 tokens
+  burn two                     3 mc      (1% of 300)
+  bob credited                 297 mc
+```
+
+So the payment destroyed **6 mc** — 3 on the split, 3 on the redeem — and
+of the 1,000 mc that was created, **16 mc is gone** once you count the
+10 mc burned to get it into a wallet in the first place. One payment,
+three different numbers — 300 asked for, 303 out of the payer, 297 into
+the recipient — and none of them is the one you typed twice. That is why
+the page quotes it for you instead of leaving you to multiply by 1%.
+
+The coins matter, and this is the part that is easy to lose. Alice spent
+310 mc of inputs to pay 300, because the smallest set of her coins that
+covers 300 plus the burn is three 100s and a 10. The burn was computed on
+that 310, not on 300 or on 303. With her coins it came to the same 3 mc —
+1% of 310 floors to 3 — but that is a coincidence of this ladder, not a
+rule. Change the coins and the arithmetic changes with them: a wallet
+holding a single 1,000 mc coin (which is what you get if you set `rate_ppm`
+to 0 before starting the mint, fund the wallet, then Stop mint, put the rate
+back and Start again — the policy is only read at startup) has nothing
+smaller to
+spend, so paying 300 mc spends the **whole 1,000 mc coin** — burn 10 mc,
+690 mc back as change, and the recipient still nets 297. That payment
+destroys 13 mc instead of 6, for the same 300 mc paid.
+
+Do not read a percentage off the amount. Read the cost line: it is quoted
+from the coins the wallet will really spend.
+
+The cost line under the amount box shows both halves before you commit,
 and the Pay button names what the recipient will actually end up with. The
 page computes the second half from the mint's own published `burn_policy`
 (and from `burn_policy_next` when it has taken effect, per the mint's
@@ -66,9 +201,12 @@ clock, never the browser's); if it cannot read the policy it says the
 recipient will get less rather than quoting a figure it cannot stand
 behind.
 
-Operator funding is the same story: issuing 1,000 mc into a wallet credits
-it 990 mc under a 1% policy, and the page reports what was created, what
-was burned and what was credited.
+Operator funding is the same story in one call instead of two: issuing
+1,000 mc into a wallet credits it 990 mc under a 1% policy, and the page
+reports what was created, what was burned and what was credited — but in
+the result line, after the click. The warning by the **Issue into wallet**
+button covers the creation ("cannot be undone") and not the burn, so the
+cost of funding is disclosed a moment later than the cost of paying is.
 
 ## Things the page is deliberate about
 
@@ -101,29 +239,46 @@ was burned and what was credited.
 
 ## Security: read this before you move it anywhere
 
-**This is a local operator tool, not a hosted service.** It has no login, no
-accounts, and no authorisation of any kind.
+**This is a local operator tool, not a hosted service.** It has a lock on
+it now — the URL it prints, exchanged for a session cookie — and that lock
+changes nothing about where it should be listening. Loopback is a weaker
+boundary than it sounds: it does not separate users on a shared machine,
+it does not stop another local process, and it does not stop a web page
+open in your own browser from firing requests at `127.0.0.1`. The cookie
+is a second lock on a door that should still not face the street.
 
-- It binds a **loopback address only**. `--host` with anything routable is
-  refused with an explanation, and a request whose `Host` header is not
-  `127.0.0.1`, `localhost` or `::1` is rejected, so a web page somewhere
-  else cannot point a hostname at your machine and drive it from your
-  browser.
-- It answers **its own page only**. A request a browser marks as coming
-  from another site — `Sec-Fetch-Site` other than `same-origin`/`none`, or
-  an `Origin` that is not this exact server — is refused with 403, whatever
-  its `Host` header says. Without that, any page in any other tab could
-  POST straight to `127.0.0.1` with a simple content type, needing neither
-  DNS rebinding nor CORS permission, and mint, drain or stop. A request
-  with neither header (curl, a script, the examples below) is not a browser
-  request and is allowed.
-- **Anyone who can reach this port can mint money and can spend every
-  wallet in the workdir.** There is nothing to log in to. Treat the port
-  exactly as you would treat the wallet files themselves.
+- **Every route needs the session cookie.** A `GET /` with the right `?k=`
+  is the one place the cookie is handed out (`HttpOnly; SameSite=Strict;
+  Path=/`); `/` with a wrong or missing key is a 401 HTML page telling you
+  to use the URL from the terminal. Every `/api/*` route — the read-only
+  ones too — is a 401 JSON `{"error":{"reason":"unauthorized", ...}}`
+  without that cookie, and the key is **not** accepted in an API query
+  string: the key opens the page, the cookie drives it.
+- It binds a **loopback address only**, and separately it checks the
+  `Host` header is a loopback literal — `127.0.0.1`, `::1`, `[::1]` or
+  `localhost`, with an optional port. Anything else is 403. That check is
+  the DNS-rebinding defence, and it is the reason binding to loopback is
+  not enough on its own: a hostile page can make your browser resolve its
+  own domain to `127.0.0.1`, and only the `Host` check catches it.
+- It answers **its own page only**. `Origin` and `Referer`, when present,
+  must be exactly this server, and `Sec-Fetch-Site` must be
+  `same-origin`/`none`; a mismatch is 403 whatever the `Host` header says.
+  Absent is allowed, because a same-origin fetch and curl both omit them.
+  With `SameSite=Strict` on the cookie, this is the cross-site defence.
+- `--no-auth` turns all of that off and exists **for automated tests
+  only**. It prints a loud multi-line warning to stderr on every start
+  (`THIS GUI IS SERVING WITH NO PASSWORD`) and it is not a way to recover a
+  lost URL — stop the GUI and start it again instead. Running with no flags
+  at all is authenticated; you have to ask for the open door.
+- **Anyone who gets the cookie, or the URL, can mint money and spend every
+  wallet in the workdir.** Treat that URL exactly as you would treat the
+  wallet files themselves, and do not paste it anywhere.
 - The mint's `/admin/issue` credential is read from
   `var/mint-admin-keys.json` on the server side, attached to the mint
   request there, and scrubbed out of anything that leaves this process. It
   is not in `page.html`, not in an API response, and not in a log line.
+  Neither is the GUI's own key: it lives in memory and is printed to the
+  terminal once.
 - Each wallet is one sqlite file under `var/wallets/`, mode 0600, and it
   holds that wallet's secrets. **Whoever has the file has the money.** There
   is no backup and no recovery phrase.
@@ -134,11 +289,14 @@ accounts, and no authorisation of any kind.
 ## What lives where
 
 ```
-gui/app.py        this server: the page, the JSON API, the loopback rules
+gui/app.py        this server: the page, the JSON API, the key/cookie and
+                  loopback rules
 gui/page.html     the entire interface, one self-contained file
 gui/mintctl.py    starts, supervises and stops run_mint.py as a subprocess
 gui/walletops.py  a thin wrapper over aicash.wallet.Wallet
-gui/test_app.py   tests for app.py and page.html (see below)
+gui/test_app.py       tests for app.py and page.html (see below)
+gui/test_mintctl.py   tests for the supervisor
+gui/test_walletops.py tests for the wallet wrapper
 gui/var/          workdir: mint.db, mint-keys.json, mint-admin-keys.json,
                   mint-token-digests.json, mint-control.json, mint.log,
                   gui-state.json, wallets/<name>.db
@@ -165,7 +323,20 @@ looks like it needs the spec to change, that is a bug in here.
 
 ## The JSON API
 
-The page uses it; you can too, from the same machine.
+The page uses it; you can too, from the same machine — with the session
+cookie, which curl gets the same way the browser does, by opening `/` with
+the key from the terminal:
+
+```
+K=<the k= value app.py printed>
+C=$(curl -s -D - -o /dev/null "http://127.0.0.1:8799/?k=$K" \
+    | sed -n 's/^[Ss]et-[Cc]ookie: \([^;]*\).*/\1/p')
+curl -s -H "Cookie: $C" http://127.0.0.1:8799/api/mint/status
+```
+
+Without that cookie every route below is a 401, and the key alone in the
+query string will not do it. (`--no-auth` skips all of this and is for
+automated tests, not for saving three lines of shell.)
 
 ```
 GET  /api/mint/status                       POST /api/wallet/create  {name}
@@ -191,6 +362,17 @@ Amounts are **whole millicredits**. `12.7` is refused, not rounded down.
 `last_start`, the settings this GUI last started a mint with (or `null`).
 The page uses it to refill the form; it is a convenience, not protocol.
 
+`GET /api/wallet/history` returns rows whose `ts_ms` is always `0`, and
+`0` there means **unknown**, not 1 January 1970: the wallet's sqlite has no
+clock column, so there is no time to report and none is invented. Rows are
+newest-first by insertion order. In Python, `walletops.history()` returns
+that field as the exported `TS_UNKNOWN` sentinel, which is the integer `0`
+but prints as `unknown`; across the JSON boundary it is a plain `0`, so a
+consumer of this API has to carry the disclosure itself. The page does:
+each such When cell reads the words *not recorded*, and one note above the
+table says how many cells that is and that this wallet's database stores no
+time for them.
+
 `POST /api/mint/issue` returns token strings and credits nothing on its own
 — the page then calls `/api/wallet/receive` to put them in the chosen
 wallet. That is two steps on purpose: if the crediting step fails, the
@@ -200,7 +382,8 @@ transaction.
 ## Tests
 
 ```
-cd aicash && python3 -m unittest gui.test_app -v
+cd aicash && python3 -m unittest gui.test_app -v          # this component
+cd aicash && python3 -m unittest discover -s gui -t .     # all of gui/
 ```
 
 Three kinds, because this component makes three kinds of claim:

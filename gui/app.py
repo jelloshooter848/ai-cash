@@ -16,12 +16,26 @@ behaviour. The pieces it does own are the ones a browser forces on you:
     the workdir, used as an ``X-Admin-Token`` header on the server side,
     and scrubbed out of every response body and log line on the way out.
     It is never in page.html and never in a JSON response.
+  * A CAPABILITY URL, THEN A COOKIE. Loopback is a weaker boundary than
+    it sounds: it does not separate two users of one machine, it does not
+    stop any other local process, and it does not stop a web page in the
+    operator's own browser from issuing requests to 127.0.0.1. So this
+    server also authenticates. At startup it mints a key that exists only
+    in memory and prints it once, in the URL on the terminal. That URL
+    opens the page and nothing else; the page is handed an HttpOnly,
+    SameSite=Strict session cookie, and from then on the cookie is the
+    only credential any /api/ route accepts. The key is never written to a
+    file, never logged, and never in a response body.
   * LOOPBACK ONLY, AND SAME-ORIGIN ONLY. The listener refuses any
     non-loopback bind address, and refuses a request whose Host header is
-    not a loopback name, so a page on the internet cannot rebind DNS and
+    not a loopback literal, so a page on the internet cannot rebind DNS and
     drive your mint. It also refuses any request a browser marks as coming
-    from another site (Sec-Fetch-Site / Origin), because a cross-site POST
-    to 127.0.0.1 needs no rebinding and no CORS permission to fire.
+    from another site (Sec-Fetch-Site / Origin / Referer), because a
+    cross-site POST to 127.0.0.1 needs no rebinding and no CORS permission
+    to fire.
+  * NONE OF THAT MAKES THIS SAFE TO EXPOSE. The cookie is a second lock on
+    a door that should still not face the street. It is not a reason to
+    relax the loopback bind, and there is no flag that relaxes it.
   * NO TRACEBACK EVER REACHES THE PAGE. Every route returns JSON; failures
     return ``{"error": {"reason", "detail"}}`` with a detail a non-expert
     can act on.
@@ -38,10 +52,12 @@ import argparse
 import base64
 import contextlib
 import errno
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -75,6 +91,13 @@ WALLET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 MINT_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 
 
+SESSION_COOKIE = "aicash_gui_session"
+# One browser is one session. A handful covers a second tab, a reopened
+# window and a re-exchange after a restart; the oldest is dropped rather
+# than letting a long-running process accumulate credentials forever.
+MAX_SESSIONS = 32
+
+
 class GuiError(Exception):
     """An error with an HTTP status, a machine reason and a human detail."""
 
@@ -83,6 +106,133 @@ class GuiError(Exception):
         self.status = status
         self.reason = reason
         self.detail = detail
+
+
+def _cookie_values(header, name: str) -> list:
+    """Every value sent for ``name`` in one Cookie header.
+
+    Every, not the first: a hostile page that cannot read our cookie can
+    still try to *shadow* it by setting a second one with the same name
+    from a sibling origin, and whether the browser sends theirs first is
+    not something to depend on. Checking all of them means an extra cookie
+    cannot displace the real one.
+    """
+    out = []
+    for part in (header or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key.strip() == name:
+            out.append(value.strip().strip('"'))
+    return out
+
+
+def _secret_eq(known, presented) -> bool:
+    """Constant-time compare of two secrets that cannot be made to raise.
+
+    hmac.compare_digest, never ``==``: an ordinary string comparison
+    returns early on the first wrong byte, so a nearly-right guess answers
+    measurably slower than a wrong one and the secret can be walked out one
+    character at a time.
+
+    It is called on BYTES, not on str, and that is the whole reason this
+    wrapper exists rather than a bare compare_digest at each site.
+    compare_digest raises TypeError on a str holding any non-ASCII
+    character, and every value reaching here is attacker-supplied: the
+    ``?k=`` of an unauthenticated GET, or a Cookie header. ``GET
+    /?k=%C3%A9`` used to raise inside _authorize, which fell through to the
+    handler's catch-all and answered 500 with a traceback on stderr -- a
+    crash in the gate, on an unauthenticated request, that any local
+    process could produce at will. Encoding first makes the comparison
+    total: every input is either equal, unequal, or malformed, and the last
+    two both answer False.
+
+    surrogatepass, so a lone surrogate smuggled through the URL decoder
+    encodes to bytes and compares unequal instead of raising on the way in.
+
+    Length still leaks, exactly as it does for compare_digest on bytes. The
+    secrets compared here are fixed-length, so there is nothing in that to
+    learn.
+
+    This is the only hmac.compare_digest call site in this module, which is
+    what makes "secrets are compared in constant time" a property of one
+    function a test can pin rather than a habit every future caller has to
+    remember.
+    """
+    if not isinstance(known, str) or not isinstance(presented, str):
+        return False
+    if not known or not presented:
+        return False
+    try:
+        return hmac.compare_digest(known.encode("utf-8", "surrogatepass"),
+                                   presented.encode("utf-8", "surrogatepass"))
+    except (UnicodeError, TypeError, ValueError):
+        return False
+
+
+class _Auth:
+    """The capability key, the sessions exchanged for it, and nothing else.
+
+    Both values are generated here, live only in this process's memory, and
+    leave it in exactly two places: the key in the URL printed once on the
+    terminal, a session in one Set-Cookie header. They are never written to
+    the workdir, never logged (Handler.log_message is silent), and scrubbed
+    out of every response body on the way past Handler._redact.
+
+    ``enabled=False`` is --no-auth: for automated tests, never for a
+    machine anyone cares about.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = bool(enabled)
+        # token_urlsafe(32) is 32 bytes of os.urandom, ~43 characters. Not
+        # guessable at any rate an attacker can drive a local socket at.
+        self.key = secrets.token_urlsafe(32) if self.enabled else ""
+        self._sessions = []
+        self._lock = threading.Lock()
+
+    def new_session(self) -> str:
+        """A session value independent of the key.
+
+        Independent on purpose: holding one must prove nothing about the
+        other, so a session that leaks (a screenshot of devtools, a copied
+        curl command) cannot be walked back to the key, and vice versa.
+        """
+        session = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions.append(session)
+            del self._sessions[:-MAX_SESSIONS]
+        return session
+
+    def sessions(self) -> list:
+        with self._lock:
+            return list(self._sessions)
+
+    def key_ok(self, presented) -> bool:
+        # _secret_eq, not compare_digest directly: `presented` is whatever
+        # was in the query string, including non-ASCII, and a bare
+        # compare_digest on str raises TypeError on it. See _secret_eq.
+        if not self.enabled:
+            return True
+        return _secret_eq(self.key, presented)
+
+    def session_ok(self, cookie_header) -> bool:
+        if not self.enabled:
+            return True
+        found = False
+        for value in _cookie_values(cookie_header, SESSION_COOKIE):
+            for session in self.sessions():
+                # _secret_eq, and no early return: a plain `==` on a secret,
+                # or a break on the first match, both answer faster for a
+                # nearly right guess than for a wrong one. _secret_eq also
+                # absorbs a non-ASCII cookie, which compare_digest on str
+                # would raise on -- inside the gate, before any route.
+                if _secret_eq(session, value):
+                    found = True
+        return found
+
+    def secrets_in(self, text: str) -> list:
+        """Whichever of our credentials appear in ``text``. See _redact."""
+        candidates = ([self.key] if self.key else []) + self.sessions()
+        return [value for value in candidates if value and value in text]
 
 
 # ----------------------------------------------------------------------
@@ -811,12 +961,51 @@ ROUTES = {
     ("GET", "/api/token/status"): "route_token_status",
 }
 
-_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_ALLOWED_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# The WHOLE Host header, not a prefix of it: 127.0.0.1, localhost, [::1] or
+# ::1, then either nothing or a colon and a decimal port. There is no set of
+# allowed names beside this pattern, because a set plus a hand-rolled
+# splitter is how the accepted host space widens by accident: the pattern is
+# the whitelist, and it is anchored at both ends because the obvious
+# hand-rolled version -- split on the last colon, or cut at the "]" --
+# validates the part before the separator and accepts whatever follows it,
+# so "127.0.0.1:8799.evil.example", "localhost:not-a-port" and
+# "[::1]evil.example" all sail through a check that looks right. An
+# "optional :port" that accepts arbitrary text is not an optional port; it
+# is an optional anything.
+#
+# Bare "::1" carries no port: an unbracketed IPv6 address followed by
+# ":<port>" is not something HTTP can express, so "::1:8799" is not a
+# loopback host with a port and is refused.
+_HOST_RE = re.compile(
+    r"^(?:(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?|::1)$")
+
+# Deliberately says nothing an attacker could use: no key, no session, no
+# port list, no hint about what the routes are. Just where the operator's
+# own URL came from.
+LOCKED_PAGE = """<!doctype html><meta charset=utf-8>
+<title>aicash operator - locked</title>
+<body style="font:15px/1.5 system-ui;padding:40px;max-width:44em">
+<h1>This page needs the URL from your terminal</h1>
+<p>The aicash operator GUI prints one address when it starts, with a key
+in it, like <code>http://127.0.0.1:8799/?k=&hellip;</code>. That address is
+the password: open it, and this browser is let in for as long as the GUI
+keeps running.</p>
+<p>Look in the terminal window where you ran <code>app.py</code>. If you
+have lost it, stop the GUI and start it again; the key is generated fresh
+each time and is never written down anywhere.</p>
+</body>
+"""
 
 
 class Handler(BaseHTTPRequestHandler):
     api: Api = None            # set by serve()
+    auth: _Auth = None         # set by serve(); None fails every request shut
     page_path: str = ""
+    # One request's pending Set-Cookie. Set in exactly one place
+    # (_authorize, on a good key) and emitted by _send. A class-level
+    # default matters: send_error() can answer before _handle() runs.
+    _set_cookie = None
     server_version = "aicash-gui"
     sys_version = ""
     # A deadline on one connection. Without it, a client that announces
@@ -849,6 +1038,18 @@ class Handler(BaseHTTPRequestHandler):
             token = None
         if token and len(token) >= 8 and token in text:
             text = text.replace(token, "[admin token redacted]")
+        # The capability key and the session belong in exactly two places:
+        # the URL on the terminal and one Set-Cookie header. Nothing here
+        # serialises either -- but a route that echoed its own query string,
+        # or a component quoting a command line, would, and either would
+        # hand the whole GUI to a page that can only read a response body.
+        # Strip them on the way out rather than trust that none ever will.
+        try:
+            leaked = self.auth.secrets_in(text) if self.auth else []
+        except Exception:
+            leaked = []
+        for value in leaked:
+            text = text.replace(value, "[credential redacted]")
         return text
 
     def _send(self, code: int, payload: bytes, ctype: str):
@@ -857,6 +1058,8 @@ class Handler(BaseHTTPRequestHandler):
         if code != 204:  # a 204 has no body by definition
             self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if self._set_cookie:
+            self.send_header("Set-Cookie", self._set_cookie)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -888,20 +1091,29 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"error": {"reason": reason, "detail": detail}})
 
     def _host_ok(self) -> bool:
-        """Refuse a Host header that is not loopback.
+        """Refuse a Host header that is not a loopback LITERAL.
 
-        Without this, a page on the public internet can point a hostname at
-        127.0.0.1 (DNS rebinding) and drive this API from the victim's own
-        browser, which would let it mint and spend every wallet here.
+        This is the DNS-rebinding defence, and it is the reason binding to
+        127.0.0.1 is not sufficient on its own. A page on the public
+        internet can point its own hostname at 127.0.0.1 and then drive
+        this API from the victim's browser: the packets are loopback
+        packets, the bind address stops nothing, and the only thing the
+        attacker cannot change is that the browser puts *their* hostname in
+        the Host header. So the name is checked, not the address, and only
+        the four literals a person can actually type are accepted -- no
+        resolution, because "does this name resolve to 127.0.0.1" is the
+        question the attacker gets to answer.
+
+        A missing Host is refused too. No browser omits it, so allowing it
+        bought nothing and left a hole in the outer defence.
+
+        The whole header has to match, port included. Validating the name
+        and shrugging at the rest is the classic way to get this wrong:
+        "127.0.0.1:8799.evil.example" has a loopback literal in front of it
+        and is not a loopback host.
         """
-        host = (self.headers.get("Host") or "").strip()
-        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-        if host.startswith("["):
-            name = host.split("]")[0] + "]"
-        # A missing Host used to pass. No browser omits it, so allowing it
-        # bought nothing and left a hole in the control the README presents
-        # as the outer defence.
-        return name in _ALLOWED_HOSTNAMES
+        host = (self.headers.get("Host") or "").strip().lower()
+        return _HOST_RE.match(host) is not None
 
     def _origin_ok(self) -> bool:
         """Refuse a request that another site told the browser to make.
@@ -922,26 +1134,43 @@ class Handler(BaseHTTPRequestHandler):
             another page driving us.
           * ``Origin``: when present it must be exactly this server.
 
-        A request carrying neither is not a browser request — curl, a
+          * ``Referer``: same rule. A browser that suppressed Origin may
+            still send this, and a page that sends a forged one is not a
+            browser.
+
+        A request carrying none of them is not a browser request — curl, a
         script, the examples in the README — and is allowed, because those
         cannot be conscripted by a web page in the first place.
         """
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if site and site not in ("same-origin", "none"):
             return False
-        origin = (self.headers.get("Origin") or "").strip()
-        if not origin:
-            return True
-        if origin.lower() == "null":  # sandboxed iframe, file://, data:
+        for header in ("Origin", "Referer"):
+            value = (self.headers.get(header) or "").strip()
+            if not value:
+                continue          # absent is allowed; present must be us
+            if not self._same_origin(value):
+                return False
+        return True
+
+    def _same_origin(self, value: str) -> bool:
+        """Is this Origin (or Referer URL) exactly this server?
+
+        Scheme, host and port all have to match. "Starts with
+        http://127.0.0.1" is not a check: http://127.0.0.1.evil.example
+        starts with it too, and so does another local port belonging to
+        some other program the operator is running.
+        """
+        if value.lower() == "null":   # sandboxed iframe, file://, data:
             return False
         try:
-            parsed = urllib.parse.urlsplit(origin)
+            parsed = urllib.parse.urlsplit(value)
             port = parsed.port
         except ValueError:
             return False
         if parsed.scheme != "http":
             return False
-        if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        if (parsed.hostname or "").lower() not in _ALLOWED_ORIGIN_HOSTS:
             return False
         try:
             mine = self.server.server_address[1]
@@ -949,15 +1178,53 @@ class Handler(BaseHTTPRequestHandler):
             mine = None
         return port is not None and mine is not None and port == mine
 
-    def _guard(self) -> bool:
-        """Both origin controls, before anything else looks at the request."""
+    # -- THE ACCESS POLICY, all of it, in one place ---------------------
+    def _authorize(self, method: str, path: str, query: dict) -> bool:
+        """The only gate. Every request passes through here, before
+        dispatch, before the body is read, before any route name is even
+        looked up. A route added to ROUTES tomorrow inherits all of it
+        without its author doing anything, because dispatch happens after
+        this function returns True.
+
+          1. HOST is a loopback literal, or 403. DNS rebinding; see
+             _host_ok. This is the check most likely to be written wrong,
+             and the one that stops an attack the bind address does not.
+          2. ORIGIN and REFERER, when present, are this server, or 403.
+             Absent is fine: a same-origin fetch and curl both omit them.
+             Together with SameSite=Strict on the cookie, this is what
+             stops a page in another tab from POSTing here.
+          3. GET / is the ONE route the capability key opens. A correct
+             ?k= is exchanged for an HttpOnly, SameSite=Strict session
+             cookie, once, and the key is never needed again. A wrong or
+             missing key, with no valid cookie, is 401 and NO Set-Cookie.
+          4. EVERYTHING ELSE requires that cookie and accepts nothing
+             else. GET as much as POST: /api/wallet/list names every
+             wallet, /api/mint/logs is the mint's log. ?k= is deliberately
+             NOT accepted here -- a URL ends up in history files, proxy
+             logs, Referer headers and shoulder-surfing range, which is
+             exactly why it is spent once on a cookie and then retired.
+
+        None of this makes the GUI safe to expose. It is a second lock on
+        a door that should still not face the street: it does not turn the
+        loopback bind into an optional extra, and nothing here should ever
+        be read as permission to relax it.
+        """
+        if self.auth is None:
+            # serve() always installs one. Fail closed if something built a
+            # Handler subclass without it, rather than serve money openly.
+            self.close_connection = True
+            self._error(500, "misconfigured",
+                        "This server was started without an access policy "
+                        "and will not answer anything.")
+            return False
         if not self._host_ok():
             self.close_connection = True
             self._error(
-                421, "not_loopback",
-                "This GUI only answers requests addressed to 127.0.0.1 or "
-                "localhost. It is a local operator tool, not a hosted "
-                "service.")
+                403, "not_loopback",
+                "This GUI only answers requests addressed to 127.0.0.1, "
+                "[::1] or localhost. It is a local operator tool, not a "
+                "hosted service, and a request that arrived under any other "
+                "name is a browser being pointed here by someone else.")
             return False
         if not self._origin_ok():
             self.close_connection = True
@@ -966,6 +1233,31 @@ class Handler(BaseHTTPRequestHandler):
                 "That request came from another web page. This GUI can mint "
                 "money and spend every wallet in its workdir, so it answers "
                 "only its own page, opened directly at this address.")
+            return False
+        if not self.auth.enabled:
+            return True           # --no-auth; main() has already shouted
+        has_cookie = self.auth.session_ok(self.headers.get("Cookie"))
+        if method in ("GET", "HEAD") and path in ("/", "/index.html"):
+            if has_cookie:
+                return True
+            if self.auth.key_ok(query.get("k")):
+                self._set_cookie = (
+                    "%s=%s; HttpOnly; SameSite=Strict; Path=/"
+                    % (SESSION_COOKIE, self.auth.new_session()))
+                return True
+            self.close_connection = True
+            self._send(401, LOCKED_PAGE.encode("utf-8"),
+                       "text/html; charset=utf-8")
+            return False
+        if not has_cookie:
+            self.close_connection = True
+            self._error(
+                401, "unauthorized",
+                "This request carried no session for this GUI. Open the "
+                "address printed in the terminal that is running app.py — "
+                "it contains a key, and opening it is what hands this "
+                "browser the cookie every API route requires. The key "
+                "itself is not accepted here.")
             return False
         return True
 
@@ -993,15 +1285,29 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- dispatch -------------------------------------------------------
     def _handle(self, method: str):
-        if not self._guard():
-            return
         # A body we never read would leave the next request on a reused
         # connection misaligned, so any path that skips it closes instead.
         drained = False
+        # One connection can carry many requests; nothing from the last one
+        # may survive into this one.
+        self._set_cookie = None
         raw_path, _, raw_query = self.path.partition("?")
         path = urllib.parse.unquote(raw_path).rstrip("/") or "/"
         query = {k: v[-1] for k, v in urllib.parse.parse_qs(raw_query).items()}
         try:
+            # THE gate. Nothing below this line runs for a request that did
+            # not pass it, which is the whole point of dispatching after it
+            # rather than checking inside each route.
+            if not self._authorize(method, path, query):
+                return
+            if method not in ("GET", "HEAD", "POST"):
+                # No route uses these. BaseHTTPRequestHandler would answer
+                # with a 501 HTML page, and would answer before the gate;
+                # this is JSON, and it is behind the gate.
+                return self._error(
+                    405, "method_not_allowed",
+                    f"This GUI answers GET and POST only; no route uses "
+                    f"{method}.")
             if path in ("/", "/index.html") and method in ("GET", "HEAD"):
                 return self._serve_page()
             if path == "/favicon.ico":
@@ -1037,7 +1343,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"{type(exc).__name__}: {exc}. The full detail is in the "
                 f"terminal running app.py.")
         finally:
-            if method == "POST" and not drained:
+            if method not in ("GET", "HEAD") and not drained:
                 self.close_connection = True
 
     def _serve_page(self):
@@ -1064,35 +1370,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._handle("POST")
 
-    def _unsupported(self, method: str):
-        """A method no route uses — still JSON, still behind the guards.
-
-        BaseHTTPRequestHandler would answer these with a 501 HTML page,
-        which breaks the one promise every client of this API is allowed to
-        rely on, and it would answer before the loopback checks ran.
-        """
-        self.close_connection = True
-        if not self._guard():
-            return
-        self._error(
-            405, "method_not_allowed",
-            f"This GUI answers GET and POST only; no route uses {method}.")
-
+    # Every method this class answers goes through _handle, and therefore
+    # through _authorize. There is deliberately no second entry point: a
+    # do_* that did its own thing would be a route with no access policy.
     def do_PUT(self):
-        self._unsupported("PUT")
+        self._handle("PUT")
 
     def do_PATCH(self):
-        self._unsupported("PATCH")
+        self._handle("PATCH")
 
     def do_DELETE(self):
-        self._unsupported("DELETE")
+        self._handle("DELETE")
 
     def do_OPTIONS(self):
         # Deliberately no CORS headers: the page is served by this same
         # server, so nothing it does is cross-origin, and an Access-Control
         # answer here would invite precisely the cross-site request
         # _origin_ok() exists to refuse.
-        self._unsupported("OPTIONS")
+        self._handle("OPTIONS")
 
     def send_error(self, code, message=None, explain=None):
         """The base class's own failures, in this GUI's error envelope.
@@ -1136,9 +1431,12 @@ def require_loopback(host: str, port: int = DEFAULT_PORT) -> int:
     """Resolve ``host`` and refuse anything the world could reach.
 
     This process can create money and can spend every wallet in the
-    workdir, with no authentication of any kind. Binding it to a routable
-    address does not expose a dashboard, it exposes the mint's operator
-    credential to everyone who can route a packet to the machine.
+    workdir. It authenticates now, and that changes nothing here: a
+    capability cookie is a second lock on a door that should still not
+    face the street. Binding to a routable address would put every one of
+    these routes, and the mint's operator credential behind them, one
+    guessable-or-stolen cookie away from everyone who can route a packet
+    to this machine. There is no flag to relax this.
     """
     try:
         infos = socket.getaddrinfo(host, None)
@@ -1156,9 +1454,9 @@ def require_loopback(host: str, port: int = DEFAULT_PORT) -> int:
             raise SystemExit(
                 f"refusing to bind {host!r} ({address}): it is not a loopback "
                 f"address.\n"
-                f"This GUI has no login. Anyone who can reach its port can "
-                f"mint money and spend every wallet in the workdir, so it "
-                f"binds 127.0.0.1 only.\n"
+                f"This GUI can mint money and spend every wallet in the "
+                f"workdir. Its session cookie is a second lock, not a reason "
+                f"to face the network, so it binds 127.0.0.1 only.\n"
                 f"To reach it from another machine, forward the port over "
                 f"ssh:  ssh -L {port}:127.0.0.1:{port} user@this-host")
         families.add(info[0])
@@ -1169,16 +1467,44 @@ def require_loopback(host: str, port: int = DEFAULT_PORT) -> int:
             else socket.AF_INET)
 
 
-def serve(port: int, workdir: str, host: str = "127.0.0.1") -> GuiServer:
+def serve(port: int, workdir: str, host: str = "127.0.0.1", *,
+          auth: bool = True) -> GuiServer:
+    """One bound, authenticated server. ``auth=False`` is --no-auth."""
     family = require_loopback(host, port)
-    # One handler class per server, so the workdir belongs to the server
-    # rather than to the module: two GuiServers in one process (the tests
-    # do exactly that) must not share an Api and a workdir.
+    # One handler class per server, so the workdir and the credentials
+    # belong to the server rather than to the module: two GuiServers in one
+    # process (the tests do exactly that) must not share an Api, a workdir,
+    # or a key.
     bound = type("BoundHandler", (Handler,),
                  {"api": Api(workdir),
+                  "auth": _Auth(enabled=auth),
                   "page_path": os.path.join(HERE, "page.html")})
     server_class = GuiServer6 if family == socket.AF_INET6 else GuiServer
-    return server_class((host, port), bound)
+    server = server_class((host, port), bound)
+    server.auth = bound.auth
+    return server
+
+
+NO_AUTH_WARNING = """
+  ############################################################
+  ##                                                        ##
+  ##   --no-auth:  THIS GUI IS SERVING WITH NO PASSWORD     ##
+  ##                                                        ##
+  ############################################################
+
+  Every route is open to anything that can open a socket to this port:
+  any other process running as any user on this machine, including
+  something installed for an unrelated reason. Those routes mint money
+  and spend every wallet in
+
+      {workdir}
+
+  This flag exists so automated tests can drive the server. It is not a
+  convenience, and it is not a fix for a lost URL -- stop the GUI and
+  start it again for a fresh one. Do not leave this process running.
+
+  ############################################################
+"""
 
 
 def main(argv=None) -> int:
@@ -1192,12 +1518,17 @@ def main(argv=None) -> int:
     parser.add_argument("--workdir", default=DEFAULT_WORKDIR,
                         help="where the mint database, keys, log and wallets "
                              f"live (default {DEFAULT_WORKDIR})")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="serve with NO key and NO session cookie. For "
+                             "automated tests only: it opens every route, "
+                             "including the ones that mint money and spend "
+                             "wallets, to every process on this machine.")
     args = parser.parse_args(argv)
 
     workdir = os.path.abspath(args.workdir)
     os.makedirs(os.path.join(workdir, "wallets"), exist_ok=True)
     try:
-        httpd = serve(args.port, workdir, args.host)
+        httpd = serve(args.port, workdir, args.host, auth=not args.no_auth)
     except OSError as exc:
         if exc.errno in (errno.EADDRINUSE, errno.EACCES):
             why = ("something else is already listening there. Stop it, or "
@@ -1213,15 +1544,33 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
+    if args.no_auth:
+        # Loud, multi-line, on stderr, on every single startup. Nobody gets
+        # to run this by accident and not notice.
+        sys.stderr.write(NO_AUTH_WARNING.format(workdir=workdir))
+        sys.stderr.flush()
+
     shown = args.host if ":" not in args.host else f"[{args.host}]"
-    url = f"http://{shown}:{httpd.server_address[1]}/"
+    base = f"http://{shown}:{httpd.server_address[1]}/"
+    # The key is printed here and nowhere else: not to a file, not to a log
+    # line (log_message is silent), not into any response body. Losing it
+    # means restarting the GUI, which is the intended cost.
+    url = base if args.no_auth else base + "?k=" + httpd.auth.key
     print(f"\n  aicash operator GUI")
     print(f"  workdir   {workdir}")
     print(f"  wallets   {os.path.join(workdir, 'wallets')}")
     print(f"\n  OPEN      {url}   <- open this in a browser\n")
-    print(f"  Loopback only, and no password. Anyone who reaches this port "
-          f"can mint\n  money and spend every wallet in the workdir. Ctrl-C "
-          f"to stop.\n", flush=True)
+    if args.no_auth:
+        print(f"  NO AUTHENTICATION (--no-auth). See the warning above. "
+              f"Ctrl-C to stop.\n", flush=True)
+    else:
+        print(f"  That whole URL is the password: the key in it is generated "
+              f"fresh each\n  start, kept only in memory, and exchanged once "
+              f"for a session cookie. Do\n  not paste it into anything.\n")
+        print(f"  It is still loopback only, and that still matters. The "
+              f"cookie is a second\n  lock on a door that should not face "
+              f"the street: these routes mint money\n  and spend every "
+              f"wallet in the workdir. Ctrl-C to stop.\n", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

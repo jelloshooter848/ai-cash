@@ -55,7 +55,23 @@ One Python process. Concretely, when you run the launcher you get:
 - **Optionally, a loopback operator console** (`--console-port`, default 8080),
   a separate HTTP server that holds the admin token server-side and proxies to
   the mint. **Set `--console-port 0` in production**, or reach it only over an
-  SSH tunnel. Anyone who reaches that port can mint without limit.
+  SSH tunnel.
+
+  The console authenticates: on startup it prints one URL carrying a
+  capability key (`http://127.0.0.1:<port>/?k=…`), generated fresh each start
+  and held in memory only — never written to a file, a log line or any
+  response body. Opening that URL once exchanges the key for an `HttpOnly;
+  SameSite=Strict` session cookie, and every `/api/*` route requires that
+  cookie; the bare `http://127.0.0.1:<port>/` answers 401, and the key is not
+  accepted on an API route. It also refuses any `Host` that is not a loopback
+  literal (the DNS-rebinding defence) and any foreign `Origin`/`Referer`. A
+  `--no-auth` flag exists for automated tests only and shouts on every start.
+
+  **None of that makes the port safe to expose, and it is not a reason to
+  relax anything above.** It is a second lock on a door that should still not
+  face the street: it does not separate users on a shared machine, does not
+  stop another local process, and the admin token is still sitting in that
+  process. `--console-port 0` in production remains the instruction.
 
 The launcher (`run_mint.py`, installed as `aicash-mint`) is explicitly **not
 protocol** — it is a wiring script, and its flags change faster than this
@@ -928,8 +944,10 @@ there is no earned issuance or attestation (L10).
 **8. Issuance is one bearer credential.** Whoever holds the admin token mints
 without limit. `--open-issuance` removes even that, and `MintConfig.admin_token=None`
 means *allow everyone*, not *allow no one*. The operator console holds the token
-server-side and is loopback-only — keep it that way, or turn it off with
-`--console-port 0`.
+server-side, is loopback-only, and additionally requires the capability URL it
+prints at startup (exchanged once for a session cookie) on every route — but it
+is still a process holding a credential that mints without limit, so keep it on
+loopback, or turn it off with `--console-port 0`.
 
 **9. The HTTP server is stdlib.** `ThreadingHTTPServer` plus
 `BaseHTTPRequestHandler` is a thread per connection with no request timeouts of
@@ -973,7 +991,11 @@ it.
 - [ ] Certificate expiry is monitored from outside with weeks of headroom (§8)
 - [ ] Proxy limiter matches the descriptor's published `anonymous_rate`
       exactly — including `burst`, which caddy-ratelimit cannot express (§4.1/§5)
-- [ ] `--console-port 0`, or console reachable only through an SSH tunnel (§1)
+- [ ] `--console-port 0`, or console reachable only through an SSH tunnel (§1).
+      The console's own capability-URL auth does **not** substitute for this:
+      if the console is running at all, confirm its startup URL was not
+      captured to a log by a service manager, since that file then holds a
+      minting credential until the process is restarted (§1)
 - [ ] Proxy access log cannot capture a token-bearing URL (§4.2)
 - [ ] systemd unit stops cleanly — verified by watching for the launcher's own
       shutdown line in the journal; `TimeoutStopSec` > `--drain-seconds` (§6)

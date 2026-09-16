@@ -521,7 +521,13 @@ def main():
         console = mint_console.serve(args.console_port, port, args.mint_id, admin_token)
         threading.Thread(target=console.serve_forever, daemon=True,
                          name="aicash-console").start()
-        print(f"\n  CONSOLE     http://127.0.0.1:{args.console_port}   <- open this in a browser")
+        # No URL is printed here on purpose. mint_console.serve() has just
+        # printed the ONE address that works: it carries the capability key
+        # the console generated a moment ago, and this process has no other
+        # way to know that key. A bare http://127.0.0.1:<port> printed here
+        # used to be the LAST line the operator saw, so it was the one they
+        # clicked, and it answers 401. The keyed URL is also on the server
+        # object as console.console_url if anything downstream needs it.
 
     stop = threading.Event()
     if prune_interval_s > 0:

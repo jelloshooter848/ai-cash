@@ -81,16 +81,31 @@ The wallet store has exactly two tables and neither has a clock column::
 
 ``op_id`` is a random uuid4, so it sorts by nothing.  Therefore:
 
-* **There are no timestamps.  None.**  ``ts_ms`` is returned as ``0`` on
-  every row.  It is a placeholder to satisfy the agreed shape, not data.
-  A UI must not render it as a date.  Ordering comes from the sqlite
-  ``rowid`` of ``wallet_ops``, which is insertion order — the order the
-  operations were *planned*, which for this single-threaded wallet is also
-  the order they were attempted.  It is not wall-clock time and it cannot
-  be compared against anything outside this one store.  Producing a real
-  ``ts_ms`` would need a clock column in the wallet schema or a second
-  file beside the store; both are ruled out here, so the field is
-  honestly inert rather than quietly invented.
+* **There are no timestamps.  None.**  ``ts_ms`` is ``TS_UNKNOWN`` on
+  every row — a value that IS the integer ``0`` (it is an ``int``
+  subclass, so ``== 0``, ``isinstance(x, int)`` and ``json.dumps`` all
+  behave exactly as they always did) but that says what it means when it
+  is printed: ``str()`` gives ``"unknown"`` and ``repr()`` gives
+  ``TS_UNKNOWN(0 — the wallet store records no clock)``.  **Zero here
+  means UNKNOWN, not 1970-01-01.**  A consumer that wants to branch on it
+  should test ``row["ts_ms"] is TS_UNKNOWN`` (it is a singleton) or just
+  ``not row["ts_ms"]``, and must not render it as a date: every wallet
+  ever written by this build would render as the epoch.  Ordering comes
+  from the sqlite ``rowid`` of ``wallet_ops``, which is insertion order —
+  the order the operations were *planned*, which for this single-threaded
+  wallet is also the order they were attempted.  It is not wall-clock
+  time and it cannot be compared against anything outside this one store.
+  Producing a real ``ts_ms`` would need a clock column in the wallet
+  schema or a second file beside the store; both are ruled out here, so
+  the field is honestly inert rather than quietly invented.
+  A JSON consumer sees a plain ``0`` (the wire shape is unchanged, and
+  that is enforced at import — see ``TS_UNKNOWN`` below), so an HTTP
+  layer that re-serialises these rows has to carry the "no clock"
+  disclosure itself: ``gui/app.py`` passes the ``0`` through and
+  ``page.html`` is where it is explained.  It does not leave the When
+  column empty: each such cell reads the words ``not recorded``, and one
+  note above the table says how many cells that is and why the wallet's
+  database has no time to give.
 * ``pay`` and ``pay_many`` are both recorded as kind ``pay``.  A fan-out to
   three recipients is indistinguishable from one payment of the total, and
   the per-recipient split is not recoverable.
@@ -132,8 +147,11 @@ are the exact shapes a caller may rely on)
                   burn_mc + change_mc`` always.
 ``pay()``      -> ``{"tokens": [str], "amount_mc": int, "burn_mc": int}``
 ``recover()``  -> ``Wallet.recover``'s counters, passed through unchanged.
-``history()``  -> ``[{"ts_ms": int, "kind": str, "amount_mc": int,
-                  "detail": str}]``, newest first.  ``kind`` is drawn from
+``history()``  -> ``[{"ts_ms": TS_UNKNOWN, "kind": str, "amount_mc": int,
+                  "detail": str}]``, newest first.  ``ts_ms`` is ALWAYS
+                  ``TS_UNKNOWN`` — an ``int`` equal to ``0`` meaning "this
+                  store records no clock", never a real time and never the
+                  epoch; see the history section above.  ``kind`` is drawn from
                   a CLOSED set — a caller may switch on it exhaustively::
 
                       receive   receive_failed   receive_pending
@@ -176,7 +194,62 @@ from aicash.wallet import (  # noqa: E402
     Wallet,
 )
 
-__all__ = ["WalletOps", "WalletOpsError"]
+__all__ = ["TS_UNKNOWN", "WalletOps", "WalletOpsError"]
+
+
+# ---------------------------------------------------------------------------
+# "no clock in this schema" sentinel
+# ---------------------------------------------------------------------------
+
+
+class _UnknownTime(int):
+    """``0``, and loud about the fact that it is not a time.
+
+    The wallet store has no clock column (see the module docstring), so
+    every ``history()`` row would otherwise carry a bare ``ts_ms`` of
+    ``0`` — which the next consumer of this API can read as midnight on
+    1 January 1970 and render as a date.  This is still the integer
+    ``0``: it compares equal to ``0``, ``isinstance(x, int)`` is True,
+    arithmetic works, and ``json.dumps`` writes ``0``, so nothing that
+    already handles the field changes behaviour.  What changes is what it
+    says when a human or a log sees it: ``str()`` is ``"unknown"`` and
+    ``repr()`` names itself and the reason.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "TS_UNKNOWN(0 — the wallet store records no clock)"
+
+    def __str__(self) -> str:
+        return "unknown"
+
+
+#: The only value ``history()`` ever puts in ``ts_ms``.  A singleton, so
+#: ``row["ts_ms"] is TS_UNKNOWN`` is an exact test; ``== 0`` and
+#: ``not row["ts_ms"]`` work too.  It means "this wallet's sqlite records
+#: no time for this operation", NOT "this happened at the epoch".
+TS_UNKNOWN = _UnknownTime(0)
+
+# The WIRE shape is the contract here; the pretty printing is only a
+# convenience.  ``GET /api/wallet/history`` must always put a bare ``0`` in
+# ``ts_ms``: a consumer that suddenly read ``"TS_UNKNOWN(0 - ...)"`` out of
+# that field would be parsing corrupt JSON, which is very much worse than an
+# unlabelled zero.  Both of json's encoders serialise an ``int`` subclass by
+# value on CPython 3.12 -- the C encoder, and the pure-Python one that any
+# ``indent=`` forces -- but that is an implementation detail of the encoder,
+# not a documented promise, and this module has no test that would catch it
+# changing.  So check it once, at import, against BOTH encoders, and give up
+# the sentinel rather than the API if it ever stops holding.
+if (json.dumps({"ts_ms": TS_UNKNOWN}) != '{"ts_ms": 0}'
+        or json.dumps([TS_UNKNOWN], indent=1) != "[\n 0\n]"):  # pragma: no cover
+    # Fall back to the plain integer.  Everything a caller is told to rely on
+    # still holds: ``row["ts_ms"] is TS_UNKNOWN`` (history() puts this very
+    # object in the row), ``== 0``, ``isinstance(x, int)``, ``not x``.  Only
+    # ``str()``/``repr()`` lose the word "unknown" -- the cosmetic half -- and
+    # the field goes back to being a bare zero that this docstring, gui/app.py
+    # and gui/README.md each explain in words.
+    TS_UNKNOWN = 0
 
 
 # ---------------------------------------------------------------------------
@@ -850,10 +923,13 @@ class WalletOps:
 
         Rows are ``{"ts_ms", "kind", "amount_mc", "detail"}``.  READ THE
         MODULE DOCSTRING before trusting a field: the store has no clock,
-        so ``ts_ms`` is always ``0`` and "newest first" means newest by
-        sqlite insertion order, not by time.  ``kind`` is drawn from the
-        closed set listed in the module docstring; ``amount_mc`` is always
-        a non-negative magnitude, direction lives in ``kind``.
+        so ``ts_ms`` is always ``TS_UNKNOWN`` and "newest first" means
+        newest by sqlite insertion order, not by time.  ``TS_UNKNOWN``
+        *is* the integer ``0``, but it means UNKNOWN, never 1970 — it
+        prints as ``unknown`` and ``row["ts_ms"] is TS_UNKNOWN`` is the
+        exact test.  Do not render it as a date.  ``kind`` is drawn from
+        the closed set listed in the module docstring; ``amount_mc`` is
+        always a non-negative magnitude, direction lives in ``kind``.
 
         Reads the store READ-ONLY over ONE connection, so the page a
         caller gets is one consistent snapshot even if the wallet is being
@@ -984,7 +1060,9 @@ def _history_row(op_id, kind, state, request_json, out_by_role: dict) -> dict:
             " could not be parsed, so the face total is incomplete"
         )
     return {
-        "ts_ms": 0,  # the wallet store keeps no timestamps; see docstring
+        # The store keeps no timestamps; TS_UNKNOWN is 0 and says so when
+        # printed, so "unknown" cannot be mistaken for the epoch.
+        "ts_ms": TS_UNKNOWN,
         "kind": f"{kind}{suffix}",
         "amount_mc": int(amount),
         "detail": detail,

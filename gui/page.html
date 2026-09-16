@@ -4,9 +4,11 @@
 /* Same palette and proportions as mint_console.py, so the two read as one
    product. No CDN, no framework, no build step: this file is the whole UI. */
 :root{--bg:#f7f7f5;--card:#fff;--ink:#1a1a18;--dim:#6b6b66;--line:#e2e2dd;
---accent:#2f6f4f;--warn:#8a4b2a;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+--accent:#2f6f4f;--warn:#8a4b2a;--warnbg:#fbf2ea;--alarm:#a11c14;--alarmbg:#fcebe9;
+--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(prefers-color-scheme:dark){:root{--bg:#16161a;--card:#1e1e23;--ink:#e8e8e4;
---dim:#9a9a94;--line:#30303a;--accent:#6bbf90;--warn:#d89a6a}}
+--dim:#9a9a94;--line:#30303a;--accent:#6bbf90;--warn:#d89a6a;--warnbg:#2a1f18;
+--alarm:#ff8f7a;--alarmbg:#2e1613}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
 .wrap{max-width:940px;margin:0 auto;padding:24px 18px 60px}
@@ -59,6 +61,20 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);cursor:point
 .wallet .tag{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
 .banner{border:1px solid var(--warn);border-radius:8px;padding:10px 12px;
 color:var(--warn);font-size:13px;margin-bottom:16px}
+/* The two authentication banners are not the same kind of thing as "no mint
+   is running", and they must not read like it: bigger type, a heavy left
+   bar, a shouted kicker line, a tinted ground. The Host/Origin case gets a
+   colour used nowhere else on the page, because it is the only message here
+   that means someone other than the operator may be driving the tool. */
+#auth-banner{font-size:14.5px;line-height:1.55;padding:14px 16px;
+border-width:2px;border-left-width:10px;background:var(--warnbg)}
+#auth-banner .kick{display:block;font-size:11px;font-weight:700;
+text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
+#auth-banner .ttl{display:block;font-size:17px;font-weight:700;
+line-height:1.3;margin-bottom:6px}
+#auth-banner.alarm{border-color:var(--alarm);color:var(--alarm);
+background:var(--alarmbg);border-left-width:16px}
+#auth-banner.alarm .note{color:var(--alarm)}
 .step{display:inline-block;width:18px;height:18px;border-radius:50%;
 background:var(--dim);color:var(--bg);font-size:11px;line-height:18px;
 text-align:center;margin-right:8px;font-weight:700}
@@ -67,9 +83,11 @@ text-align:center;margin-right:8px;font-weight:700}
 <h1><span class="dot unk" id="hdr-dot"></span>aicash operator</h1>
 <div class="sub" id="hdr-state">starting up...</div>
 
+<div class="banner" id="auth-banner" hidden></div>
 <div class="banner" id="stopped-banner" hidden>
   No mint is running, so wallets cannot be created, funded or spent. Start one
-  under <b>MINT</b> below — the defaults are fine.
+  under <b>MINT</b> below — the defaults are fine, and they include a small
+  demo burn so that a first run shows what a payment really costs.
 </div>
 <div class="banner" id="fatal-banner" hidden></div>
 
@@ -80,7 +98,7 @@ text-align:center;margin-right:8px;font-weight:700}
   <div class="grid" id="m-stats"></div>
   <div id="m-policy" class="note"></div>
 
-  <details id="m-settings"><summary>Mint settings (defaults are fine)</summary>
+  <details id="m-settings"><summary>Mint settings (defaults are fine — they include a demo burn)</summary>
     <div class="row">
       <div><label>Mint id (lowercase, digits, hyphens)</label>
         <input id="m-id" value="local-test-mint" autocomplete="off"></div>
@@ -89,11 +107,20 @@ text-align:center;margin-right:8px;font-weight:700}
       <div><label>Port</label><input id="m-port" value="8787" inputmode="numeric"></div>
     </div>
     <h3>Burn policy — what every payment costs</h3>
+    <div class="note"><b>These start at a demo value, not at zero.</b> Rate
+      10,000 ppm is 1% of each exchange, capped at 1,000 mc, with amounts of
+      10 mc and under exempt. It is deliberately small, and it is here so that
+      a first run burns something real and the cost line in section 3 has
+      something to show. For a mint where a payment moves its whole amount,
+      set both rate and cap to 0.<br>
+      <b>To change any of this on a running mint: press Stop mint, edit these
+      fields, then press Start mint again.</b> They are locked while it runs
+      because the mint reads them once, at startup.</div>
     <div class="row">
       <div><label>Rate (parts per million)</label>
-        <input id="m-rate" value="0" inputmode="numeric"></div>
+        <input id="m-rate" value="10000" inputmode="numeric"></div>
       <div><label>Cap: most one payment can burn (mc)</label>
-        <input id="m-cap" value="0" inputmode="numeric"></div>
+        <input id="m-cap" value="1000" inputmode="numeric"></div>
       <div><label>Exempt below (mc)</label>
         <input id="m-exempt" value="10" inputmode="numeric"></div>
     </div>
@@ -130,8 +157,12 @@ text-align:center;margin-right:8px;font-weight:700}
       <input id="f-amount" value="1000" inputmode="numeric"></div>
     <div><label>How many tokens</label>
       <input id="f-count" value="1" inputmode="numeric"></div>
-    <div><label>Into wallet</label><select id="f-wallet"></select></div>
+    <div><label>Into wallet (the active wallet)</label>
+      <select id="f-wallet"></select></div>
   </div>
+  <div class="note">There is one current wallet on this page. This dropdown
+    and the <b>active</b> wallet in sections 2 and 3 are the same thing —
+    change either and both follow.</div>
   <button id="f-go">Issue into wallet</button>
   <div class="warn">Issuing creates new money out of nothing. It is signed into
     the supply snapshot and cannot be undone.</div>
@@ -150,7 +181,10 @@ text-align:center;margin-right:8px;font-weight:700}
   <div id="w-msg"></div>
   <div id="w-list"></div>
   <div class="note">Click a wallet to make it the <b>active</b> one — that is the
-    wallet that pays and receives in section 3. Each wallet is one sqlite file in
+    wallet that gets funded in section 1 and that pays and receives in
+    section 3. Creating a wallet makes the new one active straight away, so
+    after creating <b>alice</b> then <b>bob</b> it is <b>bob</b> that is
+    active; click alice to switch back. Each wallet is one sqlite file in
     <span id="wallets-dir">the workdir</span>; whoever has the file has the money.</div>
 </div>
 
@@ -182,6 +216,7 @@ text-align:center;margin-right:8px;font-weight:700}
   <div class="btnrow"><button id="h-refresh" class="sec small">Refresh history</button>
     <button id="h-recover" class="sec small">Recover interrupted payments</button></div>
   <div id="h-out"></div>
+  <div id="h-note" class="note"></div>
   <table id="h-table"><thead><tr><th>When</th><th>What</th>
     <th style="text-align:right">Amount</th><th>Detail</th></tr></thead>
     <tbody id="h-body"></tbody></table>
@@ -193,9 +228,14 @@ text-align:center;margin-right:8px;font-weight:700}
     <div id="t-out"></div></details>
 </div>
 
-<div class="note">Loopback only, and no password: anyone who can reach this port
-  can mint money and spend every wallet in the workdir. Local operator tool, not
-  a hosted service.</div>
+<div class="note">Unless app.py was started with <b>--no-auth</b> (which is for
+  its own tests), this page is authenticated: it works only in a browser that
+  opened the one-time URL app.py printed in your terminal, and every request
+  below carries the session cookie that URL bought. That lock is a second one
+  on a door that should still not face the street — this tool starts a mint,
+  creates money out of nothing and can spend every wallet in the workdir, so
+  it stays bound to loopback and off the network. Local operator tool, not a
+  hosted service.</div>
 
 </div><script>
 "use strict";
@@ -224,6 +264,30 @@ let quoteSeq = 0;
    writing the running mint's settings over what they are typing. */
 let settingsEdited = false;
 let settingsInitialised = false;
+/* app.py requires a session cookie on every /api/* route, handed out when
+   the browser opened the one-time URL printed in its terminal. Null while
+   that is working. Otherwise {kind, reason, detail} where kind is
+   "unauthorized" (401: no cookie, or not this server's) or "blocked"
+   (403/421: the Host or Origin check refused the request). The two mean
+   very different things, so they never share a message — and neither is
+   ever allowed to look like "the mint is stopped" or "you have no
+   wallets", which is exactly what an un-guarded failure path renders. */
+let authFailure = null;
+/* True only once the OPERATOR has picked a recipient with their own hand.
+   The select's own value cannot answer this: the very first renderWallets()
+   runs before any wallet exists, when the only option on offer is the
+   bearer-token one, and any rule that reads "the select already holds
+   something, keep it" therefore pins that option for the rest of the
+   session — which is exactly the cold-start bug. A page-filled select has
+   chosen nothing, and the safe option (a wallet on this machine) wins every
+   fill until someone says otherwise. */
+let payTargetChosen = false;
+/* The last history this page actually read, and whose wallet it belongs to,
+   so a lockout can caveat it in place instead of wiping it or leaving it
+   looking current. */
+let historyHtml = "";
+let historyNote = "";
+let historyName = null;
 
 /* ---------- fetch with a deadline, so nothing can spin forever ---------- */
 async function api(path, body, ms) {
@@ -231,7 +295,12 @@ async function api(path, body, ms) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), limit);
   try {
-    const init = {signal: ctrl.signal, headers: {"Accept": "application/json"}};
+    // credentials: every /api/* route requires the session cookie app.py set
+    // when it served this page, and a fetch that drops it is a 401 no matter
+    // who is at the keyboard. Same-origin is already the browser default;
+    // it is written out so that nobody has to know that to read this.
+    const init = {signal: ctrl.signal, credentials: "same-origin",
+                  headers: {"Accept": "application/json"}};
     if (body !== undefined && body !== null) {
       init.method = "POST";
       init.headers["Content-Type"] = "application/json";
@@ -242,14 +311,17 @@ async function api(path, body, ms) {
     try { data = await res.json(); } catch (e) { data = null; }
     if (!res.ok) {
       const err = (data && data.error) || {};
-      return {ok: false, reason: err.reason || ("http_" + res.status),
-              detail: err.detail || ("The server answered " + res.status +
-                                     " with no explanation."), data: data};
+      const reason = err.reason || ("http_" + res.status);
+      const detail = err.detail || ("The server answered " + res.status +
+                                    " with no explanation.");
+      noteAuthStatus(res.status, reason, detail);
+      return {ok: false, reason: reason, detail: detail, data: data};
     }
     if (data === null) {
       return {ok: false, reason: "bad_response",
               detail: "The server answered with something that is not JSON."};
     }
+    if (authFailure) clearAuthFailure();   // we are back in
     return {ok: true, data: data};
   } catch (e) {
     if (e.name === "AbortError") {
@@ -262,6 +334,99 @@ async function api(path, body, ms) {
             detail: "Could not reach the GUI server at all (" + e.message +
                     "). Is app.py still running in your terminal?"};
   } finally { clearTimeout(timer); }
+}
+
+/* ---------- authentication ---------- */
+/* app.py hands this page a session cookie when it is opened at the URL it
+   printed, and requires that cookie on every /api/* route, GET included.
+   Two failures have to be told apart:
+     401        no cookie, or not one this server issued — the page was
+                opened without the key, or app.py has restarted since (it
+                mints a fresh key in memory every start and writes it
+                nowhere);
+     403 / 421  the Host or Origin check refused the request, meaning it
+                did not arrive addressed to this server's own loopback
+                address. Nothing the operator does at the keyboard causes
+                that, which is why it gets its own, louder sentence.
+   Either way the page stops pretending it knows anything: no spinner, no
+   empty state, no "no mint is running". */
+/* The status code alone is NOT enough to classify this, and treating it as
+   enough was a bug worth spelling out: app.py also raises 403
+   "not_authorized" from /api/mint/issue when the MINT rejects the operator
+   credential — an ordinary stale mint-admin-keys.json — and a page that
+   reads that as the Host check firing tells the operator an attack is in
+   progress and disables a Stop button that would have worked. So only the
+   two reasons app.py's own gate emits count, and any other 401/403 is left
+   to the ordinary error path that renders it next to the control that
+   caused it. */
+const BLOCKED_REASONS = {not_loopback: true, cross_site: true};
+function noteAuthStatus(status, reason, detail) {
+  if (status === 401 && reason === "unauthorized") {
+    setAuthFailure("unauthorized", reason, detail);
+  } else if ((status === 403 || status === 421) && BLOCKED_REASONS[reason]) {
+    setAuthFailure("blocked", reason, detail);
+  }
+}
+function setAuthFailure(kind, reason, detail) {
+  authFailure = {kind: kind, reason: reason, detail: detail};
+  renderAuthBanner();
+  // Immediately, not at the next poll: a 401 that arrives in the middle of
+  // a Pay or a Receive must leave every control that moves money dead and
+  // no button stuck on "paying...". Pure DOM work, so it is safe to do
+  // from inside api().
+  renderMint();
+  // Every other panel that is showing a figure read from app.py, too. A
+  // lockout that arrives from Issue, Pay, Receive or Recover used to leave
+  // the wallet list and the history sitting there uncaveated, reading as
+  // live, directly under a banner saying nothing on this page is live. The
+  // stale-balance warning is the honesty property of this state; it has to
+  // appear on the paths most likely to reach it, not only on Refresh.
+  renderWallets();
+  renderHistoryStale();
+  // A cost estimate describes a payment this page can no longer check or
+  // make, so it is voided rather than left on screen looking agreed to.
+  invalidateQuote();
+  say($("p-quote"), "warn bad", "No cost can be checked and nothing can be " +
+      "paid: this page is locked out. See the message at the top.");
+}
+function clearAuthFailure() {
+  authFailure = null;
+  renderAuthBanner();
+}
+function renderAuthBanner() {
+  const el = $("auth-banner");
+  if (!authFailure) {
+    el.hidden = true; el.className = "banner"; el.innerHTML = ""; return;
+  }
+  const said = '<div class="note">app.py said: ' + esc(authFailure.detail) +
+               '  [' + esc(authFailure.reason) + ']</div>';
+  el.hidden = false;
+  el.className = "banner" + (authFailure.kind === "blocked" ? " alarm" : "");
+  el.innerHTML = authFailure.kind === "unauthorized"
+    ? '<span class="kick">Not signed in</span>' +
+      '<span class="ttl">This page is not signed in, so nothing on it is ' +
+      'live.</span> Either it ' +
+      'was opened without the key from the terminal, or its session has ' +
+      'ended — app.py generates a new key every time it starts and keeps it ' +
+      'only in memory, so restarting it invalidates the old one. Anything ' +
+      'below is the last thing this page managed to read, not the current ' +
+      'state, and no button here can move money until you are back in. ' +
+      'Reopen the <b>http://127.0.0.1:&lt;port&gt;/?k=…</b> URL that app.py ' +
+      'printed in the terminal it is running in; that link is what sets the ' +
+      'session cookie. Then press Refresh.' + said
+    : '<span class="kick">&#9888; Refused &mdash; check this before doing ' +
+      'anything else</span>' +
+      '<span class="ttl">app.py refused this request as coming from ' +
+      'somewhere other than itself.</span> It answers only requests ' +
+      'addressed to 127.0.0.1 or ' +
+      'localhost and sent by its own page at its own address. If you opened ' +
+      'this tab from the URL in the terminal, take this seriously: something ' +
+      'is reaching the GUI under a different name — a hostname pointed at ' +
+      '127.0.0.1, a proxy in front of it, or another web page trying to ' +
+      'drive it from your browser. This tool can mint money and spend every ' +
+      'wallet in its workdir, so check the address bar against what app.py ' +
+      'printed, and if you cannot account for the difference, close the tab ' +
+      'and stop app.py.' + said;
 }
 
 /* ---------- small helpers ---------- */
@@ -368,7 +533,10 @@ function working(btn, label) {
 }
 function done(btn) {
   if (btn.dataset.label) btn.textContent = btn.dataset.label;
-  btn.disabled = false;
+  // Re-enabling a control while the page is locked out would be a lie: the
+  // next click can only fail the same way. done() runs after api() has
+  // already noticed the 401, so it is the last word on the button.
+  btn.disabled = !!authFailure;
 }
 function tokenBlock(tokens, heading, cls) {
   const text = tokens.join("\n");
@@ -395,6 +563,7 @@ window.copyFrom = copyFrom;
 
 /* ---------- mint ---------- */
 function renderMint() {
+  if (authFailure) return renderLockedOut();
   const running = !!mint.running;
   $("hdr-dot").className = "dot" + (running ? "" : " off");
   $("hdr-state").textContent = running
@@ -452,6 +621,31 @@ function renderMint() {
   if (!running) { $("p-go").disabled = true; }
 }
 
+/* Locked out: say "unknown", never "stopped" and never "none".
+   A 401 tells us nothing at all about the mint or the wallets, so every
+   figure that would normally be read from the server is blanked rather
+   than left showing a stale or invented state, and everything that would
+   act on money is disabled. Refresh stays live: it is how the operator
+   finds out they are back in. */
+function renderLockedOut() {
+  $("hdr-dot").className = "dot unk";
+  $("hdr-state").textContent = authFailure.kind === "unauthorized"
+    ? "not signed in - this page cannot see the mint or the wallets"
+    : "refused - this page is not reaching app.py at its own address";
+  $("stopped-banner").hidden = true;
+  $("m-stats").innerHTML = [
+    ["State", "unknown"], ["Mint id", "-"], ["Port", "-"], ["Process", "-"]
+  ].map(p => '<div class="stat"><div class="n">' + esc(p[1]) +
+             '</div><div class="l">' + esc(p[0]) + '</div></div>').join("");
+  $("m-policy").className = "note bad";
+  $("m-policy").textContent =
+    "Burn policy: cannot be read while this page is locked out.";
+  for (const id of ["m-start", "m-stop", "f-go", "w-create", "r-go",
+                    "h-recover", "t-go", "p-requote", "p-go"]) {
+    $(id).disabled = true;
+  }
+}
+
 /* The burn policy, in words, outside the collapsed descriptor blob. */
 function renderPolicy(running) {
   const el = $("m-policy");
@@ -468,7 +662,11 @@ function renderPolicy(running) {
     " (" + policySource + "): " + policyWords(policy) +
     (burns ? ". Every payment is burned twice — on the split and again when " +
              "the recipient redeems. The cost line in section 3 shows both."
-           : ". A payment moves its whole amount.");
+           : ". A payment moves its whole amount.") +
+    (running ? " To change it: Stop mint, edit the burn policy under Mint " +
+               "settings, then Start mint again — the mint reads it once, at " +
+               "startup, so the fields are locked while it runs."
+             : " Edit it under Mint settings before pressing Start mint.");
 }
 
 /* The running mint's own settings, written back into the form, so that a
@@ -547,10 +745,14 @@ async function stopMint() {
 
 /* ---------- funding ---------- */
 async function issueInto() {
-  const name = $("f-wallet").value;
+  // The ACTIVE wallet, not whatever the dropdown happens to hold: they are
+  // one thing on this page now, and `active` is the copy every other
+  // section reads.
+  const name = active;
   const amount = parseInt($("f-amount").value, 10);
   const count = parseInt($("f-count").value, 10);
-  if (!name) { say($("f-out"), "warn bad", "Create a wallet first (section 2)."); return; }
+  if (!name) { say($("f-out"), "warn bad", "Create a wallet first (section 2) — " +
+      "issued money has to land in one."); return; }
   busy = true; working($("f-go"), "issuing...");
   const r = await api("/api/mint/issue", {amount_mc: amount, count: count});
   if (!r.ok) { busy = false; done($("f-go")); fail($("f-out"), r); return; }
@@ -588,10 +790,25 @@ async function issueInto() {
 function renderWallets() {
   const list = $("w-list");
   if (!wallets.length) {
-    list.innerHTML = '<div class="note">No wallets yet. Create two — say ' +
-      '<b>alice</b> and <b>bob</b> — then fund one above and pay the other below.</div>';
+    // "no wallets" and "app.py would not tell us" are not the same answer,
+    // and only one of them means it is safe to go and create some.
+    list.innerHTML = authFailure
+      ? '<div class="warn bad">This is <b>not</b> an empty wallet list: this ' +
+        'page is locked out and app.py refused to say what is in the workdir. ' +
+        'See the message at the top.</div>'
+      : '<div class="note">No wallets yet. Create two — say ' +
+        '<b>alice</b> and <b>bob</b> — then fund one above and pay the other ' +
+        'below.</div>';
   } else {
-    list.innerHTML = wallets.map(w => {
+    // Known wallets, but we have just been refused: these figures are the
+    // last ones that were true, and saying so is the difference between a
+    // stale balance and a wrong one.
+    const stale = authFailure
+      ? '<div class="warn bad">Locked out — these are the last balances this ' +
+        'page managed to read, not current ones. See the message at the ' +
+        'top.</div>'
+      : "";
+    list.innerHTML = stale + wallets.map(w => {
       const bal = w.balance_mc === null || w.balance_mc === undefined
         ? (w.error ? "unreadable" : "?") : mc(w.balance_mc);
       const tag = w.error ? '<span class="tag bad">' + esc(w.error.slice(0, 60)) + '</span>'
@@ -607,27 +824,42 @@ function renderWallets() {
   const names = wallets.map(w => w.name);
   if (active && names.indexOf(active) < 0) active = null;
   if (!active && names.length) active = names[0];
+  // Section 1's "into wallet" is a second view of the active wallet, never a
+  // second wallet: it always shows `active`, and picking in it sets `active`.
   fillSelect($("f-wallet"), names, active);
-  const payTargets = [["", "-- just make token strings --"]].concat(
-    names.filter(n => n !== active).map(n => [n, "wallet: " + n]));
-  fillSelect2($("p-to"), payTargets);
+  // Paying into a wallet on this machine is the safe option, so it is the
+  // default. "Token strings" hands back bearer money that exists in exactly
+  // one place — offered last, and named for what it is.
+  const payTargets = names.filter(n => n !== active).map(n => [n, "wallet: " + n])
+    .concat([["", "no wallet — just print the token strings (bearer money)"]]);
+  fillPayTargets($("p-to"), payTargets);
   const me = wallets.filter(w => w.name === active)[0];
   $("active-name").textContent = active || "none";
   $("active-balance").textContent = me ? mc(me.balance_mc) : "-";
   renderMint();
 }
+/* Follows `chosen` unconditionally: this select mirrors one piece of state
+   and must not hold an opinion of its own about which wallet is current. */
 function fillSelect(sel, names, chosen) {
-  const keep = sel.value;
   sel.innerHTML = names.map(n => '<option value="' + esc(n) + '">' + esc(n) +
     '</option>').join("");
-  if (names.indexOf(keep) >= 0) sel.value = keep;
-  else if (chosen && names.indexOf(chosen) >= 0) sel.value = chosen;
+  if (chosen && names.indexOf(chosen) >= 0) sel.value = chosen;
 }
-function fillSelect2(sel, pairs) {
+/* Keeps what the operator chose, and nothing else. `payTargetChosen` is set
+   by the select's own change listener, which fires on a human picking and
+   never on this function refilling the list, so a value the page put there
+   is never mistaken for a decision. When there is no decision to honour --
+   first fill, or the chosen wallet is gone or has become the active one --
+   the first pair wins, and the first pair is always a wallet on this
+   machine when one exists. The bearer-token option is offered last and is
+   reached only by choosing it. */
+function fillPayTargets(sel, pairs) {
   const keep = sel.value;
   sel.innerHTML = pairs.map(p => '<option value="' + esc(p[0]) + '">' + esc(p[1]) +
     '</option>').join("");
-  if (pairs.some(p => p[0] === keep)) sel.value = keep;
+  if (payTargetChosen && pairs.some(p => p[0] === keep)) { sel.value = keep; return; }
+  payTargetChosen = false;
+  if (pairs.length) sel.value = pairs[0][0];
 }
 function setActive(name) {
   active = name;
@@ -638,7 +870,14 @@ function setActive(name) {
 }
 async function refreshWallets() {
   const r = await api("/api/wallet/list");
-  if (!r.ok) { fail($("w-msg"), r); return; }
+  if (!r.ok) {
+    fail($("w-msg"), r);
+    // A failed list leaves whatever was on screen on screen, which for a
+    // page that has never had a successful read is an empty panel that
+    // looks exactly like "no wallets". Re-render so it says what it is.
+    if (authFailure) renderWallets();
+    return;
+  }
   wallets = r.data.wallets || [];
   $("wallets-dir").textContent = r.data.dir || "the workdir";
   renderWallets();
@@ -646,14 +885,23 @@ async function refreshWallets() {
 async function createWallet() {
   const name = $("w-name").value.trim();
   if (!name) { say($("w-msg"), "warn bad", "Give the wallet a name first."); return; }
+  const was = active;
   busy = true; working($("w-create"), "creating...");
   const r = await api("/api/wallet/create", {name: name});
   busy = false; done($("w-create"));
   if (!r.ok) { fail($("w-msg"), r); return; }
-  say($("w-msg"), "note ok", "Created " + name + ".");
   $("w-name").value = "";
   await refreshWallets();
   setActive(name);
+  // A new wallet takes over as the active one, which is the thing a reader
+  // following a walkthrough does not expect and is not told. Say it here,
+  // at the moment it happens, and name what it displaced.
+  say($("w-msg"), "note ok", "Created " + name + ", and " + name + " is now " +
+      "the ACTIVE wallet" + (was && was !== name ? " (it was " + was + ")" : "") +
+      ". The active wallet is the one section 1 funds and the one that pays " +
+      "and receives in section 3" +
+      (was && was !== name ? " — click " + was + " in the list to switch back."
+                           : "."));
 }
 
 /* ---------- pay ---------- */
@@ -680,6 +928,11 @@ async function refreshQuote() {
   const seq = quoteSeq;
   const stale = () => seq !== quoteSeq;
   const amount = parseInt($("p-amount").value, 10);
+  if (authFailure) {
+    say($("p-quote"), "warn bad", "No cost can be checked and nothing can be " +
+        "paid: this page is locked out. See the message at the top.");
+    return;
+  }
   if (!active) { say($("p-quote"), "note", "Pick an active wallet first."); return; }
   if (!mint.running) { say($("p-quote"), "note", "The mint is stopped."); return; }
   if (!(amount > 0)) { say($("p-quote"), "note", "Enter an amount above zero."); return; }
@@ -803,41 +1056,248 @@ async function receiveNow() {
         (x.detail ? ' - ' + esc(x.detail) : '') + '</td></tr>').join("") +
       '</tbody></table>';
   }
+  // Take the accepted lines out of the box and leave the rejected ones in,
+  // so a second press retries only what failed. Resubmitting a token that
+  // was already taken comes back "already spent", which reads like a loss
+  // and is not one.
+  const trim = trimAccepted(tokens, rej);
+  if (trim.ok) {
+    $("r-tokens").value = trim.left.join("\n");
+    if (took && rej.length) {
+      html += '<div class="note">The ' + esc(took) + ' token(s) that were ' +
+        'taken have been removed from the box above; the ' + esc(rej.length) +
+        ' rejected one(s) are still in it. Press Receive again to retry just ' +
+        'those — re-sending a token that was already taken answers "already ' +
+        'spent", which looks like a failure but only means the money is ' +
+        'already here.</div>';
+    }
+  } else if (rej.length) {
+    html += '<div class="note">Nothing was removed from the box above: this ' +
+      'page could not match every rejected token back to a line you pasted, ' +
+      'and dropping a line that was never accepted could throw away the only ' +
+      'copy of it. Delete the accepted ones by hand before pressing Receive ' +
+      'again.</div>';
+  }
   $("r-out").innerHTML = html;
-  if (!rej.length) $("r-tokens").value = "";
   await refreshWallets(); await refreshHistory();
 }
 
+/* app.py truncates a rejected token to this many characters on its way out
+   (gui/app.py: str(item.get("token", ""))[:120]). A key SHORTER than this
+   was returned whole and can only be matched whole. */
+const REJECT_TOKEN_TRUNCATE = 120;
+
+/* Which pasted lines stay in the box, and the rule that makes auto-trimming
+   safe to ship: a token that was NOT accepted is never dropped out of the
+   one place it exists. If any rejected entry cannot be matched back to
+   exactly one line, nothing is removed at all and the caller says so.
+
+   Matching is by whole-line equality first. A bare prefix match is not
+   enough and was a real hazard: with lines ["abcdef", "abc"] and one
+   rejected entry "abc", prefix-first consumed "abcdef" and reported a clean
+   trim, deleting the rejected line and keeping an accepted one. Truncated
+   keys still have to be matched by prefix, so that is a second pass, it
+   applies only to keys that are exactly the truncation length, it requires
+   the line to be strictly longer than the key (a real truncation), and it
+   demands exactly ONE unclaimed candidate -- two candidates is a guess, and
+   a guess here throws away money.
+   Pure, so the rule can be read without running the page. */
+function trimAccepted(submitted, rejected) {
+  const keys = rejected.map(x => String((x && x.token) || ""));
+  const keepAll = () => ({ok: false, left: submitted.slice()});
+  if (keys.some(k => !k)) return keepAll();   // an entry we cannot match at all
+  const taken = submitted.map(() => false);
+  const matched = keys.map(() => -1);
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = 0; j < submitted.length; j++) {
+      if (!taken[j] && submitted[j] === keys[i]) {
+        taken[j] = true; matched[i] = j; break;
+      }
+    }
+  }
+  for (let i = 0; i < keys.length; i++) {
+    if (matched[i] >= 0 || keys[i].length !== REJECT_TOKEN_TRUNCATE) continue;
+    let hit = -1, n = 0;
+    for (let j = 0; j < submitted.length; j++) {
+      if (!taken[j] && submitted[j].length > keys[i].length &&
+          submitted[j].indexOf(keys[i]) === 0) { hit = j; n++; }
+    }
+    if (n === 1) { taken[hit] = true; matched[i] = hit; }
+  }
+  if (!matched.every(m => m >= 0)) return keepAll();
+  const keep = {};
+  for (const m of matched) keep[m] = true;
+  return {ok: true, left: submitted.filter((_, j) => keep[j] === true)};
+}
+
 /* ---------- history ---------- */
+/* Locked out, with the last rows this page genuinely read kept underneath a
+   caveat -- but only if they belong to the wallet that is active now. A
+   table of alice's entries under bob's name would be a worse lie than an
+   empty one. Pure DOM, so setAuthFailure can call it from inside api(). */
+function renderHistoryStale() {
+  const mine = historyHtml && historyName === active;
+  $("h-note").textContent = mine ? historyNote : "";
+  $("h-body").innerHTML = mine
+    ? '<tr><td colspan="4" class="bad"><b>Locked out</b> \u2014 the entries ' +
+      'below are the last ones this page managed to read, not current ones. ' +
+      'See the message at the top.</td></tr>' + historyHtml
+    : '<tr><td colspan="4" class="bad"><b>Not an empty history</b>: this page ' +
+      'is locked out and app.py refused to say what this wallet has done. ' +
+      'See the message at the top.</td></tr>';
+}
+
 async function refreshHistory() {
   const body = $("h-body");
+  $("h-note").textContent = "";
+  if (authFailure) { renderHistoryStale(); return; }
   if (!active) { body.innerHTML = '<tr><td colspan="4">No active wallet.</td></tr>'; return; }
   const r = await api("/api/wallet/history?limit=50&name=" + encodeURIComponent(active));
   if (!r.ok) {
+    if (authFailure) { renderHistoryStale(); return; }
     body.innerHTML = '<tr><td colspan="4" class="bad">' + esc(r.detail) +
       '  [' + esc(r.reason) + ']</td></tr>';
     return;
   }
   const rows = r.data.history || [];
   // The wallet's own schema stores no timestamps, so walletops cannot invent
-  // them. Say that once, rather than print a column of 1970s.
-  if (rows.length && rows.every(h => !h.ts_ms)) {
-    say($("h-out"), "note", "This wallet's database does not record when each " +
-        "entry happened, so the When column is blank. The order is newest first.");
+  // them. Today that is true of every row, but a row WITH a time must not
+  // turn the explanation off and leave the rest showing bare dashes nobody
+  // can account for: the note covers however many are missing, and each
+  // such cell says "not recorded" in words.
+  const missing = rows.filter(h => !h.ts_ms).length;
+  if (missing) {
+    $("h-note").textContent = (missing === rows.length
+      ? "None of these entries has a recorded time: this wallet's database " +
+        "does not store one, so every When cell reads \u201cnot " +
+        "recorded\u201d."
+      : (missing === 1 ? "One entry below has no recorded time"
+                       : missing + " of the " + rows.length +
+                         " entries below have no recorded time") +
+        " — this wallet's database does not store one for every kind of " +
+        "entry, so " + (missing === 1 ? "that cell reads" : "those cells read") +
+        " \u201cnot recorded\u201d rather than showing a time that does " +
+        "not exist.") +
+      " The order is newest first, by the order they were written.";
   }
-  body.innerHTML = rows.length ? rows.map(h =>
-    '<tr><td>' + esc(when(h.ts_ms)) + '</td><td>' + esc(h.kind) +
+  historyHtml = rows.length ? rows.map(h =>
+    '<tr><td>' + esc(h.ts_ms ? when(h.ts_ms) : "not recorded") + '</td><td>' + esc(h.kind) +
     '</td><td class="num">' + esc(h.amount_mc === null ? "-" : mc(h.amount_mc)) +
     '</td><td class="note" style="margin:0">' + esc(h.detail) + '</td></tr>').join("")
-    : '<tr><td colspan="4">Nothing yet.</td></tr>';
+    : "";
+  historyNote = $("h-note").textContent;
+  historyName = active;
+  body.innerHTML = historyHtml || '<tr><td colspan="4">Nothing yet.</td></tr>';
 }
+/* Wallet.recover() returns seven counters: ops_resolved, ops_confirmed,
+   ops_orphaned, outputs_confirmed, outputs_orphaned, inputs_restored,
+   inputs_lost. Printing that dict at an operator was the finding — it puts
+   the word "inputs_lost" in front of someone who has just been told
+   something was interrupted, with nothing to say whether it matters. These
+   are the same numbers in sentences, and the raw dict stays one click away
+   for whoever wants it. Pure: no DOM, no fetch. */
+const RECOVER_KEYS = ["ops_resolved", "ops_confirmed", "ops_orphaned",
+  "outputs_confirmed", "outputs_orphaned", "inputs_restored", "inputs_lost"];
+
+function recoverLines(res, balance) {
+  const unreadable = () =>
+    [["warn bad", "Recovery ran, but this page could not read the summary it " +
+      "produced, so it cannot tell you what changed. The balance is now " +
+      mc(balance) + "; the history below is the record to trust, and the raw " +
+      "counters recovery reported are under the fold."]];
+  if (!res || typeof res !== "object") return unreadable();
+  // All seven counters, each a real whole number that is not negative.
+  // Coercing anything else to zero is how a summary reading
+  // {ops_resolved: "1", inputs_lost: "9"} came out as "Nothing needed
+  // recovering ... nothing was changed" -- a confident wrong answer where
+  // "this page could not read it" was sitting right there and is true.
+  for (const k of RECOVER_KEYS) {
+    const v = res[k];
+    if (typeof v !== "number" || !isFinite(v) || v < 0 ||
+        Math.floor(v) !== v) return unreadable();
+  }
+  const num = k => res[k];
+  const n = (v, one, many) => v + " " + (v === 1 ? one : many);
+  const resolved = num("ops_resolved");
+  if (!resolved) {
+    return [["note ok", "Nothing needed recovering. This wallet had no " +
+             "payment left half-finished by a crash or a dropped connection, " +
+             "so nothing was changed and the balance is still " +
+             mc(balance) + "."]];
+  }
+  // "That payment" / "All three of them" / "2 of them", so the sentences
+  // read as English at every count instead of as a counter with a word
+  // after it.
+  const share = v => (v === resolved
+    ? (resolved === 1 ? "That payment" : "All " + resolved + " of them")
+    : v + " of them");
+  const out = [["note", "Found " + n(resolved, "payment", "payments") +
+    " left half-finished, asked the mint what had really happened to " +
+    (resolved === 1 ? "it" : "each of them") + ", and settled the wallet to " +
+    "match. The balance is now " + mc(balance) + "."]];
+  if (num("ops_confirmed")) {
+    const c = num("ops_confirmed"), o = num("outputs_confirmed");
+    out.push(["note ok", share(c) + " had in fact gone through at the mint " +
+      "before the interruption, so the wallet now records " +
+      (c === 1 ? "it" : "them") + " as complete. " +
+      n(o, "coin", "coins") + " from " + (c === 1 ? "it" : "them") +
+      (o === 1 ? " can" : " can") + " be spent from here; any coin whose " +
+      "token string had already been handed to someone else is marked as " +
+      "gone, because it is."]);
+  }
+  if (num("ops_orphaned")) {
+    const o = num("ops_orphaned");
+    out.push(["note", share(o) + " never reached the mint at all, so " +
+      (o === 1 ? "it" : "they") + " did not happen and " +
+      (o === 1 ? "is" : "are") + " now marked failed. Nothing was paid out " +
+      "by " + (o === 1 ? "it" : "them") + "."]);
+  }
+  if (num("outputs_orphaned")) {
+    const o = num("outputs_orphaned"), oo = num("ops_orphaned");
+    out.push(["note", n(o, "coin", "coins") + " that " +
+      (oo === 1 ? "that payment" : "those payments") + " would have created " +
+      (o === 1 ? "was" : "were") + " never made by the mint, so this wallet " +
+      "has stopped counting " + (o === 1 ? "it" : "them") + ". Nothing went " +
+      "missing with " + (o === 1 ? "it" : "them") + ": " +
+      (o === 1 ? "it" : "they") + " never existed. What this wallet had set " +
+      "aside to pay for " + (o === 1 ? "it" : "them") + " is accounted for by " +
+      "the restored and lost counts below."]);
+  }
+  if (num("inputs_restored")) {
+    const v = num("inputs_restored");
+    out.push(["note ok", n(v, "coin", "coins") + " that had been held back " +
+      "for " + (num("ops_orphaned") === 1 ? "that payment" : "those payments") +
+      (v === 1 ? " is" : " are") + " spendable again, and counted in the " +
+      "balance above."]);
+  }
+  if (num("inputs_lost")) {
+    out.push(["warn bad", "Worth a second look: " +
+      n(num("inputs_lost"), "coin", "coins") + " this wallet was holding can " +
+      "no longer be spent from here. The mint reports " +
+      (num("inputs_lost") === 1 ? "it" : "them") + " as already spent, or " +
+      "cannot say. Nothing was destroyed by the recovery itself — the wallet " +
+      "has stopped counting money it cannot spend, which is the honest " +
+      "balance. That is exactly what you would see if the interrupted " +
+      "payment did go out after all, or if that token string was redeemed " +
+      "somewhere else. If you cannot account for a payment of that size, the " +
+      "history below is where to look."]);
+  } else {
+    out.push(["note ok", "Nothing was lost: every coin this wallet was " +
+      "holding is still accounted for."]);
+  }
+  return out;
+}
+
 async function recoverNow() {
   busy = true; working($("h-recover"), "recovering...");
   const r = await api("/api/wallet/recover", {name: active});
   busy = false; done($("h-recover"));
   if (!r.ok) { fail($("h-out"), r); return; }
-  say($("h-out"), "note ok", "Recovery done. Balance " + mc(r.data.balance_mc) +
-      ". " + JSON.stringify(r.data.result));
+  $("h-out").innerHTML =
+    recoverLines(r.data.result, r.data.balance_mc)
+      .map(l => '<div class="' + l[0] + '">' + esc(l[1]) + '</div>').join("") +
+    '<details><summary>The raw counters recovery reported</summary><pre>' +
+    esc(JSON.stringify(r.data.result, null, 2)) + '</pre></details>';
   await refreshWallets(); await refreshHistory();
 }
 
@@ -861,10 +1321,19 @@ $("m-refresh").addEventListener("click", refreshAll);
 $("m-logs-refresh").addEventListener("click", refreshLogs);
 $("m-logbox").addEventListener("toggle", () => { if ($("m-logbox").open) refreshLogs(); });
 $("f-go").addEventListener("click", issueInto);
+// Picking here is picking the active wallet: one concept, two places to
+// say it. setActive re-renders, which puts this select back in step.
+$("f-wallet").addEventListener("change", () => {
+  const picked = $("f-wallet").value;
+  if (picked && picked !== active) setActive(picked);
+});
 $("w-create").addEventListener("click", createWallet);
 $("w-name").addEventListener("keydown", e => { if (e.key === "Enter") createWallet(); });
 $("p-amount").addEventListener("input", scheduleQuote);
-$("p-to").addEventListener("change", scheduleQuote);
+$("p-to").addEventListener("change", () => {
+  payTargetChosen = true;       // a human picked; from here the page follows
+  scheduleQuote();
+});
 for (const id of ["m-id", "m-baseline", "m-port", "m-rate", "m-cap", "m-exempt"]) {
   $(id).addEventListener("input", () => { settingsEdited = true; });
 }
@@ -875,9 +1344,14 @@ $("h-refresh").addEventListener("click", refreshHistory);
 $("h-recover").addEventListener("click", recoverNow);
 $("t-go").addEventListener("click", lookupToken);
 
+renderAuthBanner();      // hides it explicitly; nothing has failed yet
 refreshAll().then(refreshQuote);
-setInterval(() => { if (!busy) { refreshMint(); refreshWallets(); } }, 4000);
-setInterval(() => { if (mint.running) $("hdr-state").textContent =
+// The poll stops while locked out: hammering a server that will keep
+// answering 401 buys nothing, and the banner would flicker over the
+// operator's reading of it. Refresh re-tries by hand, and a single
+// success clears the banner and starts the poll answering again.
+setInterval(() => { if (!busy && !authFailure) { refreshMint(); refreshWallets(); } }, 4000);
+setInterval(() => { if (mint.running && !authFailure) $("hdr-state").textContent =
   (mint.mint_id || "mint") + "  .  " + (mint.base_url || "") + "  .  up " +
   since(mint.started_at_ms); }, 1000);
 </script></body></html>

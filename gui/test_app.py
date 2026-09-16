@@ -7,8 +7,17 @@ Three kinds of test, because this component has three kinds of claim.
     sockets so the tests can send the headers a browser sends and the ones
     an attacker sends. The two components app.py talks to are faked here
     ON PURPOSE (mintctl.py and walletops.py have their own test files):
-    what is under test is the HTTP skin — the origin controls, the error
-    envelope, input validation, credential redaction.
+    what is under test is the HTTP skin — authentication, the origin
+    controls, the error envelope, input validation, credential redaction.
+
+    Every one of these runs AUTHENTICATED: ServerCase performs the real
+    key-for-cookie exchange in setUpClass and carries the cookie on every
+    request, exactly as a browser would. That is deliberate: exactly ONE
+    test in this file starts a server with --no-auth
+    (test_no_auth_opens_the_api_and_shouts_about_it), and one more starts
+    one with no flags at all to prove authentication is what you get by
+    default. A suite that passed --no-auth everywhere would be testing a
+    server nobody ships.
 
   * THE PAGE. page.html's real JavaScript, executed under a small DOM by
     node, against a fake GUI API. This is the only way to test the page's
@@ -24,6 +33,8 @@ Run:  cd <repo> && python3 -m unittest gui.test_app -v
 """
 import errno
 import http.client
+import inspect
+import io
 import json
 import os
 import shutil
@@ -31,8 +42,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
+import tokenize
 import types
 import unittest
 
@@ -226,6 +239,48 @@ def raw_request(port, text, wait=5.0):
         sock.close()
 
 
+def http_call(port, method, path, body=None, headers=None,
+              host="127.0.0.1", timeout=10):
+    """One request through http.client; returns (status, headers, body).
+
+    Headers come back because two things this file has to prove live in
+    them: that a correct key is answered with a Set-Cookie, and that a
+    wrong one is answered with none.
+    """
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    payload = None if body is None else json.dumps(body)
+    head = {"Accept": "application/json"}
+    if payload is not None:
+        head["Content-Type"] = "application/json"
+    head.update(headers or {})
+    conn.request(method, path, payload, head)
+    response = conn.getresponse()
+    raw = response.read()
+    got = {k.lower(): v for k, v in response.getheaders()}
+    conn.close()
+    return response.status, got, raw
+
+
+def exchange_cookie(httpd, host="127.0.0.1"):
+    """The real thing a browser does with the URL printed on the terminal.
+
+    GET / with the capability key, keep the session cookie, throw the key
+    away. Every authenticated test below starts here; none of them is
+    handed a credential the server did not actually issue.
+    """
+    port = httpd.server_address[1]
+    # Connection: close so the server hangs up when it is done rather than
+    # holding a keep-alive socket this helper will never use again.
+    status, headers, raw = http_call(port, "GET", "/?k=" + httpd.auth.key,
+                                     headers={"Connection": "close"},
+                                     host=host)
+    assert status == 200, "the capability URL did not open the page: %d %r" % (
+        status, raw[:200])
+    cookie = headers.get("set-cookie", "")
+    assert cookie, "a correct key was not answered with a session cookie"
+    return cookie.split(";")[0]
+
+
 def split_response(raw):
     head, _, body = raw.partition(b"\r\n\r\n")
     lines = head.decode("iso-8859-1").split("\r\n")
@@ -255,6 +310,9 @@ class ServerCase(unittest.TestCase):
         # serve() binds one handler class per server; the Api is on that.
         cls.api = cls.httpd.RequestHandlerClass.api
         cls.control = cls.api.components.mint()
+        # Authenticate the way the operator's browser does, once, and carry
+        # the cookie from here on. Nothing below fakes a credential.
+        cls.cookie = exchange_cookie(cls.httpd)
 
     @classmethod
     def tearDownClass(cls):
@@ -269,21 +327,19 @@ class ServerCase(unittest.TestCase):
         self.control.running = True
 
     # -- helpers --------------------------------------------------------
-    def call(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        payload = None if body is None else json.dumps(body)
-        head = {"Accept": "application/json"}
-        if payload is not None:
-            head["Content-Type"] = "application/json"
-        head.update(headers or {})
-        conn.request(method, path, payload, head)
-        response = conn.getresponse()
-        raw = response.read()
-        conn.close()
+    def fetch(self, method, path, body=None, headers=None, cookie=True):
+        """(status, headers, body). ``cookie=False`` sends no credential."""
+        head = dict(headers or {})
+        if cookie and "Cookie" not in head:
+            head["Cookie"] = self.cookie
+        return http_call(self.port, method, path, body, head)
+
+    def call(self, method, path, body=None, headers=None, cookie=True):
+        status, _headers, raw = self.fetch(method, path, body, headers, cookie)
         try:
-            return response.status, json.loads(raw or b"{}"), raw
+            return status, json.loads(raw or b"{}"), raw
         except ValueError:
-            return response.status, None, raw
+            return status, None, raw
 
     def assert_envelope(self, status, obj, raw):
         self.assertGreaterEqual(status, 400)
@@ -350,19 +406,592 @@ class TestOriginControls(ServerCase):
             self.assertEqual(status, 200, raw[:200])
 
     def test_missing_host_header_is_refused(self):
-        raw = raw_request(self.port,
-                          "GET /api/mint/status HTTP/1.0\r\n\r\n")
+        raw = raw_request(
+            self.port,
+            "GET /api/mint/status HTTP/1.0\r\nCookie: %s\r\n\r\n"
+            % self.cookie)
         status, _headers, body = split_response(raw)
-        self.assertEqual(status, 421, body[:200])
+        self.assertEqual(status, 403, body[:200])
         self.assertEqual(json.loads(body)["error"]["reason"], "not_loopback")
 
     def test_foreign_host_header_is_refused(self):
         raw = raw_request(
             self.port,
             "GET /api/mint/status HTTP/1.1\r\nHost: mint.evil.example\r\n"
-            "Connection: close\r\n\r\n")
+            "Cookie: %s\r\nConnection: close\r\n\r\n" % self.cookie)
         status, _headers, body = split_response(raw)
-        self.assertEqual(status, 421, body[:200])
+        self.assertEqual(status, 403, body[:200])
+        self.assertEqual(json.loads(body)["error"]["reason"], "not_loopback")
+
+
+class TestAuthentication(ServerCase):
+    """The finding this round exists for.
+
+    Before this, anyone who could reach the port could mint money and spend
+    every wallet in the workdir: loopback was the whole boundary, and
+    loopback does not separate two users of a machine, does not stop any
+    other local process, and does not stop a web page in the operator's own
+    browser from fetching 127.0.0.1.
+
+    Every test below deletes exactly one defence's reason to exist. If the
+    check it names is removed from app.py, the test fails; if it is
+    weakened (a `==` instead of compare_digest, a prefix match instead of an
+    exact origin, a `k` accepted on an API route), it still fails.
+    """
+
+    def key(self):
+        return self.httpd.auth.key
+
+    # -- 3. every /api/* route needs the cookie -------------------------
+    def test_an_api_get_with_no_cookie_is_401(self):
+        """GET, not only POST. /api/wallet/list names every wallet and its
+        balance, /api/mint/logs is the mint's log: reading is not harmless."""
+        for path in ("/api/mint/status", "/api/wallet/list",
+                     "/api/mint/logs?lines=50", "/api/mint/descriptor",
+                     "/api/wallet/summary?name=alice",
+                     "/api/wallet/history?name=alice"):
+            with self.subTest(path=path):
+                status, obj, raw = self.call("GET", path, cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "unauthorized")
+                self.assert_envelope(status, obj, raw)
+
+    def test_an_api_post_with_no_cookie_is_401_and_moves_nothing(self):
+        for path, body in (
+                ("/api/wallet/pay", {"name": "alice", "amount_mc": 11}),
+                ("/api/wallet/receive", {"name": "alice", "tokens": ["x"]}),
+                ("/api/wallet/quote", {"name": "alice", "amount_mc": 11}),
+                ("/api/wallet/recover", {"name": "alice"}),
+                ("/api/wallet/create", {"name": "mallory"}),
+                ("/api/mint/issue", {"amount_mc": 10, "count": 1}),
+                ("/api/mint/start", {"mint_id": "evil",
+                                     "baseline_model_class": "b", "port": 1,
+                                     "rate_ppm": 0, "cap_mc": 0,
+                                     "exempt_below_mc": 0}),
+                ("/api/mint/stop", {"drain_seconds": 0})):
+            with self.subTest(path=path):
+                status, obj, raw = self.call("POST", path, body, cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "unauthorized")
+        self.assertEqual(FakeWalletOps.calls, [],
+                         "an unauthenticated request reached a wallet")
+        self.assertEqual(self.control.stopped, [])
+        self.assertEqual(self.control.started, [])
+        self.assertTrue(self.control.running)
+        self.assertNotIn("mallory", self.api.wallet_names())
+
+    def test_every_route_in_the_table_is_behind_the_cookie(self):
+        """Not a sample: the whole ROUTES table, so a route added later
+        cannot quietly ship unprotected."""
+        self.assertTrue(gui_app.ROUTES)
+        for method, path in sorted(gui_app.ROUTES):
+            with self.subTest(route="%s %s" % (method, path)):
+                status, obj, raw = self.call(method, path, {}, cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "unauthorized")
+
+    # -- 2/3. the key opens the page, never the API ---------------------
+    def test_the_key_in_a_query_string_does_not_open_the_api(self):
+        """A URL ends up in history files, proxy logs, Referer headers and
+        over a shoulder. It is spent once on a cookie and then retired."""
+        key = self.key()
+        for method, path, body in (
+                ("GET", "/api/wallet/list?k=" + key, None),
+                ("GET", "/api/mint/status?k=" + key, None),
+                ("POST", "/api/wallet/pay?k=" + key,
+                 {"name": "alice", "amount_mc": 11}),
+                ("POST", "/api/mint/issue?k=" + key,
+                 {"amount_mc": 10, "count": 1})):
+            with self.subTest(path=path):
+                status, obj, raw = self.call(method, path, body, cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "unauthorized")
+                self.assertNotIn(key.encode(), raw)
+        self.assertEqual(FakeWalletOps.calls, [])
+        # ...and the very same key does open the page.
+        status, _obj, raw = self.call("GET", "/?k=" + key, cookie=False)
+        self.assertEqual(status, 200, raw[:200])
+
+    # -- 2. the cookie exchange ------------------------------------------
+    def test_a_correct_key_is_answered_with_a_locked_down_cookie(self):
+        status, headers, raw = self.fetch("GET", "/?k=" + self.key(),
+                                          cookie=False)
+        self.assertEqual(status, 200, raw[:200])
+        cookie = headers.get("set-cookie", "")
+        name, _, rest = cookie.partition("=")
+        self.assertEqual(name, gui_app.SESSION_COOKIE)
+        value = rest.split(";")[0]
+        lowered = cookie.lower()
+        for attribute in ("httponly", "samesite=strict", "path=/"):
+            self.assertIn(attribute, lowered, cookie)
+        # The session is its own secret. If it were the key, or built from
+        # it, one leaked cookie would hand over the other credential too.
+        self.assertNotEqual(value, self.key())
+        self.assertNotIn(value, self.key())
+        self.assertNotIn(self.key(), value)
+        self.assertGreaterEqual(len(value), 32)
+        # and it actually works
+        status, _obj, raw = self.call("GET", "/api/mint/status", None,
+                                      {"Cookie": "%s=%s" % (name, value)},
+                                      cookie=False)
+        self.assertEqual(status, 200, raw[:200])
+
+    def test_a_wrong_key_is_401_and_is_handed_no_cookie(self):
+        """The one that catches a `==` softened into `startswith`, or a
+        missing key treated as a match."""
+        key = self.key()
+        for path in ("/", "/index.html", "/?k=", "/?k=wrong",
+                     "/?k=" + key[:-1], "/?k=" + key + "x",
+                     "/?k=" + key.upper(), "/?j=" + key):
+            with self.subTest(path=path):
+                status, headers, raw = self.fetch("GET", path, cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertNotIn("set-cookie", headers,
+                                 "a session was issued for a wrong key")
+                self.assertIn(b"terminal", raw)
+                self.assertNotIn(key.encode(), raw)
+
+    def test_a_reload_without_the_key_still_works_and_re_issues_nothing(self):
+        """The browser drops the query string as soon as the operator
+        navigates. A reload must not send them back to the terminal, and
+        must not hand out a second credential for the same browser."""
+        status, headers, raw = self.fetch("GET", "/")
+        self.assertEqual(status, 200, raw[:200])
+        self.assertNotIn("set-cookie", headers,
+                         "a browser that already has a session was issued "
+                         "another one")
+
+    def test_a_second_browser_gets_its_own_session_and_both_work(self):
+        second = exchange_cookie(self.httpd)
+        self.assertNotEqual(second, self.cookie)
+        for cookie in (self.cookie, second):
+            status, _obj, raw = self.call("GET", "/api/mint/status", None,
+                                          {"Cookie": cookie}, cookie=False)
+            self.assertEqual(status, 200, raw[:200])
+
+    def test_a_forged_or_stale_cookie_is_401(self):
+        for value in ("", "nope", "a" * 43, self.key(),
+                      self.cookie.split("=", 1)[1][:-1]):
+            with self.subTest(value=value[:12]):
+                status, obj, raw = self.call(
+                    "GET", "/api/mint/status", None,
+                    {"Cookie": "%s=%s" % (gui_app.SESSION_COOKIE, value)},
+                    cookie=False)
+                self.assertEqual(status, 401, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "unauthorized")
+
+    def test_a_shadow_cookie_cannot_displace_the_real_one(self):
+        """A page that cannot read our cookie can still try to set another
+        with the same name. Checking only the first value sent would let
+        that log the operator out -- or worse, be the value checked."""
+        status, _obj, raw = self.call(
+            "GET", "/api/mint/status", None,
+            {"Cookie": "%s=forged; %s" % (gui_app.SESSION_COOKIE, self.cookie)},
+            cookie=False)
+        self.assertEqual(status, 200, raw[:200])
+
+    # -- 4. Host: the DNS-rebinding defence -----------------------------
+    def test_a_foreign_host_is_403_even_with_a_valid_cookie(self):
+        """The attack the bind address does not stop: evil.example resolves
+        its own name to 127.0.0.1, so the packets ARE loopback packets. The
+        Host header is the one thing the attacker cannot change."""
+        for host in ("evil.example.com", "evil.example.com:%d" % self.port,
+                     "127.0.0.1.evil.example.com", "localhost.evil.example",
+                     "evil.example.com:80", "mint.internal", "127.0.0.2"):
+            with self.subTest(host=host):
+                status, obj, raw = self.call("GET", "/api/wallet/list", None,
+                                             {"Host": host})
+                self.assertEqual(status, 403, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "not_loopback")
+        # a POST that would have moved money, with the same good cookie
+        status, obj, raw = self.call("POST", "/api/wallet/pay",
+                                     {"name": "alice", "amount_mc": 11},
+                                     {"Host": "evil.example.com"})
+        self.assertEqual(status, 403, raw[:200])
+        self.assertEqual(FakeWalletOps.calls, [])
+        # and the page is not reachable under a foreign name either, so the
+        # rebinding page cannot even fetch the exchange for itself
+        status, headers, raw = self.fetch("GET", "/?k=" + self.key(), None,
+                                          {"Host": "evil.example.com"},
+                                          cookie=False)
+        self.assertEqual(status, 403, raw[:200])
+        self.assertNotIn("set-cookie", headers)
+
+    def test_a_loopback_literal_with_junk_after_it_is_403(self):
+        """An "optional :port" means a port, not "anything at all".
+
+        The tempting way to write the Host check is to validate the part
+        before the colon (or before the "]") and let the rest through. That
+        accepts every host below: each one opens with a real loopback
+        literal and then carries a foreign name, so a check that stops at
+        the separator says yes. Whether a browser can be made to send one
+        is not the point -- the pinned rule is a literal plus an optional
+        numeric port, and anything wider is an accepted-host space nobody
+        chose.
+        """
+        for host in ("127.0.0.1:%d.evil.example" % self.port,
+                     "127.0.0.1:evil.example",
+                     "127.0.0.1:not-a-port",
+                     "127.0.0.1:",
+                     "localhost:evil.example",
+                     "localhost:80/../x",
+                     "localhost:%d:9" % self.port,
+                     "[::1]evil.example",
+                     "[::1].evil.example",
+                     "[::1]:%d@evil.example" % self.port,
+                     "[::1]:%d.evil.example" % self.port,
+                     "[::1]:",
+                     "::1:%d" % self.port,
+                     "::1.evil.example"):
+            with self.subTest(host=host):
+                status, obj, raw = self.call("GET", "/api/wallet/list", None,
+                                             {"Host": host})
+                self.assertEqual(status, 403, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "not_loopback")
+        # and it is a gate, not a label: the POST never reaches the route
+        status, _obj, raw = self.call(
+            "POST", "/api/wallet/pay", {"name": "alice", "amount_mc": 11},
+            {"Host": "127.0.0.1:%d.evil.example" % self.port})
+        self.assertEqual(status, 403, raw[:200])
+        self.assertEqual(FakeWalletOps.calls, [])
+
+    def test_the_loopback_literals_are_accepted(self):
+        for host in ("127.0.0.1", "127.0.0.1:%d" % self.port, "localhost",
+                     "localhost:%d" % self.port, "LocalHost", "[::1]",
+                     "[::1]:%d" % self.port, "::1"):
+            with self.subTest(host=host):
+                status, _obj, raw = self.call("GET", "/api/mint/status", None,
+                                              {"Host": host})
+                self.assertEqual(status, 200, raw[:200])
+
+    # -- 5. Origin and Referer ------------------------------------------
+    def test_a_foreign_origin_is_403_even_with_a_valid_cookie(self):
+        for origin in ("http://evil.example.com",
+                       "https://evil.example.com",
+                       "http://127.0.0.1.evil.example.com",
+                       "http://127.0.0.1:9",
+                       "https://127.0.0.1:%d" % self.port,
+                       "null"):
+            with self.subTest(origin=origin):
+                status, obj, raw = self.call("GET", "/api/wallet/list", None,
+                                             {"Origin": origin})
+                self.assertEqual(status, 403, raw[:200])
+                self.assertEqual(obj["error"]["reason"], "cross_site")
+        status, obj, raw = self.call("POST", "/api/wallet/pay",
+                                     {"name": "alice", "amount_mc": 11},
+                                     {"Origin": "http://evil.example.com"})
+        self.assertEqual(status, 403, raw[:200])
+        self.assertEqual(FakeWalletOps.calls, [])
+
+    def test_a_foreign_referer_is_403_and_our_own_is_allowed(self):
+        status, obj, raw = self.call("GET", "/api/wallet/list", None,
+                                     {"Referer": "http://evil.example.com/go"})
+        self.assertEqual(status, 403, raw[:200])
+        self.assertEqual(obj["error"]["reason"], "cross_site")
+        status, _obj, raw = self.call(
+            "GET", "/api/wallet/list", None,
+            {"Referer": "http://127.0.0.1:%d/" % self.port})
+        self.assertEqual(status, 200, raw[:200])
+
+    def test_no_origin_and_no_referer_with_a_valid_cookie_is_allowed(self):
+        """Absent must stay allowed: a same-origin fetch omits Origin on a
+        GET, this server sends Referrer-Policy: no-referrer, and curl sends
+        neither. Refusing an absent header would break the shipped page."""
+        status, _obj, raw = self.call("GET", "/api/wallet/list")
+        self.assertEqual(status, 200, raw[:200])
+        status, _obj, raw = self.call("POST", "/api/wallet/pay",
+                                      {"name": "alice", "amount_mc": 7})
+        self.assertEqual(status, 200, raw[:200])
+        self.assertIn(("pay", "alice", 7), FakeWalletOps.calls)
+
+    # -- 1. neither secret ever leaves this process ---------------------
+    def test_neither_credential_appears_in_any_response_body(self):
+        key, session = self.key(), self.cookie.split("=", 1)[1]
+        for method, path, body, cookie in (
+                ("GET", "/", None, True),
+                ("GET", "/", None, False),
+                ("GET", "/?k=" + key, None, False),
+                ("GET", "/api/mint/status", None, True),
+                ("GET", "/api/mint/status", None, False),
+                ("GET", "/api/wallet/list", None, True),
+                ("GET", "/api/mint/logs?lines=50", None, True),
+                ("GET", "/api/nope?k=" + key, None, True),
+                ("GET", "/api/wallet/summary?name=" + key, None, True),
+                ("POST", "/api/wallet/pay",
+                 {"name": "alice", "amount_mc": 1}, True),
+                ("PUT", "/api/mint/status", None, True)):
+            with self.subTest(path=path, cookie=cookie):
+                _s, _o, raw = self.call(method, path, body, cookie=cookie)
+                self.assertNotIn(key.encode(), raw, "the key came back")
+                self.assertNotIn(session.encode(), raw, "the session came back")
+
+    def test_a_component_that_quotes_a_credential_cannot_leak_it(self):
+        """Nothing here serialises either secret on purpose. Component
+        error messages are pasted through verbatim, though, and one of them
+        could quote a command line -- so they are scrubbed on the way out,
+        the same way the mint's admin token is."""
+        key = self.key()
+        FakeWalletOps.fail_with = FakeWalletOpsError(
+            "leaky", "the operator ran: curl 'http://127.0.0.1/?k=%s'" % key)
+        status, obj, raw = self.call("POST", "/api/wallet/pay",
+                                     {"name": "alice", "amount_mc": 1})
+        self.assertEqual(status, 400, raw[:200])
+        self.assertNotIn(key.encode(), raw)
+        self.assertIn(b"[credential redacted]", raw)
+
+    def test_neither_credential_is_written_under_the_workdir(self):
+        key, session = self.key(), self.cookie.split("=", 1)[1]
+        for method, path, body in (
+                ("POST", "/api/mint/start",
+                 {"mint_id": "leak-check", "baseline_model_class": "b",
+                  "port": 8787, "rate_ppm": 0, "cap_mc": 0,
+                  "exempt_below_mc": 0}),
+                ("GET", "/api/wallet/list", None),
+                ("POST", "/api/wallet/pay", {"name": "alice", "amount_mc": 1})):
+            self.call(method, path, body)
+        seen = 0
+        for root, _dirs, files in os.walk(self.workdir):
+            for name in files:
+                full = os.path.join(root, name)
+                self.assertNotIn(key, name)
+                self.assertNotIn(session, name)
+                with open(full, "rb") as handle:
+                    blob = handle.read()
+                self.assertNotIn(key.encode(), blob, full)
+                self.assertNotIn(session.encode(), blob, full)
+                seen += 1
+        self.assertGreater(seen, 0, "nothing was written at all; vacuous")
+
+
+    def test_a_non_ascii_credential_is_an_answer_not_a_crash(self):
+        """The gate must not raise on anything a stranger can send.
+
+        hmac.compare_digest raises TypeError on a str holding a non-ASCII
+        character, and BOTH values compared in the gate are
+        attacker-supplied: the ?k= of an unauthenticated GET and the Cookie
+        header of every request. Before this was fixed, `GET /?k=%C3%A9`
+        raised inside _authorize, fell through the handler's catch-all and
+        answered 500 with a traceback on stderr -- a crash in the
+        authentication path that any process able to open a socket could
+        produce at will, unauthenticated, in one request.
+
+        It failed CLOSED, which is why this is 401-vs-500 and not a bypass.
+        It is still a defect: an unauthenticated stranger should not be able
+        to drive an exception through the gate at all.
+        """
+        for raw, label in ((b"%C3%A9", "e-acute"),
+                           (b"%F0%9F%98%80", "emoji"),
+                           (b"%ED%A0%80", "lone surrogate"),
+                           (b"%FF%FE", "not valid utf-8"),
+                           (b"%C3%A9%C3%A9%C3%A9", "several")):
+            with self.subTest(key=label):
+                request = (b"GET /?k=" + raw + b" HTTP/1.1\r\n"
+                           b"Host: 127.0.0.1:%d\r\n"
+                           b"Connection: close\r\n\r\n"
+                           % self.port)
+                status, headers, _body = split_response(
+                    raw_request(self.port, request))
+                self.assertEqual(
+                    status, 401,
+                    "a non-ASCII key answered %d, not 401: the comparison "
+                    "raised instead of returning False" % status)
+                self.assertNotIn(
+                    "set-cookie", headers,
+                    "a non-ASCII key was answered with a session cookie")
+
+    def test_a_non_ascii_cookie_is_an_answer_not_a_crash(self):
+        """The same hole, reached through the Cookie header instead.
+
+        This one matters more than the ?k= case: the cookie is checked on
+        EVERY route, so before the fix any local process could 500 every
+        API route of this GUI without holding any credential at all.
+        """
+        for value, label in (("\u00e9", "e-acute"),
+                             ("\U0001f600", "emoji"),
+                             (self.cookie.split("=", 1)[1] + "\u00e9",
+                              "real session plus one non-ASCII char")):
+            with self.subTest(cookie=label):
+                request = (
+                    "GET /api/wallet/list HTTP/1.1\r\n"
+                    "Host: 127.0.0.1:%d\r\n"
+                    "Cookie: %s=%s\r\n"
+                    "Connection: close\r\n\r\n"
+                    % (self.port, gui_app.SESSION_COOKIE, value)
+                ).encode("utf-8")
+                status, _headers, body = split_response(
+                    raw_request(self.port, request))
+                self.assertEqual(
+                    status, 401,
+                    "a non-ASCII cookie answered %d, not 401 (%r)"
+                    % (status, body[:200]))
+                self.assertEqual(
+                    json.loads(body or b"{}")["error"]["reason"],
+                    "unauthorized")
+
+    def test_a_non_ascii_cookie_does_not_reach_a_money_route(self):
+        """Proof the above is a gate and not a label on a crash.
+
+        A 500 from the catch-all and a 401 from the gate are both
+        non-200; only this says the route body never ran.
+        """
+        body = json.dumps({"from": "alice", "to": "bob", "amount_mc": 5})
+        request = (
+            "POST /api/wallet/pay HTTP/1.1\r\n"
+            "Host: 127.0.0.1:%d\r\n"
+            "Cookie: %s=\u00e9\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s"
+            % (self.port, gui_app.SESSION_COOKIE, len(body), body)
+        ).encode("utf-8")
+        status, _headers, out = split_response(raw_request(self.port, request))
+        self.assertEqual(status, 401)
+        self.assertEqual(FakeWalletOps.calls, [],
+                         "a request with a non-ASCII cookie reached "
+                         "walletops; the gate did not stop it")
+
+    def test_secret_eq_returns_false_rather_than_raising(self):
+        """The helper itself, on the inputs that used to raise."""
+        good = "k" * 43
+        for other in ("\u00e9", "\U0001f600", "\ud800", good + "\u00e9",
+                      "\u00e9" + good, "e\u0301"):
+            with self.subTest(value=repr(other)):
+                self.assertIs(gui_app._secret_eq(good, other), False)
+                self.assertIs(gui_app._secret_eq(other, good), False)
+        # and it still says True for the one case that should be True
+        self.assertIs(gui_app._secret_eq(good, good), True)
+        # non-str, empty, None: False, never a raise
+        for junk in (None, b"x", 5, [], {}, "", 0, True):
+            with self.subTest(value=repr(junk)):
+                self.assertIs(gui_app._secret_eq(good, junk), False)
+                self.assertIs(gui_app._secret_eq(junk, good), False)
+
+
+def code_tokens(func):
+    """``func``'s source as tokens, with comments and strings dropped.
+
+    Dropping them is the whole point: _Auth.session_ok *discusses* ``==``
+    in a comment explaining why it does not use one, so a substring search
+    over the source text cannot tell an explanation from an
+    implementation. Tokens can.
+    """
+    source = textwrap.dedent(inspect.getsource(func))
+    skip = {tokenize.COMMENT, tokenize.STRING, tokenize.NL, tokenize.NEWLINE,
+            tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}
+    return code_tokens_of_source(source)
+
+
+def code_tokens_of_source(source):
+    """``source`` as tokens, with comments and strings dropped.
+
+    Same reason as code_tokens: gui/app.py's own docstrings and comments
+    discuss ``==`` and name compare_digest while explaining why they are
+    not used, so only a token stream can count real call sites.
+    """
+    skip = {tokenize.COMMENT, tokenize.STRING, tokenize.NL, tokenize.NEWLINE,
+            tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}
+    return [tok for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type not in skip]
+
+
+class TestAuthInternals(unittest.TestCase):
+    """Two claims about _Auth that a request cannot observe from outside.
+
+    Both were holes the round's own review found: the suite could not tell
+    ``hmac.compare_digest`` from ``==`` (a mutation run proved it: both
+    substitutions left every test green), and the session cap had no test
+    at all. Neither is reachable through HTTP -- one is a timing property,
+    the other needs 30-odd exchanges to observe -- so they are checked here,
+    directly, rather than pretended at through the socket.
+    """
+
+    def test_the_secrets_are_compared_with_compare_digest_not_equals(self):
+        """A source-level check, and deliberately not a timing measurement.
+
+        Timing a comparison from Python is noise at this scale; what can be
+        stated exactly is the thing the design actually pins, which is that
+        these two functions call hmac.compare_digest and never put a secret
+        on either side of ``==``. Without this, a future edit can quietly put
+        ``presented == self.key`` back and ship green -- which is exactly
+        what the mutation run found.
+        """
+        # The comparison now lives in one helper, _secret_eq, because a
+        # bare compare_digest on a str RAISES on any non-ASCII character
+        # and every value compared here is attacker-supplied. So this
+        # asserts two things, not one: the two callers delegate to that
+        # helper and compare nothing themselves, and the helper is the
+        # constant-time, encode-first comparison it claims to be.
+        for func in (gui_app._Auth.key_ok, gui_app._Auth.session_ok):
+            with self.subTest(func=func.__name__):
+                tokens = code_tokens(func)
+                names = [t.string for t in tokens if t.type == tokenize.NAME]
+                ops = [t.string for t in tokens if t.type == tokenize.OP]
+                self.assertIn(
+                    "_secret_eq", names,
+                    "%s does not route its comparison through _secret_eq, "
+                    "which is the only place a secret is compared in "
+                    "constant time AND without raising on non-ASCII"
+                    % func.__name__)
+                for operator in ("==", "!="):
+                    self.assertNotIn(
+                        operator, ops,
+                        "%s compares with %s; secrets are compared with "
+                        "hmac.compare_digest, in constant time, or the "
+                        "wrong guess is distinguishable from the nearly "
+                        "right one by how long the answer takes"
+                        % (func.__name__, operator))
+
+        helper = code_tokens(gui_app._secret_eq)
+        names = [t.string for t in helper if t.type == tokenize.NAME]
+        ops = [t.string for t in helper if t.type == tokenize.OP]
+        self.assertIn("compare_digest", names,
+                      "_secret_eq does not call hmac.compare_digest")
+        self.assertIn(
+            "encode", names,
+            "_secret_eq must encode both sides before comparing them: "
+            "hmac.compare_digest raises TypeError on a str holding a "
+            "non-ASCII character, and that str is attacker-supplied")
+        for operator in ("==", "!="):
+            self.assertNotIn(
+                operator, ops,
+                "_secret_eq compares with %s" % operator)
+
+        # Exactly one call site in the whole module. Without this, a future
+        # edit can add a second bare compare_digest somewhere else and
+        # reintroduce the raise this helper exists to absorb.
+        module = code_tokens_of_source(
+            inspect.getsource(gui_app).replace("\r\n", "\n"))
+        calls = [t.string for t in module if t.type == tokenize.NAME]
+        self.assertEqual(
+            calls.count("compare_digest"), 1,
+            "hmac.compare_digest is called at %d sites in gui/app.py; it "
+            "must be called at exactly one, inside _secret_eq, so that "
+            "'secrets are compared in constant time and never raise' is a "
+            "property of one function instead of a habit"
+            % calls.count("compare_digest"))
+
+    def test_sessions_are_capped_and_the_oldest_is_the_one_dropped(self):
+        """MAX_SESSIONS is a bound on this process's credential set.
+
+        Not an attack surface -- minting a session needs the key -- but an
+        unbounded list on a long-running server is a slow leak, and a cap
+        that drops the WRONG end would log the operator's live browser out
+        while keeping stale sessions valid.
+        """
+        cap = gui_app.MAX_SESSIONS
+        auth = gui_app._Auth(enabled=True)
+        issued = [auth.new_session() for _ in range(cap + 3)]
+        self.assertEqual(len(auth.sessions()), cap)
+        self.assertEqual(auth.sessions(), issued[3:],
+                         "the cap dropped the wrong end of the list")
+        for stale in issued[:3]:
+            self.assertFalse(
+                auth.session_ok("%s=%s" % (gui_app.SESSION_COOKIE, stale)),
+                "an evicted session still authenticates")
+        for live in (issued[3], issued[-1]):
+            self.assertTrue(
+                auth.session_ok("%s=%s" % (gui_app.SESSION_COOKIE, live)),
+                "a session inside the cap stopped working")
 
 
 class TestErrorEnvelope(ServerCase):
@@ -436,7 +1065,8 @@ class TestInputIsMoney(ServerCase):
                 conn = http.client.HTTPConnection("127.0.0.1", self.port,
                                                   timeout=10)
                 conn.request("POST", "/api/wallet/pay", body,
-                             {"Content-Type": "application/json"})
+                             {"Content-Type": "application/json",
+                              "Cookie": self.cookie})
                 response = conn.getresponse()
                 raw = response.read()
                 conn.close()
@@ -545,7 +1175,9 @@ class TestConnectionHygiene(ServerCase):
             sock = socket.create_connection(("127.0.0.1", self.port), timeout=20)
             try:
                 sock.sendall(b"POST /api/wallet/pay HTTP/1.1\r\n"
-                             b"Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                             b"Host: 127.0.0.1\r\n"
+                             + b"Cookie: " + self.cookie.encode() + b"\r\n"
+                             + b"Content-Type: application/json\r\n"
                              b"Content-Length: 500\r\n\r\nabcd")
                 sock.settimeout(15)
                 data = sock.recv(4096)
@@ -562,7 +1194,8 @@ class TestConnectionHygiene(ServerCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         for _ in range(2):
             conn.request("GET", "/api/mint/status", None,
-                         {"Accept": "application/json"})
+                         {"Accept": "application/json",
+                          "Cookie": self.cookie})
             response = conn.getresponse()
             payload = json.loads(response.read())
             self.assertEqual(response.status, 200)
@@ -640,10 +1273,12 @@ class TestBindRules(unittest.TestCase):
                                       kwargs={"poll_interval": 0.05},
                                       daemon=True)
             thread.start()
+            cookie = exchange_cookie(httpd, host="::1")
             conn = http.client.HTTPConnection("::1", httpd.server_address[1],
                                               timeout=10)
             conn.request("GET", "/api/mint/status", None,
-                         {"Host": "[::1]:%d" % httpd.server_address[1]})
+                         {"Host": "[::1]:%d" % httpd.server_address[1],
+                          "Cookie": cookie})
             self.assertEqual(conn.getresponse().status, 200)
             conn.close()
             httpd.shutdown()
@@ -651,6 +1286,172 @@ class TestBindRules(unittest.TestCase):
         finally:
             httpd.server_close()
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+class TestStartupCredential(unittest.TestCase):
+    """app.py started the way an operator starts it, as a real process.
+
+    Everything else in this file drives a GuiServer inside the test
+    process, which cannot see what main() prints, cannot see stderr, and
+    cannot prove what the default is when no flags are passed. These two
+    tests can, so they are the ones that pin points 1 and 6: the key is
+    printed once and only to the terminal, and authentication is ON unless
+    --no-auth is asked for out loud.
+    """
+
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="guiauth-")
+        self.proc = None
+        self.readers = []
+        self.out = []
+        self.err = []
+
+    def tearDown(self):
+        self._stop()
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+    def _stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=15)
+        for thread in self.readers:
+            thread.join(timeout=5)
+        if self.proc is not None:
+            for stream in (self.proc.stdout, self.proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _spawn(self, *flags):
+        """Run gui/app.py for real and wait until it says it is listening."""
+        port = free_port()
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.join(REPO, "gui", "app.py"),
+             "--port", str(port), "--workdir", self.workdir] + list(flags),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for stream, sink in ((self.proc.stdout, self.out),
+                             (self.proc.stderr, self.err)):
+            thread = threading.Thread(
+                target=lambda s=stream, k=sink: [k.append(line) for line in s],
+                daemon=True)
+            thread.start()
+            self.readers.append(thread)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if any("OPEN" in line for line in list(self.out)):
+                return port
+            if self.proc.poll() is not None:
+                self.fail("app.py exited %s:\n%s%s"
+                          % (self.proc.returncode, "".join(self.out),
+                             "".join(self.err)))
+            time.sleep(0.05)
+        self.fail("app.py never printed a URL:\n%s%s"
+                  % ("".join(self.out), "".join(self.err)))
+
+    def url_line(self):
+        return [line for line in self.out if "OPEN" in line][0]
+
+    # -- 6. auth is the default, --no-auth is the exception -------------
+    def test_running_with_no_flags_is_authenticated(self):
+        port = self._spawn()
+        line = self.url_line()
+        self.assertIn("?k=", line, "the startup URL carries no key")
+        key = line.split("?k=")[1].split()[0]
+        self.assertGreaterEqual(len(key), 32)
+        self.assertNotIn("no-auth", "".join(self.err).lower(),
+                         "the unauthenticated warning was printed anyway")
+
+        # no credential at all: shut, and with this GUI's error envelope
+        status, _headers, raw = http_call(port, "GET", "/api/wallet/list")
+        self.assertEqual(status, 401, raw[:200])
+        self.assertEqual(json.loads(raw)["error"]["reason"], "unauthorized")
+        status, _headers, raw = http_call(
+            port, "POST", "/api/mint/issue", {"amount_mc": 1000, "count": 1})
+        self.assertEqual(status, 401, raw[:200])
+
+        # the key alone does not open the API either
+        status, _headers, raw = http_call(port, "GET",
+                                          "/api/wallet/list?k=" + key)
+        self.assertEqual(status, 401, raw[:200])
+
+        # the printed URL opens the page, once, for a cookie; the cookie
+        # opens the API
+        status, headers, raw = http_call(port, "GET", "/?k=" + key)
+        self.assertEqual(status, 200, raw[:200])
+        cookie = headers["set-cookie"].split(";")[0]
+        session = cookie.split("=", 1)[1]
+        status, _headers, raw = http_call(port, "GET", "/api/wallet/list",
+                                          headers={"Cookie": cookie})
+        self.assertEqual(status, 200, raw[:200])
+        self.assertNotIn(key.encode(), raw)
+        self.assertNotIn(session.encode(), raw)
+
+        # the rebinding defence survives a real process too
+        status, _headers, raw = http_call(port, "GET", "/api/wallet/list",
+                                          headers={"Cookie": cookie,
+                                                   "Host": "evil.example.com"})
+        self.assertEqual(status, 403, raw[:200])
+
+        # grep the live instance: neither secret is in any file it wrote
+        files = 0
+        for root, _dirs, names in os.walk(self.workdir):
+            for name in names:
+                full = os.path.join(root, name)
+                self.assertNotIn(key, full)
+                self.assertNotIn(session, full)
+                with open(full, "rb") as handle:
+                    blob = handle.read()
+                self.assertNotIn(key.encode(), blob, full)
+                self.assertNotIn(session.encode(), blob, full)
+                files += 1
+
+        # ...nor in anything it logged. The key is printed exactly once,
+        # in the URL; the session is never printed at all.
+        self._stop()
+        stdout, stderr = "".join(self.out), "".join(self.err)
+        self.assertEqual(stdout.count(key), 1,
+                         "the key reached the terminal more than the one "
+                         "time it is meant to")
+        self.assertNotIn(key, stderr)
+        self.assertNotIn(session, stdout)
+        self.assertNotIn(session, stderr)
+        # and the requests above left no request log at all to carry them
+        self.assertNotIn("/api/wallet/list", stdout)
+        self.assertNotIn("/api/wallet/list", stderr)
+
+    def test_no_auth_opens_the_api_and_shouts_about_it(self):
+        port = self._spawn("--no-auth")
+        self.assertNotIn("?k=", self.url_line(),
+                         "--no-auth printed a key it does not use")
+
+        status, headers, raw = http_call(port, "GET", "/api/wallet/list")
+        self.assertEqual(status, 200, raw[:200])
+        self.assertNotIn("set-cookie", headers)
+        status, _headers, raw = http_call(port, "GET", "/")
+        self.assertEqual(status, 200, raw[:200])
+
+        warning = "".join(self.err)
+        self.assertGreaterEqual(len(warning.strip().splitlines()), 5,
+                                "the warning is not the loud multi-line one")
+        self.assertIn("no-auth", warning.lower())
+        self.assertIn("NO PASSWORD", warning)
+        self.assertIn("mint money", warning)
+        self.assertIn(self.workdir, warning)
+
+        # --no-auth removes the credential. It does not remove the two
+        # controls that stop a web page in the operator's browser.
+        status, _headers, raw = http_call(port, "GET", "/api/wallet/list",
+                                          headers={"Host": "evil.example.com"})
+        self.assertEqual(status, 403, raw[:200])
+        status, _headers, raw = http_call(
+            port, "GET", "/api/wallet/list",
+            headers={"Origin": "http://evil.example.com"})
+        self.assertEqual(status, 403, raw[:200])
 
 
 # The DOM shim and fake API that page.html runs against. It lives here
@@ -1097,6 +1898,7 @@ class TestMoneyEndToEnd(unittest.TestCase):
                                       kwargs={"poll_interval": 0.05},
                                       daemon=True)
         cls.thread.start()
+        cls.cookie = exchange_cookie(cls.httpd)
         cls.policy = {"rate_ppm": 10000, "cap_mc": 1000, "exempt_below_mc": 10}
         cls.mint_port = free_port()
         status, obj = cls.post("/api/mint/start",
@@ -1126,7 +1928,9 @@ class TestMoneyEndToEnd(unittest.TestCase):
     def _call(cls, method, path, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=120)
         payload = None if body is None else json.dumps(body)
-        head = {"Content-Type": "application/json"} if payload else {}
+        head = {"Cookie": cls.cookie}
+        if payload:
+            head["Content-Type"] = "application/json"
         conn.request(method, path, payload, head)
         response = conn.getresponse()
         raw = response.read()
