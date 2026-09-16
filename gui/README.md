@@ -128,13 +128,15 @@ The page is one screen with three numbered sections, all visible at once
 2. **Wallets.** Create two, say `alice` and `bob`. Click one to make it the
    *active* wallet: the one that pays and receives in section 3.
 3. **Fund alice.** In section 1's funding control, amount `1000`, count
-   `1`, into wallet `alice`. Two things happen on that one click, and only
-   the first is on the button: the mint **creates** 1,000 mc that did not
-   exist, and then alice **redeems** it, which is an exchange like any
-   other and is therefore burned. Under a 1% policy alice ends up with
-   **990 mc**, not 1,000. The result line afterwards says exactly that —
-   created, burned, credited — but the warning beside the button mentions
-   only the creation, so know the second half before you press it.
+   `1`, into wallet `alice`. Two things happen on that one click: the mint
+   **creates** 1,000 mc that did not exist, and then alice **redeems** it,
+   which is an exchange like any other and is therefore burned. Under a 1%
+   policy alice ends up with **990 mc**, not 1,000. Both halves are on the
+   screen *before* you press — the cost line above the button names what
+   will be created, what will be burned and what alice will be credited,
+   and the warning beside it covers the creation and points at that line
+   for the burn. The result line afterwards repeats the three figures as
+   they actually landed.
 4. **Pay bob.** With `alice` active, type `300`, choose `wallet: bob`, read
    the cost line, press Pay. Both balances move: alice 990 → 687, bob 297.
    Where the missing 6 mc went is the next section.
@@ -201,12 +203,27 @@ clock, never the browser's); if it cannot read the policy it says the
 recipient will get less rather than quoting a figure it cannot stand
 behind.
 
-Operator funding is the same story in one call instead of two: issuing
-1,000 mc into a wallet credits it 990 mc under a 1% policy, and the page
-reports what was created, what was burned and what was credited — but in
-the result line, after the click. The warning by the **Issue into wallet**
-button covers the creation ("cannot be undone") and not the burn, so the
-cost of funding is disclosed a moment later than the cost of paying is.
+Operator funding is the same story in one call instead of two, and it is
+disclosed the same way: before the click, not only after it. Issuing 1,000
+mc into a wallet credits it 990 mc under a 1% policy, and the cost line
+above the **Issue into wallet** button says so in advance — what will be
+created, what will be burned and what the wallet will be credited —
+recomputed as you type and read off the same policy the payment quote uses
+(`burn_policy`, or `burn_policy_next` once the mint's own clock says it is
+in force). The warning beside the button carries the half that is about
+creation ("cannot be undone") and hands the burn straight to that line —
+"the mint burns part of it on the way in — the line above says how much,
+before you press." If
+the page cannot read the policy, the cost line says the wallet will be
+credited somewhat *less* than what is created rather than quoting a figure
+it cannot stand behind — the same refusal to guess that the payment quote
+makes. The result line afterwards repeats created, burned and credited as
+they actually landed.
+
+One thing the cost line is careful about and a reader might not expect: a
+count above 1 is still **one** exchange, so the burn is charged once on the
+whole batch rather than once per token, and the sentence says that where it
+applies.
 
 ## Things the page is deliberate about
 
@@ -223,15 +240,31 @@ cost of funding is disclosed a moment later than the cost of paying is.
   same mint on the same economics instead of re-sending whatever the form
   defaulted to. The policy is also printed in words under the mint status,
   not only inside the descriptor blob.
-- **A rejected token says why.** Receiving a batch shows each rejected
-  string next to its reason — already spent, malformed, wrong mint — and
-  never loses the good tokens that were in the same paste. A paste where
-  *nothing* was taken is reported as a failure, not in the success colour.
+- **A rejected token says why, and only what is known.** Receiving a batch
+  shows each rejected string next to its reason — already spent, malformed,
+  wrong mint — and never loses the good tokens that were in the same paste.
+  A paste where *nothing* was taken is reported as a failure, not in the
+  success colour. Every failure on the page carries a machine cause from one
+  closed set (listed under **The JSON API** below), put there by the layer
+  that knew it; nothing downstream substitutes a guess, and a cause that was
+  never determined says so instead of picking a likelier story.
 - **A token is never silently dropped.** A payment or an issue produces
-  bearer token strings that exist in exactly one place: that response. If
-  the recipient wallet fails to take them, the page shows the strings and
-  says loudly that they are the only copy. Nothing here ever hides money it
-  created.
+  bearer token strings, and if the recipient wallet fails to take them the
+  page shows the strings rather than hiding money it created. Where the
+  *other* copy lives differs between the two, and the page no longer
+  flattens the difference:
+
+  - **Issue** really does produce strings that exist in exactly one place,
+    that response. `/api/mint/issue` persists nothing and the mint stores
+    ledger-key hashes, never secrets, so the page says ONLY copy and means
+    it. That is why crediting them into a wallet is a separate, retryable
+    step, and why the issue panel must not be dismissed before it succeeds.
+  - **Payment** strings are written into the payer's own wallet file before
+    the exchange is sent, which is what makes `recover()` possible. So "the
+    only copy" was false there, on the two most alarming paths the page has.
+    The page now *asks* `GET /api/wallet/outstanding?name=` and reports what
+    came back: that all of them were read back, that only some were, or that
+    it could not check at all. It never promises a recovery it has not seen.
 - **When the mint is stopped it says so** and disables what cannot work.
   Wallet balances still show, marked *last known*.
 - **Nothing spins forever.** Every request from the page has a deadline,
@@ -282,6 +315,11 @@ is a second lock on a door that should still not face the street.
 - Each wallet is one sqlite file under `var/wallets/`, mode 0600, and it
   holds that wallet's secrets. **Whoever has the file has the money.** There
   is no backup and no recovery phrase.
+- **The same four gates guard `../mint_console.py`**, the smaller console
+  for a mint you started yourself in a terminal. The two implement the same
+  design and deliberately share no code — read that file's docstring before
+  changing either, because a change here is a change to make there too, and
+  it is where the class of defect both of them had is written down.
 - To reach the page from another machine, forward the port over ssh rather
   than binding a routable address:
   `ssh -L 8799:127.0.0.1:8799 user@this-host` (use your own `--port`).
@@ -297,6 +335,10 @@ gui/walletops.py  a thin wrapper over aicash.wallet.Wallet
 gui/test_app.py       tests for app.py and page.html (see below)
 gui/test_mintctl.py   tests for the supervisor
 gui/test_walletops.py tests for the wallet wrapper
+gui/test_console_auth.py  tests for ../mint_console.py: the same four gates
+                  as this server's, against a real console in front of a
+                  real mint. It lives here because it is a GUI-suite test,
+                  not because mint_console.py is part of this directory.
 gui/var/          workdir: mint.db, mint-keys.json, mint-admin-keys.json,
                   mint-token-digests.json, mint-control.json, mint.log,
                   gui-state.json, wallets/<name>.db
@@ -347,20 +389,52 @@ GET  /api/mint/descriptor                   POST /api/wallet/receive {name, toke
 POST /api/mint/issue    {amount_mc, count}  POST /api/wallet/pay     {name, amount_mc}
 GET  /api/token/status?token=               POST /api/wallet/quote   {name, amount_mc}
                                             POST /api/wallet/recover {name}
+                                            GET  /api/wallet/outstanding?name=
 ```
 
-Every failure is a 4xx or 5xx carrying `{"error": {"reason", "detail"}}`
-with a `detail` written for a person and a `reason` that is always
-snake_case. That holds for every method, including the ones no route uses:
-`PUT`, `DELETE`, `OPTIONS` and anything else get a JSON 405, never an HTML
-error page. A traceback never reaches the caller; it goes to the terminal
-running `app.py`.
+`/api/wallet/outstanding` reads back the bearer strings of payments this
+wallet has handed out but has not seen redeemed. It persists nothing new --
+the wallet already wrote every one of them before sending the exchange --
+and it returns live bearer secrets, so it sits behind the same session
+cookie as everything else.
+
+Every failure is a 4xx or 5xx carrying
+`{"error": {"reason", "detail", "cause"}}`, with a `detail` written for a
+person and a `reason` that is always snake_case. That holds for every
+method, including the ones no route uses: `PUT`, `DELETE`, `OPTIONS` and
+anything else get a JSON 405, never an HTML error page. A traceback never
+reaches the caller; it goes to the terminal running `app.py`.
+
+`cause` is the machine answer to *why did this fail*, from one closed set —
+`mint_unreachable`, `mint_stopped`, `mint_rejected`, `already_spent`,
+`malformed_token`, `wrong_mint`, `insufficient_funds`, `unknown` — and it
+is carried through from whichever layer actually determined it, never
+re-guessed higher up. Two rules go with it: *the mint rejected it* is said
+only for `mint_rejected` (and its refinement `already_spent`), because a
+request the mint never received was not refused by it; and `unknown` reads
+as undetermined on screen, never dressed up as the likeliest story.
 
 Amounts are **whole millicredits**. `12.7` is refused, not rounded down.
 
 `GET /api/mint/status` adds one key beyond the supervisor's own fields:
 `last_start`, the settings this GUI last started a mint with (or `null`).
 The page uses it to refill the form; it is a convenience, not protocol.
+
+`GET /api/wallet/history` rows carry the same `cause` field for any
+operation that did not commit — read back from what was recorded at the
+moment it failed, never re-derived later from the stored state, which
+cannot tell a refusal from a request the mint never received. A row keeps
+the cause it was written with, permanently; it is what an operator debugs
+from months later.
+
+The limit of that, stated rather than left to be discovered: history records
+*operations*, and a token rejected **locally** never becomes one. A receive
+whose tokens are all malformed or all from another mint is filtered before
+any `/v3/exchange` is built, so nothing is sent, nothing is started, and no
+row is written — the rejections come back in the response's `rejected` list
+with their `malformed_token` / `wrong_mint` cause and appear nowhere else.
+History is the log of what this wallet *attempted against the mint*, not of
+every paste that was refused.
 
 `GET /api/wallet/history` returns rows whose `ts_ms` is always `0`, and
 `0` there means **unknown**, not 1 January 1970: the wallet's sqlite has no

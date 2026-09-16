@@ -41,7 +41,12 @@ from aicash.escrow import (
     rung_composition,
 )
 from aicash.ledgerstore import OutputSpec
-from aicash.mintapi import Ledger, MintConfig, MintServer
+from aicash.mintapi import (
+    ADMIN_ISSUANCE_DISABLED,
+    Ledger,
+    MintConfig,
+    MintServer,
+)
 from aicash.receipts import verify_dispute
 from aicash.signing import generate_keypair
 from aicash.tokencodec import b64u_encode, format_token, ledger_key, new_secret
@@ -79,6 +84,11 @@ config = MintConfig(
     signing_private=priv,
     signing_public=pub,
     grace_ms=GRACE,
+    # This demo funds IN PROCESS, through ledger.issue() below — it never
+    # calls POST /admin/issue. So the endpoint is shut outright rather than
+    # given a credential nobody would use. (MintConfig has no default
+    # admin_token; leaving it out used to mean "anyone may issue".)
+    admin_token=ADMIN_ISSUANCE_DISABLED,
 )
 db_path = tempfile.mktemp(suffix=".sqlite", prefix="aicash-j5-")
 ledger = Ledger(

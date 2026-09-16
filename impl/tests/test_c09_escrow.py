@@ -33,7 +33,7 @@ from aicash.escrow import (
     rung_composition,
 )
 from aicash.ledgerstore import Ledger, OutputSpec
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import ADMIN_ISSUANCE_DISABLED, MintConfig, MintServer
 from aicash.signing import attach_sig, generate_keypair, verify_obj
 from aicash.receipts import verify_dispute
 from aicash.tokencodec import (
@@ -104,6 +104,10 @@ class EscrowTest(unittest.TestCase):
             burn_policy=POLICY,
             signing_private=priv,
             signing_public=pub,
+            # This suite never calls /admin/issue; it funds through the
+            # Ledger directly. DISABLED is the deliberate refusal, not a
+            # placeholder: an unset admin_token is not a default here.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
             max_batch=1024,
         )
         server = MintServer(config, ledger)

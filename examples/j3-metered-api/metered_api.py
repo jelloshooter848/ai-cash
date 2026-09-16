@@ -82,10 +82,18 @@ def start_mint(workdir: str):
         burn_policy=burn,
         signing_private=private,
         signing_public=public,
+        admin_token=ADMIN_TOKEN,
     )
     server = MintServer(config, ledger)
     port = server.start()
     return server, ledger, f"http://127.0.0.1:{port}"
+
+
+
+# §7.1 operator funding is gated on this credential. MintConfig has no
+# default admin_token: a mint that says nothing does not build, so this
+# demo decides, and a demo that issues wants a credential.
+ADMIN_TOKEN = "j3-operator-credential"
 
 
 def admin_issue(base_url: str, outputs: list) -> None:
@@ -99,7 +107,8 @@ def admin_issue(base_url: str, outputs: list) -> None:
     try:
         body = json.dumps({"outputs": outputs}).encode()
         conn.request("POST", "/admin/issue", body,
-                     {"Content-Type": "application/json"})
+                     {"Content-Type": "application/json",
+                      "X-Admin-Token": ADMIN_TOKEN})
         resp = conn.getresponse()
         data = json.loads(resp.read())
         if resp.status != 200 or data.get("status") != "ok":

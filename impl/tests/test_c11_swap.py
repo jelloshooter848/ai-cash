@@ -24,7 +24,7 @@ from typing import NamedTuple
 from aicash.burncalc import BurnPolicy, compute_burn
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger, OutputSpec
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import ADMIN_ISSUANCE_DISABLED, MintConfig, MintServer
 from aicash.signing import generate_keypair
 from aicash.swap import (
     DEFAULT_LATENCY_FLOOR_MS,
@@ -100,6 +100,10 @@ class SwapTest(unittest.TestCase):
             burn_policy=policy,
             signing_private=priv,
             signing_public=pub,
+            # This suite never calls /admin/issue; it funds through the
+            # Ledger directly. DISABLED is the deliberate refusal, not a
+            # placeholder: an unset admin_token is not a default here.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
             grace_ms=grace_ms,
             max_batch=max_batch,
             recovery_window_ms=recovery_window_ms,

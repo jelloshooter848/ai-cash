@@ -38,7 +38,7 @@ from aicash.channels import (
 )
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger, OutputSpec
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import ADMIN_ISSUANCE_DISABLED, MintConfig, MintServer
 from aicash.tokencodec import (
     b64u_decode,
     b64u_encode,
@@ -124,6 +124,10 @@ class ChannelTest(unittest.TestCase):
             burn_policy=burn_policy,
             signing_private=priv,
             signing_public=pub,
+            # This suite never calls /admin/issue; it funds through the
+            # Ledger directly. DISABLED is the deliberate refusal, not a
+            # placeholder: an unset admin_token is not a default here.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
             max_batch=max_batch,
         )
         server = MintServer(config, ledger)

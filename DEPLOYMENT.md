@@ -35,6 +35,39 @@ One Python process. Concretely, when you run the launcher you get:
   it with proxy auth — you would break every anonymous receive-first client
   (§3.7/§7.2), which is the whole product.
 
+  `/admin/issue` is the opposite case, and it changed. `MintConfig.admin_token`
+  has no default any more: it is one of three states, all of them named, and
+  **saying nothing is an error rather than a state** — `MintConfig(...)` raises
+  `ValueError` before a port is ever bound.
+
+  | `admin_token=` | `/admin/issue` answers |
+  |---|---|
+  | `"<secret>"` | only a matching `X-Admin-Token` (constant-time compare) |
+  | `ADMIN_ISSUANCE_DISABLED` | 401 to everyone, including you |
+  | `ADMIN_ISSUANCE_OPEN` | everyone, unauthenticated — opt in by name |
+  | unset, or `None` | nothing: the config refuses to build |
+
+  It used to be that `admin_token=None` meant *allow everyone*, so any program
+  that built a mint from a default config served money creation to whoever
+  could reach the port — a credential whose absence was read as permission.
+  `LOCKED-DESIGN-DECISIONS.md` **L19** records that change, deliberately
+  breaking every caller that relied on the old default, including ones that
+  never issue. Openness is still available and is now greppable: `grep -rn
+  ADMIN_ISSUANCE_OPEN` enumerates every open mint in a tree, and a mint built
+  that way logs a warning naming itself on every start.
+
+  The launcher **in this tree** passes one of the three on every path, so
+  `aicash-mint` as shipped here starts (§10.8). An **older** `aicash-mint`
+  script does not, and that is the upgrade hazard: before this change
+  `--open-issuance` passed `admin_token=None`, because `None` was the old
+  spelling of *allow everyone*. Run the previous launcher against this
+  library and it dies before binding a port — verified here: `ValueError:
+  admin_token=None no longer means anything.` A `pip install` of the library
+  over a checked-out launcher is the normal shape of this, so upgrade the
+  launcher with it; the fix is one line (`--open-issuance` must now pass
+  `ADMIN_ISSUANCE_OPEN`). An embedder that built its own `MintConfig` will
+  likewise stop starting until it picks one, which is the intended outcome.
+
 - **A SQLite file** (`--db`, default `mint.db`) holding the entire ledger:
   `entries` (keyed by *hash*, never by secret), `supply`, `idempotency`, plus
   the mint's own `mintapi_state` (snapshot sequence and day-windowed activity)
@@ -67,11 +100,25 @@ One Python process. Concretely, when you run the launcher you get:
   literal (the DNS-rebinding defence) and any foreign `Origin`/`Referer`. A
   `--no-auth` flag exists for automated tests only and shouts on every start.
 
+  The console also **refuses to start with no operator credential**. It takes
+  one from `--admin-token-file` (the file the launcher writes) or
+  `--admin-token`; finding neither, it exits and names the three ways to
+  supply one rather than starting a console whose Issue button cannot work.
+  `--no-admin-token` starts it read-only on purpose — descriptor and status
+  only, `POST /api/issue` answers 503 `no_admin_credential`, and it says so
+  in the startup banner. That is the same rule as the mint's: an absent
+  credential is something you ask for, never something that happens.
+
   **None of that makes the port safe to expose, and it is not a reason to
   relax anything above.** It is a second lock on a door that should still not
-  face the street: it does not separate users on a shared machine, does not
-  stop another local process, and the admin token is still sitting in that
-  process. `--console-port 0` in production remains the instruction.
+  face the street. Binding to loopback is a much weaker boundary than it
+  sounds: it does not separate users on a shared machine, it does not stop
+  another local process — including something installed for an unrelated
+  reason — and it does not stop a web page open in the operator's own browser
+  from posting to `127.0.0.1`, which is a routinely exploited class of attack
+  and the whole reason the console checks `Host`, `Origin` and `Referer` at
+  all. The admin token is still sitting in that process.
+  `--console-port 0` in production remains the instruction.
 
 The launcher (`run_mint.py`, installed as `aicash-mint`) is explicitly **not
 protocol** — it is a wiring script, and its flags change faster than this
@@ -705,6 +752,25 @@ catches a live minting credential; mode 0600) rather than printing it, so it is
 a file on the mint host with password sensitivity and no backup value of its own — rotate it by restarting with a new
 `--admin-token`, and treat a copy of it leaving the host as an incident.
 
+A plain restart rotates it too, and that surprises people. Unless you pass
+`--admin-token`, the launcher generates a **fresh** credential on every start
+and overwrites the file — it never reads the old one back. Verified here: two
+consecutive starts in the same directory wrote two different tokens. So
+anything holding a copy (a console started separately, a funding script, a
+colleague's terminal) is invalidated by every restart, which is good hygiene
+and a bad surprise at 3am. Pass `--admin-token` from your own secret store if
+you need it stable.
+
+Losing that file is not a way to open issuance up, and not a way to lose your
+mint either. The running mint holds its credential in memory from startup, so
+deleting or editing the file changes nothing until the process restarts — and
+what a restart does is generate a **new** credential and write the file again
+(the paragraph just above; §9 carries the same fact in the restart list). What
+you lose with the file is your own copy: issuance is unreachable until the next
+restart, while the ledger, the identity and every outstanding token are
+untouched. What you cannot do is make the endpoint open by taking the
+credential away; openness has to be asked for by name (§1, L19).
+
 ---
 
 ## 8. What to monitor
@@ -828,6 +894,14 @@ current is the one performance behavior L11 calls a violation.
 
 Verified against this build:
 
+- **A restart rotates the admin credential, unless you pin it.** Identity and
+  ledger survive a restart (next bullet); the *issuance credential* does not.
+  Unless `--admin-token` is passed, the launcher generates a fresh one on every
+  start and overwrites `--admin-token-file` — it never reads the old one back.
+  Every separately started console, funding script or colleague's terminal
+  holding the previous token is invalidated by the restart, and gets a 401 with
+  no other symptom. Plan restarts accordingly, or pass `--admin-token` from your
+  own secret store. Detail and the two-start verification are in §7.
 - **A restart preserves identity and state.** Same `--keys` file → same
   `signing_pubkey`, same `mint_id`, same pinned baseline. Same `--db` →
   the same outstanding supply. Observed across a stop/start cycle:
@@ -885,7 +959,7 @@ someone is quietly working on; they are the known state of the build.
 **1. The cryptography has never had an independent human review.** Every
 signature, hash-lock, chain-derivation and swap construction in this
 implementation was designed and checked inside the same process that produced
-it. The test suite — 336 cases when this line was last updated, and still
+it. The test suite — 380 cases passing when this line was last updated, and still
 growing, so run `python3 -m unittest discover -s tests -t .` from `impl/` for
 today's number rather than trusting a figure in prose — covers the adversarial
 cases the authors *thought of*. No external cryptographer has audited the Ed25519 usage, the domain separation
@@ -941,19 +1015,58 @@ margin, not a defect (L14); drawn-but-unsettled channel value refunds to the
 payer at expiry (L16); credits are permanently nonconvertible (L9, §12) and
 there is no earned issuance or attestation (L10).
 
-**8. Issuance is one bearer credential.** Whoever holds the admin token mints
-without limit. `--open-issuance` removes even that, and `MintConfig.admin_token=None`
-means *allow everyone*, not *allow no one*. The operator console holds the token
-server-side, is loopback-only, and additionally requires the capability URL it
-prints at startup (exchanged once for a session cookie) on every route — but it
-is still a process holding a credential that mints without limit, so keep it on
+**8. Issuance is one bearer credential — and its absence is now a refusal.**
+Whoever holds the admin token mints without limit; that has not changed. The
+other half did. `MintConfig.admin_token=None` used to mean *allow everyone*, so
+any program that built a mint from a default config served `/admin/issue` to
+whoever could reach the port — a credential whose absence was read as
+permission. It now means nothing at all: `admin_token` has three named states
+and `None` is not one of them, so the config refuses to build and says which
+three to choose from (§1, L19). That is a breaking change for anything that
+relied on the old default, deliberately, because the old default was the
+risk.
+
+Two things about this launcher. First, it was never the source of the hole and
+still is not: every path through it passes one of the three named states, so it
+cannot produce an unset one. It is, however, affected by the change — the
+pre-change launcher spelled `--open-issuance` as `admin_token=None`, the very
+value that is now refused, so an older `aicash-mint` script will not start
+against this library until that one line becomes `ADMIN_ISSUANCE_OPEN` (§1). `--open-issuance` still does exactly what it says
+— it is now spelled `ADMIN_ISSUANCE_OPEN` in the config, still deletes
+`--admin-token-file` on the way up so no stale file implies a protection that
+is not there, still warns on stderr, and the mint itself now logs a warning
+naming the open `mint_id` on every start — through the mint's logger, so with
+this launcher it lands in `--access-log` and on stdout (verified here:
+`mint <id>: /admin/issue is UNAUTHENTICATED (ADMIN_ISSUANCE_OPEN)`). It
+remains a laptop-demo flag: an open mint is one that anybody who reaches the
+port can mint from, without limit.
+Second, the credential is regenerated on every start unless you pass
+`--admin-token` (§7), so a restart is also a rotation. Note the one asymmetry
+that follows: the console started by `--open-issuance` is handed no credential,
+and it refuses to issue rather than send an uncredentialled request — an open
+mint is fundable on its own port, not through the console.
+
+The operator console holds the token server-side, is loopback-only, requires
+the capability URL it prints at startup (exchanged once for a session cookie)
+on every route, and refuses to start with no credential at all — but it is
+still a process holding a credential that mints without limit, so keep it on
 loopback, or turn it off with `--console-port 0`.
 
 **9. The HTTP server is stdlib.** `ThreadingHTTPServer` plus
-`BaseHTTPRequestHandler` is a thread per connection with no request timeouts of
-its own. It has a 1 MiB body cap and a bounded idempotency-key length, and that
-is the extent of its input hardening. It was never meant to face the open
-internet, which is another way of saying the §4 proxy is load-bearing.
+`BaseHTTPRequestHandler` is a thread per connection, and it caps neither
+connections nor threads: N sockets are N threads, and nothing in this process
+says no. A single *request* is bounded — that part of this entry used to say
+"no request timeouts of its own" and that is no longer true. Verified in
+`impl/aicash/mintapi.py`: a 10-second idle timeout per recv (`_Handler.timeout`),
+a 30-second wall-clock deadline on the whole request line, headers and body
+(`MAX_REQUEST_SECONDS`, enforced through `_DeadlineRaw` precisely so a slow
+drip cannot keep resetting the idle timer), a 1 MiB body cap refused on the
+declared `Content-Length` *before* anything is allocated (`MAX_BODY_BYTES`), a
+128-character idempotency-key cap (`MAX_IDEMPOTENCY_KEY_LEN`), and a
+`max_batch` that `MintConfig` refuses to publish above what that body cap can
+carry. That is the extent of it: per-request bounds, no concurrency bound, no
+per-client bound. Rate limiting is still the proxy's job (§5), which is another
+way of saying the §4 proxy is load-bearing.
 
 **10. Recovery from backup is a conformance event, not a routine.** §7 has the
 detail; the term of the deal is this: there is no replay log, so restoring an
@@ -991,6 +1104,10 @@ it.
 - [ ] Certificate expiry is monitored from outside with weeks of headroom (§8)
 - [ ] Proxy limiter matches the descriptor's published `anonymous_rate`
       exactly — including `burst`, which caddy-ratelimit cannot express (§4.1/§5)
+- [ ] An admin credential is configured, and issuance without it is refused —
+      checked on the host, not assumed: `curl -si -X POST
+      http://127.0.0.1:8787/admin/issue -d '{"outputs":[]}'` with no
+      `X-Admin-Token` must answer **401**, never 200 (§1/§10.8)
 - [ ] `--console-port 0`, or console reachable only through an SSH tunnel (§1).
       The console's own capability-URL auth does **not** substitute for this:
       if the console is running at all, confirm its startup URL was not

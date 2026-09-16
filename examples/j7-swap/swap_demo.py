@@ -59,6 +59,12 @@ from aicash.wallet import MintClient, MintRejected, Wallet
 BASE_MS = 1_756_000_000_000  # arbitrary fixed epoch for the fake clocks
 DAY_MS = 86_400_000
 
+# §7.1 operator funding is gated on this credential. MintConfig has no
+# default admin_token: a mint that says nothing does not build, so this
+# demo decides, and a demo that issues wants a credential. Both mints in
+# the swap use it; they are both this script's own.
+ADMIN_TOKEN = "j7-operator-credential"
+
 
 def say(msg: str) -> None:
     print(msg, flush=True)
@@ -82,6 +88,7 @@ def start_mint(tmp, name, clock, policy, p99_ms):
         burn_policy=policy,          # NOTE: must repeat the Ledger's policy
         signing_private=priv,
         signing_public=pub,
+        admin_token=ADMIN_TOKEN,
         grace_ms=5_000,
         timestamp_precision_ms=100,
         recovery_window_ms=recovery_window_ms,   # NOTE: repeated again
@@ -107,7 +114,8 @@ def issue_to_wallet(base_url, wallet, mint_id, amount_mc):
     ).encode()
     req = urllib.request.Request(
         base_url + "/admin/issue", data=body,
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={"Content-Type": "application/json",
+                 "X-Admin-Token": ADMIN_TOKEN}, method="POST",
     )
     with urllib.request.urlopen(req) as resp:
         assert json.loads(resp.read())["status"] == "ok"

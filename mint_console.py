@@ -46,6 +46,46 @@ do not port-forward it, do not put it behind a reverse proxy. The auth is
 insurance against the local attacker and the hostile tab, not a licence to
 widen the bind.
 
+THE CLASS OF DEFECT THIS AUTHENTICATION EXISTS AGAINST
+------------------------------------------------------
+The same defect has now been found three times in this repository, on three
+different artifacts, and underneath it is one shape: a credential-shaped
+thing whose ABSENCE was read as permission rather than as refusal. None of
+the three failed a check. Each had no check, and no check reads as fine
+because nothing gets reported.
+
+  1. this console (2026-09-08): it holds the mint's admin credential and
+     exposes issuance, and its only protection was the loopback bind. The
+     four gates above are that fix.
+  2. the operator GUI, gui/app.py with gui/page.html (2026-09-15):
+     specified the same way at a larger surface, because it also holds
+     every wallet in its workdir and can spend them. Same four gates, same
+     reasons: its module docstring states them from that side, and
+     gui/README.md's security section points back here by name (app.py
+     itself does not mention this file — the README is the link that
+     exists). Whoever unifies the two starts from the divergence list
+     below.
+  3. the library itself (2026-09-15): ``MintConfig.admin_token`` defaulted
+     to ``None`` and ``admin_authorized()`` answered True for ``None``, so
+     any program that built a mint from a default config served POST
+     /admin/issue to whoever could reach the port. That is the worst of the
+     three, because the other two are tools an operator chooses to run and
+     this one is what you get by not thinking about it. The field now has
+     no default at all: a secret string, ADMIN_ISSUANCE_DISABLED, or
+     ADMIN_ISSUANCE_OPEN, and anything else — unset, None, "" — raises out
+     of MintConfig before a port is bound. Open issuance still exists and
+     is opted into by name, so `grep -rn ADMIN_ISSUANCE_OPEN` finds every
+     open mint; what is gone is reaching it by saying nothing. Breaking
+     change from the v0.4 build, deliberately, recorded in
+     LOCKED-DESIGN-DECISIONS.md (L19) rather than left to prose.
+
+This file follows (3) rather than depending on it. It refuses to start with
+no credential — ``--no-admin-token`` is the explicit, read-only opt-out, so
+the absence is something an operator asked for and never something that
+happened — and POST /api/issue answers 503 ``no_admin_credential`` instead
+of sending a credential-less /admin/issue and finding out how generous the
+mint on the other end happens to be. See ``main()`` and ``_mint()``.
+
 DELIBERATE DUPLICATION: the operator GUI implements the same design in
 gui/app.py (page at gui/page.html), and this file does NOT import it. Two
 reasons: the console must stay runnable on its own with nothing but the
@@ -197,10 +237,32 @@ async function api(p,b){const r=await fetch(p,b?{method:'POST',credentials:'same
  if(r.status===401){$('lost').style.display='block';}
  return {ok:r.ok,status:r.status,data:data};}
 function fmt(n){return (n===undefined||n===null)?'-':n.toLocaleString();}
+// The closed set of failures this page can NAME, keyed by the reason string
+// the console itself put in the error envelope. Nothing is inferred from the
+// status code alone beyond the 401 fallback below.
+const HDR_WHY={
+ mint_unreachable:'mint unreachable - it did not answer this console',
+ no_admin_credential:'read-only: this console holds no operator credential',
+ unauthorized:'not authorised',
+ bad_host:'refused here: the Host header is not a loopback literal',
+ cross_site:'refused here: cross-site request',
+ not_found:'this console has no such route',
+ bad_response:'the console answered something that is not JSON'};
 async function refresh(){
  const r=await api('/api/descriptor');
  if(!r.ok){$('dot').className='dot off';
-  $('hdr').textContent=(r.status===401)?'not authorised':'mint unreachable';return;}
+  // Say why, from the reason the server actually sent, and nothing else.
+  // "mint unreachable" is reserved for the ONE case this console
+  // determined it: its own proxy could not complete a request to the mint
+  // (_mint()'s 502). A 403 out of this console's own Host/Origin gate, or
+  // a 500 raised in this process, never reached the mint at all -- calling
+  // either of those "mint unreachable" asserts a cause nothing here knows.
+  // Anything unrecognised reads as undetermined, and says so.
+  const why=(r.data&&r.data.error&&r.data.error.reason)||'';
+  $('hdr').textContent=(r.status===401)?HDR_WHY.unauthorized:(HDR_WHY[why]||
+   'descriptor unreadable - http '+r.status+(why?' '+why:'')+
+   '; why is undetermined, and this console will not guess');
+  return;}
  const d=r.data,s=d.supply||{};
  $('dot').className='dot';$('lost').style.display='none';
  $('hdr').textContent=d.mint_id+'  ·  '+(d.denominations_mc||[]).join(', ')+' mc denominations';
@@ -515,7 +577,31 @@ class Console(BaseHTTPRequestHandler):
         # Only /admin/* needs the credential. The public routes used to get
         # it too, which put the operator token into requests that did not
         # need it (and into whatever the mint chooses to log about them).
-        if admin and self.admin_token:
+        if admin:
+            if not self.admin_token:
+                # A missing credential is refused HERE. The old spelling was
+                # `if admin and self.admin_token`, which sent the admin
+                # request with no header at all and left the mint to decide
+                # how generous to be about it — and the mint's answer used to
+                # be "allow everyone". That is defect (3) in this file's
+                # docstring, seen from the calling side.
+                #
+                # The reason string is picked with care: the mint did not
+                # reject this request, because the mint never saw it. Saying
+                # "the mint refused" here would be asserting a cause this
+                # process cannot know.
+                return 503, {"error": {
+                    "reason": "no_admin_credential",
+                    "detail": "this console holds no operator credential, so "
+                              "it did not send the issuance request. The mint "
+                              "never saw it and did not refuse it. Restart "
+                              "the console with --admin-token-file pointed at "
+                              "the file run_mint.py wrote, or with "
+                              "--admin-token. (A mint started deliberately "
+                              "open — run_mint.py --open-issuance, i.e. "
+                              "ADMIN_ISSUANCE_OPEN — hands this console no "
+                              "credential either; issue against the mint's "
+                              "own port, not through here.)"}}
             headers["X-Admin-Token"] = self.admin_token
         c = None
         try:
@@ -659,23 +745,51 @@ def serve(port, mint_port, mint_id, admin_token, auth=True, announce=True,
     if not state.enabled:
         # Loud, multi-line, on stderr, every single startup.
         print(NO_AUTH_BANNER, file=sys.stderr, flush=True)
+    if announce and not admin_token:
+        # Reachable through serve() from run_mint.py --open-issuance, which
+        # is the one supported way to get here with no credential. Say it on
+        # startup rather than at the first click of Issue.
+        print("\n  CONSOLE  no operator credential was given, so this console"
+              "\n  cannot issue: POST /api/issue answers 503"
+              " no_admin_credential."
+              "\n  Everything read-only (descriptor, status) still works.",
+              file=out, flush=True)
     if announce:
         if state.enabled:
+            # What a captured stdout is worth depends on what this console
+            # can DO, and with no operator credential the answer is: read.
+            # The key opens the page and the read-only routes; it cannot
+            # reach issuance, because there is nothing here to issue with.
+            # Saying "a minting credential" in that mode would overstate
+            # the leak, which is the same class of error as understating
+            # one: a sentence asserting more than the process knows.
+            captured = ("that file now holds a minting credential"
+                        "\n  — restart to rotate it.)"
+                        if admin_token else
+                        "that file now holds this console's"
+                        "\n  session key. It opens a READ-ONLY console — no"
+                        "\n  operator credential was given, so the key cannot"
+                        "\n  reach issuance. Restart to rotate it.)")
             print("\n  CONSOLE  open this exact URL — it carries a one-time key:"
                   "\n\n      %s\n"
                   "\n  The plain http://127.0.0.1:%d/ answers 401. The key is"
                   "\n  held in memory only, is never written to a file or a log"
                   "\n  by this console, and dies with this process."
                   "\n  (If this process's stdout is captured to a file by a"
-                  "\n  service manager, that file now holds a minting"
-                  "\n  credential — restart to rotate it.)"
+                  "\n  service manager, %s"
                   "\n  Auth does not make this safe to expose: keep it on"
                   "\n  loopback, do not proxy it, do not port-forward it."
-                  % (httpd.console_url, bound), file=out, flush=True)
+                  % (httpd.console_url, bound, captured), file=out, flush=True)
         else:
             print("\n  CONSOLE  %s   (UNAUTHENTICATED)" % httpd.console_url,
                   file=out, flush=True)
     return httpd
+
+
+#: Where run_mint.py writes the generated operator credential. Named
+#: rather than inlined so the help text, the refusal messages and the
+#: lookup cannot drift apart.
+DEFAULT_ADMIN_TOKEN_FILE = "mint-admin-keys.json"
 
 
 def main(argv=None):
@@ -687,30 +801,108 @@ def main(argv=None):
     ap.add_argument("--mint-port", type=int, default=8787,
                     help="port the mint is listening on")
     ap.add_argument("--mint-id", default="local-test-mint")
-    ap.add_argument("--admin-token-file", default="mint-admin-keys.json",
+    # default=None so that "the operator asked for this file" and "nobody
+    # said anything, so we looked in the usual place" are distinguishable
+    # below. They have to be: --no-admin-token is an explicit request to hold
+    # NO credential, and it used to be silently overridden by whatever
+    # happened to be sitting in the default file.
+    ap.add_argument("--admin-token-file", default=None,
                     help='JSON file with an "admin_token" field, as written '
-                         "by run_mint.py. Preferred: a token passed on the "
-                         "command line is visible to every process on the "
-                         "machine via /proc and ps.")
+                         "by run_mint.py (default: %s). Preferred: a token "
+                         "passed on the command line is visible to every "
+                         "process on the machine via /proc and ps."
+                         % DEFAULT_ADMIN_TOKEN_FILE)
     ap.add_argument("--admin-token",
                     help="operator credential (visible in ps; prefer "
                          "--admin-token-file)")
+    ap.add_argument("--no-admin-token", action="store_true",
+                    help="start with NO operator credential: descriptor and "
+                         "status still work and POST /api/issue answers 503. "
+                         "Without this flag a console that found no "
+                         "credential refuses to start, because an absent "
+                         "credential must be something you asked for.")
     ap.add_argument("--no-auth", action="store_true",
                     help="FOR AUTOMATED TESTS ONLY: serve with no capability "
                          "key and no session cookie. Prints a loud warning.")
     args = ap.parse_args(argv)
 
+    # --no-admin-token is an explicit instruction to hold no credential, so
+    # pairing it with a credential is a contradiction, not a preference
+    # order. It used to be neither: the flag was checked only AFTER the
+    # lookup, so a console started with --no-admin-token on a machine where
+    # the default mint-admin-keys.json existed came up holding a live
+    # minting credential and said nothing about having ignored the flag.
+    # An operator who asks for a read-only console and silently gets a
+    # minting one is the same defect this round is about, pointing the other
+    # way: the presence of a credential nobody asked for.
+    if args.no_admin_token and args.admin_token is not None:
+        ap.error("--admin-token with --no-admin-token is contradictory: one "
+                 "supplies an operator credential and the other says to run "
+                 "without one. Pick one.")
+    if args.no_admin_token and args.admin_token_file is not None:
+        ap.error("--admin-token-file with --no-admin-token is contradictory: "
+                 "one names a file to read an operator credential from and "
+                 "the other says to run without a credential. Pick one. "
+                 "(--no-admin-token on its own does not read %s either.)"
+                 % DEFAULT_ADMIN_TOKEN_FILE)
+    if args.admin_token_file is None and not args.no_admin_token:
+        args.admin_token_file = DEFAULT_ADMIN_TOKEN_FILE
+
     token = args.admin_token
+    # `not token` rather than `token == ""`: a credential is never compared
+    # with ==/!= in this file, not even against the empty string, and a
+    # source-level test pins that (test_no_secret_is_compared_with_equals).
+    why = ("--admin-token was given but is empty or only whitespace"
+           if isinstance(token, str) and not token.strip() else
+           "neither --admin-token nor --admin-token-file was given")
     if token is None and args.admin_token_file:
         try:
             with open(args.admin_token_file) as fh:
                 token = json.load(fh).get("admin_token")
         except FileNotFoundError:
-            token = None
+            token, why = None, "%s does not exist" % args.admin_token_file
         except (OSError, ValueError) as exc:
             # Never interpolate the file's contents into the message.
             sys.exit("could not read %s: %s"
                      % (args.admin_token_file, type(exc).__name__))
+        else:
+            why = ('%s has no usable "admin_token" field'
+                   % args.admin_token_file)
+    if not isinstance(token, str) or not token.strip():
+        # Anything that is not a non-whitespace string is no credential: an
+        # empty --admin-token, a JSON file whose field is null, 0, a list.
+        # It used to become a console that quietly proxied issuance with no
+        # header.
+        #
+        # `.strip()` and not just `not token`: a token file holding only a
+        # newline, or an environment variable that expanded to nothing, is
+        # truthy and used to sail through here. The console then started
+        # "credentialled", promised issuance, and got a 401 at the first
+        # click -- which is exactly what the startup refusal below exists to
+        # prevent. The library refuses to BUILD a mint on such a token
+        # (MintConfig.__post_init__), so no mint is ever gated on one; a
+        # console holding one holds nothing. It is tested, never trimmed:
+        # nothing here sends a credential the operator did not supply.
+        token = None
+
+    if token is None and not args.no_admin_token:
+        # The absence of a credential is refused at startup, not discovered
+        # at the first click of Issue — the same move the library made when
+        # it stopped letting an unset admin_token build a mint at all (see
+        # the docstring, and L19).
+        sys.exit(
+            "no operator credential (%s).\n"
+            "This console will not start without one. It would not be able "
+            "to issue — it refuses to send an uncredentialled "
+            "/admin/issue, and a mint gated on X-Admin-Token would answer "
+            "401 anyway — so starting would only postpone finding that out "
+            "until the first click of Issue.\n"
+            "  --admin-token-file PATH  the file run_mint.py writes "
+            "(default mint-admin-keys.json, JSON field \"admin_token\")\n"
+            "  --admin-token TOKEN      visible in ps to every process on "
+            "this machine; prefer the file\n"
+            "  --no-admin-token         start read-only on purpose: "
+            "descriptor and status work, Issue answers 503" % why)
 
     httpd = serve(args.port, args.mint_port, args.mint_id, token,
                   auth=not args.no_auth)

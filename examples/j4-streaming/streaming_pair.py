@@ -55,6 +55,13 @@ DRAWS = 60       # tokens actually generated/streamed
 FUND_MC = 200    # operator funding for the payer
 
 
+
+# §7.1 operator funding is gated on this credential. MintConfig has no
+# default admin_token: a mint that says nothing does not build, so this
+# demo decides, and a demo that issues wants a credential.
+ADMIN_TOKEN = "j4-operator-credential"
+
+
 def admin_issue(port: int, outputs: list) -> dict:
     """POST /admin/issue (no MintClient method exists for it, so hand-rolled)."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
@@ -63,7 +70,8 @@ def admin_issue(port: int, outputs: list) -> dict:
             "POST",
             "/admin/issue",
             json.dumps({"outputs": outputs}).encode(),
-            {"Content-Type": "application/json"},
+            {"Content-Type": "application/json",
+             "X-Admin-Token": ADMIN_TOKEN},
         )
         resp = conn.getresponse()
         body = json.loads(resp.read())
@@ -94,6 +102,7 @@ def main() -> None:
         burn_policy=policy,  # NB: must repeat the ledger's policy by hand
         signing_private=priv,
         signing_public=pub,
+        admin_token=ADMIN_TOKEN,
     )
     server = MintServer(config, ledger)
     port = server.start()

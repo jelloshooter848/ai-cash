@@ -111,6 +111,23 @@ class MintFixture(unittest.TestCase):
         self.addCleanup(server.stop)
         return server, f"http://127.0.0.1:{bound}"
 
+    def restart_mint(self):
+        """Start this fixture's mint again: same mint_id, same ledger file.
+
+        Not ``replacement_mint`` — that is a DIFFERENT mint wearing the same
+        address.  This is the real "it was down, now it is back" case, which
+        is what an operator does after a delivery failed with the mint off,
+        and what ``recover()`` needs to settle a stranded op against the
+        ledger that actually holds it.
+        """
+        self.server, self.ledger = make_mint(
+            self.config, db_path=os.path.join(self.dir, "mint.db"),
+            clock=self.clock,
+        )
+        self.server.start(self.port)
+        self._stopped = False
+        return self.server
+
     def spent_token(self, amount_mc: int = 500) -> str:
         """A token string that has already been redeemed by someone else."""
         token = self.issue(amount_mc)
@@ -514,15 +531,25 @@ class TestHistory(MintFixture):
                     w.history(limit=bad)
 
     def test_every_entry_has_the_agreed_shape(self):
+        """Five keys now: an op that did not commit carries WHY it did not.
+
+        (Was four.  ``cause`` was added deliberately — a history row that
+        cannot say why an operation failed is the defect this round closes,
+        and the field is part of the pinned shape, not an extra.)
+        """
         w = self.ops()
         w.receive([self.issue(10_000)])
         w.pay(100)
         for e in w.history():
-            self.assertEqual(set(e), {"ts_ms", "kind", "amount_mc", "detail"})
+            self.assertEqual(set(e),
+                             {"ts_ms", "kind", "amount_mc", "detail", "cause"})
             self.assertIsInstance(e["ts_ms"], int)
             self.assertIsInstance(e["kind"], str)
             self.assertIsInstance(e["amount_mc"], int)
             self.assertIsInstance(e["detail"], str)
+            self.assertIsInstance(e["cause"], str)
+            # Everything here committed, so there is no cause to give.
+            self.assertEqual(e["cause"], "")
 
     def test_timestamps_are_zero_because_the_schema_has_none(self):
         """Documented limitation, asserted so nobody mistakes 0 for a date."""
@@ -976,6 +1003,641 @@ class TestHistoryEfficiency(MintFixture):
             f"history ran {len(queries)} queries for {len(rows)} rows:"
             f" {queries}",
         )
+
+
+# ---------------------------------------------------------------------------
+# WHY did it fail: the pinned cause vocabulary, driven by REAL failures
+# ---------------------------------------------------------------------------
+
+
+class TestFailureCauses(MintFixture):
+    """Every cause here is produced by actually breaking something.
+
+    No mocked exceptions and no hand-written ``failed`` rows: the mint is
+    stopped for real, a real already-spent token is submitted, a real
+    foreign-mint token is pasted, and a real in-flight delivery is cut off
+    by killing the mint between the plan commit and the send.  A cause
+    vocabulary tested against invented failures proves only that the test
+    and the code agree about a string.
+    """
+
+    def funded(self, name="w", face=100_000):
+        w = self.ops(name)
+        w.receive([self.issue(face)])
+        return w
+
+    def causes_of(self, rows):
+        return [r["cause"] for r in rows]
+
+    # -- the mint never saw it ------------------------------------------
+
+    def test_a_stopped_mint_is_unreachable_and_never_a_rejection(self):
+        w = self.funded()
+        self.stop_mint()
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(1_000)
+        self.assertEqual(cm.exception.cause, "mint_unreachable")
+        self.assertNotIn("rejected", cm.exception.detail.lower())
+        # It says the mint refused nothing, and it does NOT claim the
+        # request never landed: a dead socket cannot establish that, which
+        # is why §5.1 persists before sending and recover() exists.
+        self.assertIn("refused nothing", cm.exception.detail)
+        self.assertIn("undetermined", cm.exception.detail)
+        self.assertIn("recover", cm.exception.detail)
+        self.assertNotIn("never saw", cm.exception.detail)
+        self.assertNotIn("never answered", cm.exception.detail)
+
+    def test_the_gui_knowing_the_process_is_gone_sharpens_it_to_stopped(self):
+        """mint_stopped is a claim about a PROCESS, so it needs a witness."""
+        w = self.funded("witnessed")
+        self.stop_mint()
+        w.mint_running = lambda: False
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(1_000)
+        self.assertEqual(cm.exception.cause, "mint_stopped")
+        self.assertEqual(cm.exception.reason, "mint stopped")
+        self.assertNotIn("rejected", cm.exception.detail.lower())
+
+    def test_a_hook_that_cannot_answer_leaves_the_weaker_claim(self):
+        """No witness, a broken witness, an unsure witness: unreachable."""
+        for hook in (None, lambda: True, lambda: None,
+                     lambda: (_ for _ in ()).throw(RuntimeError("no idea"))):
+            with self.subTest(hook=repr(hook)):
+                w = self.ops("hooked-%s" % id(hook))
+                w.mint_running = hook
+                self.stop_mint()
+                with self.assertRaises(WalletOpsError) as cm:
+                    w.summary() if False else w.pay(10)
+                self.assertEqual(cm.exception.cause, "mint_unreachable")
+
+    # -- the mint answered ----------------------------------------------
+
+    def test_an_already_spent_token_says_already_spent(self):
+        w = self.ops()
+        out = w.receive([self.spent_token(500)])
+        self.assertEqual(out["rejected"][0]["cause"], "already_spent")
+        [row] = w.history()
+        self.assertEqual(row["kind"], "receive_failed")
+        self.assertEqual(row["cause"], "already_spent")
+        # It IS a rejection: the mint answered, and the row may say so.
+        self.assertIn("rejected", row["detail"])
+
+    def test_a_mixed_batch_records_the_refusal_and_what_was_taken(self):
+        """One op failed, one committed, in a single call. Both say so."""
+        w = self.ops("mixed-batch")
+        good, bad = self.issue(1_000), self.spent_token(500)
+        out = w.receive([bad, good])
+        self.assertEqual(out["accepted"], 1)
+        self.assertEqual([r["cause"] for r in out["rejected"]],
+                         ["already_spent"])
+        rows = w.history()
+        self.assertEqual(rows[-1]["kind"], "receive_failed")
+        self.assertEqual(rows[-1]["cause"], "already_spent")
+        self.assertIn("credited", rows[-1]["detail"])
+        self.assertEqual(rows[0]["kind"], "receive")
+        self.assertEqual(rows[0]["cause"], "")
+
+    def test_a_malformed_string_is_never_blamed_on_the_mint(self):
+        w = self.ops()
+        out = w.receive(["this is not a token"])
+        self.assertEqual(out["rejected"][0]["cause"], "malformed_token")
+        self.assertNotIn("mint rejected", out["rejected"][0]["detail"])
+        # Nothing was sent, so there is no operation and no history row.
+        self.assertEqual(w.history(), [])
+
+    def test_a_token_from_another_mint_is_wrong_mint_not_malformed(self):
+        stranger = self.issue(1_000)          # issued by THIS mint...
+        _server, base = self.replacement_mint("other-mint")
+        w = WalletOps(self.path("elsewhere"), base)
+        out = w.receive([stranger])           # ...offered to a different one
+        self.assertEqual(out["rejected"][0]["cause"], "wrong_mint")
+        self.assertNotIn("mint rejected", out["rejected"][0]["detail"])
+        self.assertEqual(w.history(), [])
+
+    def test_a_store_bound_to_another_mint_is_wrong_mint(self):
+        w = self.funded("bound")
+        w.close()
+        _server, base = self.replacement_mint("successor-mint")
+        moved = WalletOps(self.path("bound"), base)
+        with self.assertRaises(WalletOpsError) as cm:
+            moved.pay(100)
+        self.assertEqual(cm.exception.cause, "wrong_mint")
+
+    def test_insufficient_funds_carries_its_own_cause(self):
+        w = self.funded("poor", face=1_000)
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(50_000)
+        self.assertEqual(cm.exception.cause, "insufficient_funds")
+        self.assertNotIn("rejected", cm.exception.detail.lower())
+
+    def test_a_bad_amount_is_undetermined_not_a_mint_story(self):
+        w = self.ops()
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay("100")
+        self.assertEqual(cm.exception.cause, "unknown")
+        self.assertIn("nothing was sent to the mint", cm.exception.detail)
+
+    # -- THE ROW THE REVIEWER FOUND -------------------------------------
+
+    def stop_the_mint_mid_flight(self, ops, after=1):
+        """Cut the mint off between the plan COMMIT and the send.
+
+        The wallet's own persist_fsync event fires exactly there (§5.1
+        persist-before-send), so this reproduces the real accident: the
+        operator's mint dies — or the machine's network does — after the
+        wallet has written its plan and before the exchange lands.  The
+        socket failure that follows is real: the port is genuinely closed.
+
+        ``after`` is which plan commit to cut on: ``receive_batch`` plans
+        a fresh op per retry round, so ``after=2`` kills the mint once it
+        has already ANSWERED round one — the two-causes-in-one-call case.
+        """
+        ops._open()                 # bind, so there is a wallet to hook
+        killed = []
+
+        def kill(event, _op_id):
+            if event == "persist_fsync" and len(killed) < after:
+                killed.append(True)
+                if len(killed) == after:
+                    self.stop_mint()
+
+        ops._wallet.event_hook = kill
+        return killed
+
+    def test_a_delivery_the_mint_never_saw_is_not_recorded_as_a_rejection(self):
+        """THE DEFECT, end to end.
+
+        Before this fix the row below read "did not commit (the mint
+        rejected it)" for a payment the mint never received — the tokens
+        were fine, the mint was simply down — and an operator reading it
+        months later goes and debugs the mint's §3.8 handling.  Nothing in
+        the store can tell the two apart afterwards, so the cause is
+        recorded at the moment it is known and read back verbatim.
+        """
+        w = self.funded("stranded")
+        killed = self.stop_the_mint_mid_flight(w)
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(5_000)
+        self.assertTrue(killed, "the mint was not stopped mid-flight")
+        self.assertEqual(cm.exception.cause, "mint_unreachable")
+
+        row = w.history()[0]           # newest first: the payment that hung
+        self.assertEqual(row["kind"], "pay_pending")
+        self.assertEqual(row["cause"], "mint_unreachable")
+        self.assertNotIn("the mint rejected it", row["detail"])
+        self.assertIn("recover", row["detail"])
+
+        # ...and the row survives recover() turning the op into `failed`,
+        # which is the exact state that used to be printed as a rejection.
+        self.restart_mint()
+        w.recover()
+        row = w.history()[0]
+        self.assertEqual(row["kind"], "pay_failed")
+        self.assertEqual(row["cause"], "mint_unreachable")
+        self.assertNotIn("the mint rejected it", row["detail"])
+        self.assertNotIn("rejected", row["detail"].lower())
+        self.assertIn("refused nothing", row["detail"])
+        self.assertNotIn("never saw", row["detail"])
+        # the money came back, which is the other half of "not a rejection"
+        self.assertEqual(w.summary()["balance_mc"], 99_000)
+
+    def test_a_stranded_delivery_says_stopped_when_the_gui_knows(self):
+        w = self.funded("stranded2")
+        w.mint_running = lambda: not self._stopped
+        self.stop_the_mint_mid_flight(w)
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(5_000)
+        self.assertEqual(cm.exception.cause, "mint_stopped")
+        row = w.history()[0]
+        self.assertEqual(row["cause"], "mint_stopped")
+        self.assertNotIn("rejected", row["detail"].lower())
+
+    def test_a_recorded_cause_is_permanent(self):
+        """The row an operator debugs from months later does not drift.
+
+        A second attempt is a different operation with its own story; it
+        must not rewrite the first one's.
+        """
+        w = self.funded("permanent")
+        self.stop_the_mint_mid_flight(w)
+        with self.assertRaises(WalletOpsError):
+            w.pay(5_000)
+        first = w.history()[0]["detail"]
+        self.restart_mint()
+        w.recover()
+        w.pay(1_000)                       # a later, successful payment
+        w.receive([self.spent_token(500)])  # and a later, real rejection
+        rows = {r["kind"]: r for r in w.history()}
+        self.assertEqual(rows["pay_failed"]["cause"], "mint_unreachable")
+        self.assertEqual(rows["pay_failed"]["detail"], first.replace(
+            " — still unresolved; run recover() to settle", ""))
+        self.assertEqual(rows["receive_failed"]["cause"], "already_spent")
+
+    # -- one call, two different causes ---------------------------------
+
+    def test_each_op_of_a_multi_round_receive_keeps_its_own_cause(self):
+        """TWO causes in ONE call — the row the fourth review found.
+
+        ``Wallet.receive_batch`` plans one op per retry round: the mint
+        enumerates the spent token and refuses round one, the wallet drops
+        it and re-sends the good remainder under a FRESH op.  Cut the mint
+        off between those two plans and the call ends with an op the mint
+        ANSWERED and refused beside an op it never answered about.
+        Stamping the call's final error on both wrote "the mint never
+        answered, so it never saw this request" into the permanent record
+        of an exchange the mint had enumerated and refused — sending the
+        operator to ask whether the mint was down when the mint had in
+        fact answered.
+        """
+        w = self.ops("two-causes")
+        spent, good = self.spent_token(500), self.issue(5_000)
+        killed = self.stop_the_mint_mid_flight(w, after=2)
+        with self.assertRaises(WalletOpsError) as cm:
+            w.receive([spent, good])
+        self.assertEqual(len(killed), 2,
+                         "the mint was not cut off on the retry round")
+        self.assertEqual(cm.exception.cause, "mint_unreachable")
+
+        rows = {r["kind"]: r for r in w.history()}
+        self.assertEqual(set(rows), {"receive_failed", "receive_pending"},
+                         "expected one refused op and one stranded op: %r"
+                         % (rows,))
+
+        refused = rows["receive_failed"]     # round one: the mint answered
+        self.assertEqual(refused["cause"], "mint_rejected")
+        self.assertIn("answered and rejected", refused["detail"])
+        self.assertNotIn("never", refused["detail"])
+        self.assertNotIn("did not answer", refused["detail"])
+
+        stranded = rows["receive_pending"]   # round two: nothing answered
+        self.assertEqual(stranded["cause"], "mint_unreachable")
+        self.assertNotIn("rejected", stranded["detail"].lower())
+
+    def test_a_locally_dropped_token_is_not_named_as_a_mint_refusal(self):
+        """The mint never saw the malformed paste, so no row may list it.
+
+        One batch, three fates: a string this module drops without asking
+        anybody, a token the mint enumerates and refuses, and a token that
+        is credited.  The sentence recorded against the refused op names
+        only what the MINT actually said.
+        """
+        w = self.ops("mixed-fates")
+        out = w.receive(["not-a-token", self.spent_token(500),
+                         self.issue(1_000)])
+        self.assertEqual(out["accepted"], 1)
+        self.assertEqual(sorted(r["cause"] for r in out["rejected"]),
+                         ["already_spent", "malformed_token"])
+        rows = [r for r in w.history() if r["kind"] == "receive_failed"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["cause"], "already_spent")
+        self.assertIn("already spent", rows[0]["detail"])
+        self.assertNotIn("malformed", rows[0]["detail"].lower())
+
+    # -- undetermined stays undetermined --------------------------------
+
+    def test_a_failure_nobody_recorded_reads_as_undetermined(self):
+        """A wallet driven by another tool leaves a `failed` op with no note.
+
+        The honest answer is that this build does not know why, and the
+        sentence has to SAY that rather than pick the likelier story.
+        """
+        path = os.path.join(self.dir, "foreign.db")
+        raw = Wallet(path, MintClient(self.base), MINT_ID)
+        with self.assertRaises(Exception):
+            raw.receive(self.spent_token(500))   # marks the op `failed`
+        raw._db.close()
+
+        [row] = WalletOps(path, self.base).history()
+        self.assertEqual(row["kind"], "receive_failed")
+        self.assertEqual(row["cause"], "unknown")
+        self.assertIn("undetermined", row["detail"])
+        self.assertNotIn("the mint rejected it", row["detail"])
+
+    def test_no_row_ever_claims_a_rejection_the_mint_did_not_make(self):
+        """The invariant, swept over every row a mixed history can produce."""
+        w = self.funded("mixed")
+        w.receive([self.spent_token(500)])          # a real rejection
+        w.receive(["not-a-token"])                  # a local refusal
+        w.pay(1_000)                                # a success
+        self.stop_the_mint_mid_flight(w)
+        with self.assertRaises(WalletOpsError):
+            w.pay(2_000)                            # a request never seen
+        self.restart_mint()
+        w.recover()
+        for row in w.history():
+            with self.subTest(kind=row["kind"], cause=row["cause"]):
+                self.assertIn(row["cause"], ("", ) + _causes())
+                if "reject" in row["detail"].lower():
+                    self.assertIn(row["cause"],
+                                  ("mint_rejected", "already_spent"),
+                                  "a row blamed the mint for a refusal it "
+                                  "never made: %r" % (row,))
+
+    def test_a_recorded_cause_never_carries_a_token_or_a_secret(self):
+        """The sentence is written to disk and shown in a browser.
+
+        Both are places a bearer string must not turn up, and the sentence
+        is built from an exception detail — so pin it here rather than
+        trusting every future raise site to remember.
+        """
+        w = self.funded("leaky")
+        spent = self.spent_token(500)
+        w.receive([spent])
+        self.stop_the_mint_mid_flight(w)
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(5_000)
+        blob = repr(w.history()) + cm.exception.detail
+        self.assertNotIn(spent, blob)
+        self.assertNotIn(spent.rsplit(":", 1)[-1], blob)
+        with open(self.path("leaky"), "rb") as fh:
+            store = fh.read()
+        # the causes table itself: the sentence must not have copied a
+        # secret into a row that is read back and rendered
+        for row in _cause_rows(self.path("leaky")):
+            self.assertNotIn(spent.rsplit(":", 1)[-1], row[2])
+        self.assertIn(b"walletops_op_causes", store)
+
+    def test_a_store_that_refuses_the_note_still_reports_the_failure(self):
+        """Recording is best effort, and "best effort" has to be true.
+
+        If the wallet file will not take the note, the operation's own
+        error must still be raised unchanged and the history row must
+        degrade to "undetermined" — never to a crash, and never to a
+        confident story nobody wrote down.
+        """
+        w = self.funded("readonly")
+        path = self.path("readonly")
+
+        def kill(event, _op_id):
+            if event == "persist_fsync":
+                self.stop_mint()
+                os.chmod(path, 0o444)       # the note cannot be written
+                os.chmod(self.dir, 0o555)   # nor a journal beside it
+
+        w._open()
+        w._wallet.event_hook = kill
+        self.addCleanup(os.chmod, self.dir, 0o755)
+        try:
+            with self.assertRaises(WalletOpsError) as cm:
+                w.pay(5_000)
+            self.assertEqual(cm.exception.cause, "mint_unreachable")
+        finally:
+            os.chmod(self.dir, 0o755)
+            os.chmod(path, 0o600)
+
+        with open(path, "rb") as fh:
+            self.assertNotIn(b"walletops_op_causes", fh.read(),
+                             "the note was written after all, so this test "
+                             "is not exercising the refusal it claims to")
+        row = w.history()[0]
+        self.assertEqual(row["kind"], "pay_pending")
+        self.assertEqual(row["cause"], "unknown")
+        self.assertNotIn("the mint rejected it", row["detail"])
+        self.assertIn("recover", row["detail"])
+
+    def test_causes_are_a_closed_set(self):
+        w = self.funded("closed")
+        self.stop_mint()
+        with self.assertRaises(WalletOpsError) as cm:
+            w.pay(10)
+        self.assertIn(cm.exception.cause, _causes())
+        # an unrecognised cause never widens the vocabulary
+        self.assertEqual(WalletOpsError("x", "y", "creative").cause, "unknown")
+        self.assertEqual(WalletOpsError("x", "y").cause, "unknown")
+
+
+def _causes():
+    return tuple(sys.modules[WalletOps.__module__].CAUSES)
+
+
+def _cause_rows(store_path):
+    """Whatever walletops wrote into its own table, read raw."""
+    import sqlite3
+    conn = sqlite3.connect(store_path)
+    try:
+        return conn.execute(
+            "SELECT op_id, cause, sentence, op FROM walletops_op_causes"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# money stranded by a failed delivery: is the browser really the only copy?
+# ---------------------------------------------------------------------------
+
+
+class TestOutstandingPayments(MintFixture):
+    """The page says the strings it shows are "the only copy". They are not.
+
+    Every payment output was persisted, secret and all, before the exchange
+    was sent (§5.1), and is still in the store afterwards.  These tests
+    pin that: the exact strings come back out of the file, in another
+    process-lifetime's WalletOps instance, with the mint up or down.
+    """
+
+    def funded(self, name="w", face=100_000):
+        w = self.ops(name)
+        w.receive([self.issue(face)])
+        return w
+
+    def strings(self, out):
+        return [t["token"] for p in out["payments"] for t in p["tokens"]]
+
+    def test_the_tokens_a_payment_returned_can_be_read_back(self):
+        w = self.funded("payer")
+        paid = w.pay(5_000)
+        w.close()
+
+        # A new instance on the same file: the browser tab is gone.
+        reread = WalletOps(self.path("payer"), self.base)
+        out = reread.outstanding_payments()
+        self.assertEqual(sorted(self.strings(out)), sorted(paid["tokens"]))
+        self.assertTrue(out["checked"])
+        for payment in out["payments"]:
+            self.assertEqual(payment["amount_mc"], 5_000)
+            self.assertEqual(payment["live_mc"], 5_000)
+            for token in payment["tokens"]:
+                self.assertEqual(token["state"], "unspent")
+
+    def test_the_read_back_strings_are_still_spendable_money(self):
+        """The point of the exercise: recovered strings redeem for real."""
+        w = self.funded("loser")
+        w.pay(5_000)                      # ...and the result panel is lost
+        w.close()
+
+        recovered = self.strings(
+            WalletOps(self.path("loser"), self.base).outstanding_payments())
+        payee = self.ops("payee")
+        got = payee.receive(recovered)
+        self.assertEqual(got["rejected"], [])
+        self.assertEqual(got["accepted_mc"], 4_950)   # 5000 less the 1% burn
+
+    def test_a_delivered_payment_is_reported_spent_not_stranded(self):
+        w = self.funded("deliverer")
+        paid = w.pay(5_000)
+        self.ops("recipient").receive(paid["tokens"])
+        out = w.outstanding_payments()
+        self.assertTrue(out["checked"])
+        for payment in out["payments"]:
+            self.assertEqual(payment["live_mc"], 0)
+            for token in payment["tokens"]:
+                self.assertEqual(token["state"], "spent")
+
+    def test_with_the_mint_down_the_strings_come_back_unclaimed(self):
+        w = self.funded("offline")
+        paid = w.pay(5_000)
+        self.stop_mint()
+        out = w.outstanding_payments()
+        self.assertEqual(sorted(self.strings(out)), sorted(paid["tokens"]))
+        self.assertFalse(out["checked"])
+        for payment in out["payments"]:
+            self.assertIsNone(payment["live_mc"])
+            for token in payment["tokens"]:
+                self.assertIsNone(token["state"])
+
+    def test_an_empty_wallet_has_nothing_outstanding(self):
+        """Nothing to report, and `checked` must not call that a failure.
+
+        ``checked`` answers "is every string below the mint's own word for
+        it", so with no strings it is vacuously True.  It used to be False
+        here, which is the flag that means "the mint could not be asked" —
+        reported with the mint up and answering, about a mint that was
+        never asked because there was nothing to ask.  That is the same
+        conflation of "nothing" with "broken" this module exists to
+        refuse; a caller asking whether the mint is reachable reads
+        summary()["connected"].
+        """
+        self.assertEqual(self.ops("empty-out").outstanding_payments(),
+                         {"checked": True, "mint_id": "", "payments": []})
+        self.assertTrue(self.ops("empty-out").summary()["connected"])
+
+    def test_nothing_to_check_is_still_nothing_when_the_mint_is_down(self):
+        """And "is the mint up" is still answered by the field that means it.
+
+        `checked` stays True with the mint down and nothing outstanding,
+        and that is not a claim about the mint: it says every string in
+        this report carries the mint's own word for it, and there are no
+        strings. The report is complete. Whether the mint is reachable is
+        summary()["connected"], which says False here — so the two
+        questions are asked and answered separately, which is the whole
+        point of not collapsing them.
+        """
+        w = self.ops("empty-down")
+        w.summary()                       # materialise the store
+        self.stop_mint()
+        out = w.outstanding_payments()
+        self.assertEqual(out["payments"], [])
+        self.assertTrue(out["checked"])
+        self.assertFalse(w.summary()["connected"])
+
+    def test_a_token_entry_has_exactly_the_documented_keys(self):
+        """The component contract is four keys, `key` included.
+
+        The module docstring calls these "the exact shapes a caller may
+        rely on", so the key SET is pinned here rather than left to a
+        reader to discover; gui/app.py drops `key` on the wire and that is
+        stated in the same paragraph.
+        """
+        w = self.funded("shape-out")
+        w.pay(1_000)
+        out = w.outstanding_payments()
+        self.assertEqual(set(out), {"checked", "mint_id", "payments"})
+        for payment in out["payments"]:
+            self.assertEqual(set(payment),
+                             {"op_id", "amount_mc", "live_mc", "tokens"})
+            for token in payment["tokens"]:
+                self.assertEqual(set(token),
+                                 {"token", "amount_mc", "key", "state"})
+
+    def test_no_second_copy_of_the_money_is_written_anywhere(self):
+        """The decision: read the store back, never write a sidecar.
+
+        A file of bearer strings beside the wallet would be a second
+        complete copy of live money on disk — and the pinned layout is one
+        file per wallet.
+        """
+        w = self.funded("solo-out")
+        w.pay(1_000)
+        w.outstanding_payments()
+        w.close()
+        made = {e for e in os.listdir(self.dir) if e.startswith("solo-out")}
+        self.assertEqual(made, {"solo-out.db"})
+
+    def test_many_payments_are_checked_in_batches_the_mint_accepts(self):
+        """More outstanding strings than one /v3/status call may carry.
+
+        The wallet's coins ladder-split, so a handful of payments is
+        already dozens of hashes; an unchunked check would be refused
+        wholesale and read as "could not ask", which is the failure this
+        module exists to stop.
+        """
+        w = self.funded("busy", face=200_000)
+        for _ in range(12):
+            w.pay(1_000)
+        out = w.outstanding_payments(limit=100)
+        self.assertTrue(out["checked"], "the mint refused the batch")
+        tokens = [t for p in out["payments"] for t in p["tokens"]]
+        self.assertGreaterEqual(len(tokens), 12)
+        self.assertTrue(all(t["state"] == "unspent" for t in tokens))
+
+    def test_limits_are_validated(self):
+        w = self.funded("limited")
+        w.pay(100)
+        w.pay(100)
+        self.assertEqual(len(w.outstanding_payments(limit=1)["payments"]), 1)
+        for bad in (0, -1, "2", None):
+            with self.subTest(limit=bad):
+                with self.assertRaises(WalletOpsError):
+                    w.outstanding_payments(limit=bad)
+
+
+class TestCausePerOpTable(unittest.TestCase):
+    """The four-way table _settle_cause writes each op's row from.
+
+    A live test can stage three of these (see TestFailureCauses); the
+    fourth — an op nothing resolved in a call that ended in a REFUSAL of a
+    different exchange — is not reachable through the wallet's current
+    control flow, and pinning it here is what stops a future raise site
+    from handing one op's answer to another op's row.
+    """
+
+    def table(self, state, cause, text):
+        module = sys.modules[WalletOps.__module__]
+        return module._cause_for_state(state, cause, text)
+
+    def test_an_op_the_mint_refused_keeps_the_answer_it_got(self):
+        self.assertEqual(
+            self.table("failed", "already_spent", "the mint said so"),
+            ("already_spent", "the mint said so"))
+
+    def test_an_op_the_mint_refused_is_never_called_unreachable(self):
+        """The reported defect, at the exact line that decides it."""
+        cause, sentence = self.table("failed", "mint_unreachable", "no answer")
+        self.assertEqual(cause, "mint_rejected")
+        self.assertIn("answered and rejected", sentence)
+        self.assertNotIn("never", sentence)
+        self.assertNotIn("no answer", sentence)
+
+    def test_an_op_nothing_resolved_keeps_the_transport_failure(self):
+        self.assertEqual(
+            self.table("planned", "mint_stopped", "the mint is down"),
+            ("mint_stopped", "the mint is down"))
+
+    def test_an_op_nothing_resolved_never_borrows_a_refusal(self):
+        cause, sentence = self.table("planned", "mint_rejected", "spent")
+        self.assertEqual(cause, "unknown")
+        self.assertIn("undetermined", sentence)
+        self.assertNotIn("spent", sentence)
+
+    def test_every_pairing_stays_inside_the_closed_vocabulary(self):
+        module = sys.modules[WalletOps.__module__]
+        for state in ("failed", "planned", "sent", "", None):
+            for cause in module.CAUSES:
+                with self.subTest(state=state, cause=cause):
+                    got, sentence = self.table(state, cause, "a sentence")
+                    self.assertIn(got, module.CAUSES)
+                    self.assertTrue(sentence.strip())
 
 
 if __name__ == "__main__":

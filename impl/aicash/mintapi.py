@@ -96,7 +96,13 @@ from aicash.tokencodec import (
     parse_token,
 )
 
-__all__ = ["MintConfig", "MintServer", "make_mint"]
+__all__ = [
+    "MintConfig",
+    "MintServer",
+    "make_mint",
+    "ADMIN_ISSUANCE_OPEN",
+    "ADMIN_ISSUANCE_DISABLED",
+]
 
 logger = logging.getLogger("aicash.mintapi")
 
@@ -121,6 +127,141 @@ _DAY_MS = 86_400_000
 # construction rather than left to publish an impossible limit: see
 # _max_batch_ceiling and MintConfig.
 MAX_BODY_BYTES = 1_048_576
+
+# -- /admin/issue: what the ABSENCE of a credential means ---------------
+#
+# It used to mean "allow everyone". ``MintConfig.admin_token`` defaulted to
+# None and ``admin_authorized()`` returned True for None, so a mint built
+# from a default config served POST /admin/issue -- unlimited issuance, the
+# only endpoint in this codebase that creates money from nothing -- to
+# anybody who could reach the port. Nothing failed a check; there was no
+# check, and no check reads as fine because nothing gets reported. Every
+# embedder who did not think about it got an open mint.
+#
+# So openness is no longer a state you can reach by saying nothing. There
+# are exactly three states, all of them named, and none of them is the
+# default:
+#
+#   admin_token="<secret>"      gated: X-Admin-Token must match (constant time)
+#   ADMIN_ISSUANCE_DISABLED     /admin/issue answers 401 to everyone, always
+#   ADMIN_ISSUANCE_OPEN         /admin/issue answers everyone -- opt in BY NAME
+#
+# WHY THE REFUSAL IS AT CONSTRUCTION TIME, NOT AT REQUEST TIME.
+# Failing closed at request time (mint runs, issuance always 401) would also
+# shut the hole, and it is the gentler change: nothing that never issues
+# would break. It was rejected anyway, for three reasons.
+#   1. The defect is a DECISION THAT WAS NEVER MADE, not a check that failed.
+#      A mint that boots and serves happily has, once again, recorded no
+#      decision anywhere; the operator learns what their mint does only when
+#      they first reach for issuance, which for a real deployment is under
+#      load, in production, months later. Refusing to build puts the
+#      discovery before the port is ever bound.
+#   2. The requirement is that openness be GREPPABLE. ``grep -rn
+#      ADMIN_ISSUANCE_OPEN`` must enumerate every open mint in a tree. That
+#      only holds if silence cannot produce one, which means silence has to
+#      be an error, not a quiet default -- at request time, silence still
+#      produces a running mint whose config file says nothing at all.
+#   3. It converts a security property into a type error, which is the one
+#      class of bug this project's tooling catches for free. Every call site
+#      that was relying on open issuance raises on the line that built the
+#      config, with the three choices in the message.
+# The cost is real and is paid deliberately: existing callers break loudly,
+# including ones that never issue. That is the point -- each break is a
+# place where nobody had decided.
+#
+# Note what is NOT here: there is no silent fallback anywhere below. If the
+# field is unset, or None, or anything that is not one of the three states
+# above, MintConfig raises. Layer 0 (/v3/exchange, /v3/status) is untouched
+# by all of this and stays anonymous for everyone, per L2 and §3.7 -- this
+# gate is only ever on the non-normative §7.1 operator-funding path.
+
+
+class _AdminIssuanceMode:
+    """A named, identity-compared /admin/issue policy. Not a token."""
+
+    __slots__ = ("_name", "_global_name")
+
+    def __init__(self, name: str, global_name: str | None = None):
+        self._name = name
+        # The module-global this instance is bound to. It is what makes the
+        # object survive pickling BY REFERENCE (see __reduce__) instead of
+        # being rebuilt as a look-alike, and it is separate from _name only
+        # because _ADMIN_TOKEN_UNSET reprs as "<unset>", which is not a
+        # legal identifier.
+        self._global_name = global_name or name
+
+    def __repr__(self) -> str:
+        return self._name
+
+    # ------------------------------------------------------------------
+    # Identity survives copying. Everything downstream of these sentinels
+    # compares them with `is` -- MintConfig.__post_init__ validates that
+    # way and admin_authorized() authorizes that way -- so a copy that is
+    # merely EQUAL is not good enough; it has to be the same object.
+    #
+    # This is not hypothetical. dataclasses.replace() on a MintConfig is on
+    # the live path (SupervisionServer.__init__ rebuilds every supervision
+    # mint's config with it), and a caller who hands it a deep-copied config
+    # used to get either a silently-shut ADMIN_ISSUANCE_OPEN mint -- the
+    # non-str fallthrough in admin_authorized() fails closed, so the mint ran
+    # but refused everyone with nothing said anywhere -- or, for
+    # ADMIN_ISSUANCE_DISABLED, a ValueError complaining about "a
+    # _AdminIssuanceMode, which is not ... one of the named issuance modes"
+    # about a value whose own repr() printed ADMIN_ISSUANCE_DISABLED.
+    #
+    # Failing closed was the right direction; failing SILENTLY was not, and
+    # an error message that denies the value it is printing is worse than
+    # either. Preserving identity removes the whole class of problem: after
+    # any copy, pickle or dataclasses.replace round trip the config still
+    # holds the exact object the author named in source.
+    # ------------------------------------------------------------------
+    def __copy__(self) -> "_AdminIssuanceMode":
+        return self
+
+    def __deepcopy__(self, memo) -> "_AdminIssuanceMode":
+        return self
+
+    def __reduce__(self) -> str:
+        # A plain string return tells pickle "this is the module global of
+        # that name" -- it stores a reference, and unpickling re-resolves
+        # aicash.mintapi.<global_name>, which IS this object. The alternative
+        # (reconstructing from __slots__) would produce an equal-looking mode
+        # that no `is` test in this module would ever match.
+        return self._global_name
+
+
+# Opt in to an unauthenticated /admin/issue, by name, in source a reader can
+# grep. Anyone who can reach the port can mint without limit. Legitimate for
+# a throwaway demo or an in-process test harness on a loopback port; never
+# for anything reachable by anything you did not start yourself.
+ADMIN_ISSUANCE_OPEN = _AdminIssuanceMode("ADMIN_ISSUANCE_OPEN")
+
+# No HTTP issuance at all: /admin/issue answers 401 to every caller,
+# including the operator. This is the safe choice for any mint whose
+# issuance happens in-process through ``Ledger.issue``, and it is a real
+# third state, not "no credential" -- it says the endpoint is shut, rather
+# than leaving a reader to infer that from a missing field.
+ADMIN_ISSUANCE_DISABLED = _AdminIssuanceMode("ADMIN_ISSUANCE_DISABLED")
+
+# Distinct from both, and from None: "nobody said". Only ever a default.
+_ADMIN_TOKEN_UNSET = _AdminIssuanceMode("<unset>", "_ADMIN_TOKEN_UNSET")
+
+_ADMIN_TOKEN_GUIDANCE = (
+    "MintConfig.admin_token must be set explicitly, because POST"
+    " /admin/issue creates credits from nothing and an unset credential"
+    " used to mean 'allow everyone'. Choose one, by name:\n"
+    "  admin_token=\"<secret>\"                 gate it on X-Admin-Token\n"
+    "  admin_token=ADMIN_ISSUANCE_DISABLED     no HTTP issuance at all"
+    " (safe default for embedders)\n"
+    "  admin_token=ADMIN_ISSUANCE_OPEN         unauthenticated issuance --"
+    " anyone who reaches the port mints without limit\n"
+    "Both names import from this module:\n"
+    "  from aicash.mintapi import ADMIN_ISSUANCE_DISABLED,"
+    " ADMIN_ISSUANCE_OPEN\n"
+    "Layer 0 (/v3/exchange, /v3/status) is unaffected either way: it is"
+    " anonymous for everyone, per L2 and §3.7."
+)
+
 
 # §3.3 idempotency keys are caller-chosen and are PERSISTED by C04 for the
 # whole §8 recovery window (90 days by default), so an unbounded key is
@@ -260,9 +401,16 @@ class MintConfig:
     ``burn_policy_next`` is ``None`` or ``(BurnPolicy, effective_at_ms)``
     (§7.3 change notice, rendered as the §3.6 descriptor field).
     ``performance`` is ``None`` or the §3.6 self-attested dict (rendered
-    ``null`` when stale — L11). ``admin_token``, when set, gates the
-    non-normative ``/admin/issue`` path via the ``X-Admin-Token`` header;
-    Layer 0 endpoints never require it (L2/§3.7).
+    ``null`` when stale — L11).
+
+    ``admin_token`` is MANDATORY and has no default: it is one of a
+    non-empty secret string (``/admin/issue`` is gated on a constant-time
+    ``X-Admin-Token`` match), ``ADMIN_ISSUANCE_DISABLED`` (the endpoint
+    answers 401 to everyone), or ``ADMIN_ISSUANCE_OPEN`` (unauthenticated
+    issuance, opted into by name). Leaving it out — or passing ``None``,
+    which is what used to mean "allow everyone" — raises. See the
+    ADMIN_ISSUANCE_* block above for why the refusal is here and not at
+    request time. Layer 0 endpoints never require any of it (L2/§3.7).
     """
 
     mint_id: str
@@ -283,7 +431,11 @@ class MintConfig:
     policy_url: str = "about:blank"
     performance: dict | None = None
     profiles: tuple[str, ...] = ()
-    admin_token: str | None = None
+    # No default that grants anything: _ADMIN_TOKEN_UNSET is rejected
+    # by __post_init__. Keyword-only would also work; a sentinel is
+    # used so the refusal can carry _ADMIN_TOKEN_GUIDANCE rather than
+    # Python's bare "missing required argument".
+    admin_token: str | _AdminIssuanceMode = _ADMIN_TOKEN_UNSET
 
     def __post_init__(self):
         if not isinstance(self.mint_id, str) or not self.mint_id:
@@ -372,10 +524,85 @@ class MintConfig:
             for k in _PERFORMANCE_FIELDS:
                 _require_plain_int(f"performance.{k}", perf[k], 0)
             _require_plain_int("performance.window_days", perf["window_days"], 1)
-        if self.admin_token is not None and (
-            not isinstance(self.admin_token, str) or not self.admin_token
-        ):
-            raise ValueError("admin_token must be None or a non-empty string")
+        # The publish blocker (see the ADMIN_ISSUANCE_* block above): the
+        # absence of a credential is REFUSAL, not permission, and it is
+        # refused here — at construction — so no mint ever binds a port
+        # without someone having said which of the three states it is in.
+        tok = self.admin_token
+        if tok is _ADMIN_TOKEN_UNSET:
+            raise ValueError(
+                "admin_token was not set.\n" + _ADMIN_TOKEN_GUIDANCE
+            )
+        if tok is None:
+            # Called out separately from "not set": None was the old spelling
+            # of ADMIN_ISSUANCE_OPEN, so code carrying it forward is code that
+            # asked for an open mint in the old vocabulary. It must not be
+            # read as ADMIN_ISSUANCE_DISABLED by accident (that would silently
+            # break a deliberate demo) nor honored as open (that would keep
+            # the hole). It is an error, naming both replacements.
+            raise ValueError(
+                "admin_token=None no longer means anything. It used to mean"
+                " 'allow everyone', which is how /admin/issue came to be open"
+                " by default.\n" + _ADMIN_TOKEN_GUIDANCE
+            )
+        if tok is ADMIN_ISSUANCE_OPEN or tok is ADMIN_ISSUANCE_DISABLED:
+            pass
+        elif isinstance(tok, str):
+            if not tok:
+                raise ValueError(
+                    "admin_token must be a NON-EMPTY string. An empty string"
+                    " is not a credential: it would gate /admin/issue on an"
+                    " empty X-Admin-Token header, which every caller can"
+                    " send.\n" + _ADMIN_TOKEN_GUIDANCE
+                )
+            if not tok.strip():
+                # Same hole as the empty string, reached the way it actually
+                # happens: a credential read from a file or an environment
+                # variable that turned out to hold only a newline or a run of
+                # spaces. `if not tok` lets those through -- they are truthy --
+                # so the mint would come up gated on whitespace, which every
+                # caller can send just as easily as an empty header. It is
+                # refused rather than stripped, because stripping would
+                # silently serve a DIFFERENT credential than the one supplied.
+                # Whitespace INSIDE an otherwise real token is left alone.
+                raise ValueError(
+                    "admin_token is %d character(s) of whitespace and nothing"
+                    " else, which is not a credential: /admin/issue would be"
+                    " gated on a header any caller can send. This is what an"
+                    " empty token file or an unset environment variable looks"
+                    " like by the time it gets here. It is refused rather than"
+                    " trimmed, because trimming would gate the mint on a"
+                    " credential you did not supply.\n"
+                    % (len(tok),) + _ADMIN_TOKEN_GUIDANCE
+                )
+        elif isinstance(tok, _AdminIssuanceMode):
+            # An issuance mode that is not one of the two public ones. The
+            # sentinels preserve identity across copy/pickle now (see
+            # _AdminIssuanceMode), so the only way to get here is to have
+            # constructed a mode of your own -- and this message must not
+            # claim the value "is not one of the named issuance modes" when
+            # its own repr() may well print one of those names. Say what is
+            # actually wrong: it is not THE object.
+            raise ValueError(
+                "admin_token was given an issuance mode (%r) that is not the"
+                " ADMIN_ISSUANCE_OPEN or ADMIN_ISSUANCE_DISABLED object from"
+                " aicash.mintapi. These are compared by identity, so a"
+                " look-alike built elsewhere is not accepted; import the"
+                " names rather than reconstructing them.\n" % (tok,)
+                + _ADMIN_TOKEN_GUIDANCE
+            )
+        else:
+            # The TYPE, never the value: whatever was passed was meant to be
+            # a credential, and §3.1 requirement 5's rule about not putting
+            # secret material into log streams applies to exception text just
+            # as much (a ValueError from a mint that fails to start is going
+            # straight into somebody's log).
+            raise ValueError(
+                "admin_token was given a %s, which is not a credential and is"
+                " not one of the named issuance modes. (The value is not"
+                " echoed here: it was meant to be a secret.)\n"
+                % (type(tok).__name__,) + _ADMIN_TOKEN_GUIDANCE
+            )
 
 
 def _call_rejection(reason: str) -> tuple[int, dict]:
@@ -813,6 +1040,18 @@ class _Core:
                 "as_of": mint_time,
             },
             "signing_pubkey": pubkey_b64u(c.signing_public),
+            # §3.6: "All fields mandatory unless marked profile-scoped", and
+            # signing_pubkey_next is typed `null | {...}` and carries no
+            # profile marking — so an explicit null IS the conforming way to
+            # say "no rotation announced", while omitting the key leaves a
+            # client reading §3.6 unable to tell a mint with nothing to
+            # announce from an older revision that predates the field.
+            # Hard-coded null: rotation itself is out of scope per L17, and
+            # nothing in this file may ever set it without the cross-signature
+            # §3.6 requires (a new key with no cross-signature from its
+            # predecessor is a DIFFERENT SIGNER, and monotonicity proofs do
+            # not span the break).
+            "signing_pubkey_next": None,
         }
 
     # -- POST /admin/issue (non-normative §7.1 operator funding) ----------
@@ -820,13 +1059,23 @@ class _Core:
     def admin_authorized(self, presented_token: str | None) -> bool:
         """Constant-time admin-token check (credential-comparison hygiene).
 
-        True when no token is configured (open test/ops path) or when the
-        presented header matches. ``hmac.compare_digest`` over utf-8 bytes
-        avoids the timing side channel of ordinary string inequality.
+        True only when the mint was explicitly built ADMIN_ISSUANCE_OPEN, or
+        when a configured secret matches the presented header. There is no
+        longer a "no token configured" branch that returns True: MintConfig
+        will not build without one of the three named states, so by the time
+        any request reaches here somebody has decided. ``hmac.compare_digest``
+        over utf-8 bytes avoids the timing side channel of ordinary string
+        inequality — unchanged, and the reason the match arm is written this
+        way rather than with ``==``.
         """
         configured = self.config.admin_token
-        if configured is None:
+        if configured is ADMIN_ISSUANCE_OPEN:
+            # Opted into by name at construction; see ADMIN_ISSUANCE_OPEN.
             return True
+        if not isinstance(configured, str):
+            # ADMIN_ISSUANCE_DISABLED, and the fallthrough for anything else
+            # that somehow got past validation: refuse. Never "allow".
+            return False
         presented = presented_token if isinstance(presented_token, str) else ""
         return hmac.compare_digest(
             configured.encode("utf-8", "surrogateescape"),
@@ -1188,6 +1437,16 @@ class MintServer:
                     " via make_mint(config, db_path), or construct the Ledger"
                     " with the config's values." % (name, cfg_v, led_v)
                 )
+        if config.admin_token is ADMIN_ISSUANCE_OPEN:
+            # Explicitly chosen, so it is allowed — but never silent. The
+            # whole defect class was "no check reads as fine because nothing
+            # gets reported", and an open mint is exactly the state an
+            # operator should be told about every single time one starts.
+            logger.warning(
+                "mint %s: /admin/issue is UNAUTHENTICATED"
+                " (ADMIN_ISSUANCE_OPEN) — anyone who can reach this port can"
+                " mint without limit", config.mint_id,
+            )
         self._core = _Core(config, ledger)
         self._httpd: _MintHTTPServer | None = None
         self._thread: threading.Thread | None = None

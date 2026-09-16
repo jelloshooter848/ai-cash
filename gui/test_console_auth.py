@@ -151,12 +151,18 @@ def wait_for(predicate, what, timeout=45.0):
                    % (what, timeout, last))
 
 
-def start_console(port, extra=(), workdir=None):
-    """A real `python3 mint_console.py` process, as an operator runs it."""
+def start_console(port, extra=(), workdir=None, token_file=True):
+    """A real `python3 mint_console.py` process, as an operator runs it.
+
+    ``token_file=False`` omits --admin-token-file entirely, which is what a
+    --no-admin-token console has to be started as: naming a credential file
+    and asking for no credential is refused as contradictory.
+    """
+    cred = (["--admin-token-file", STATE["token_file"]] if token_file else [])
     proc = subprocess.Popen(
         [sys.executable, CONSOLE, "--port", str(port),
-         "--mint-port", str(STATE["mint_port"]), "--mint-id", MINT_ID,
-         "--admin-token-file", STATE["token_file"]] + list(extra),
+         "--mint-port", str(STATE["mint_port"]), "--mint-id", MINT_ID]
+        + cred + list(extra),
         cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out, err = Reader(proc.stdout), Reader(proc.stderr)
     proc.readers = (out, err)
@@ -802,6 +808,179 @@ class TestDefaultsAndTheEscapeHatch(ConsoleCase):
             port, "POST", "/api/issue", body={"amount_mc": 1000, "count": 1},
             headers={"Origin": "http://evil.example"})
         self.assertEqual(status, 403)
+
+
+class TestStartupCredential(unittest.TestCase):
+    """8. The absence of an operator credential is REFUSED, not assumed.
+
+    Same shape as the library's L19 change, at the console: a console with
+    no credential cannot issue, so it must say so at startup rather than at
+    the first click of Issue. And "no credential" has to include the forms
+    an absent credential actually arrives in -- a missing file, a null
+    field, an empty string, a variable that expanded to whitespace -- not
+    just the ones that are falsy in Python.
+    """
+
+    def run_console(self, extra, timeout=30):
+        """Start a console that is expected to REFUSE, and collect it."""
+        proc = subprocess.Popen(
+            [sys.executable, CONSOLE, "--port", "0",
+             "--mint-port", str(STATE["mint_port"]), "--mint-id", MINT_ID]
+            + list(extra),
+            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self.fail("the console STARTED on a credential it should have "
+                      "refused; it did not exit. stdout=%r" % out[:400])
+        return proc.returncode, out, err
+
+    def token_file(self, contents):
+        d = tempfile.mkdtemp(prefix="consoletok-")
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "mint-admin-keys.json")
+        with open(path, "w") as fh:
+            fh.write(contents)
+        return path
+
+    def test_no_credential_flag_at_all_refuses_to_start(self):
+        code, _out, err = self.run_console(
+            ["--admin-token-file", self.token_file('{}')])
+        self.assertEqual(code, 1, err)
+        self.assertIn("will not start without one", err)
+        # It must name all three ways out, or the refusal is a dead end.
+        for flag in ("--admin-token-file", "--admin-token", "--no-admin-token"):
+            self.assertIn(flag, err)
+
+    def test_a_missing_token_file_refuses_to_start(self):
+        d = tempfile.mkdtemp(prefix="consoletok-")
+        self.addCleanup(shutil.rmtree, d, True)
+        code, _out, err = self.run_console(
+            ["--admin-token-file", os.path.join(d, "nope.json")])
+        self.assertEqual(code, 1, err)
+        self.assertIn("does not exist", err)
+
+    def test_every_shape_of_an_absent_credential_refuses_to_start(self):
+        """The forms an empty credential really arrives in. A whitespace
+        token is the one that used to get through: it is truthy, so the
+        console started "credentialled", promised issuance and collected a
+        401 at the first click."""
+        cases = {
+            "null field": '{"admin_token": null}',
+            "empty string": '{"admin_token": ""}',
+            "one space": '{"admin_token": " "}',
+            "a newline": '{"admin_token": "\\n"}',
+            "tabs and spaces": '{"admin_token": " \\t "}',
+            "wrong type": '{"admin_token": 12345}',
+            "no field": '{"something_else": "x"}',
+        }
+        for label, blob in cases.items():
+            with self.subTest(credential=label):
+                code, out, err = self.run_console(
+                    ["--admin-token-file", self.token_file(blob)])
+                self.assertEqual(code, 1, "%s: %r" % (label, err))
+                self.assertIn("no operator credential", err)
+                self.assertNotIn("?k=", out,
+                                 "%s: a capability URL was printed by a "
+                                 "console that should not have started"
+                                 % label)
+
+    def test_an_empty_or_whitespace_admin_token_flag_refuses_to_start(self):
+        for bad in ("", " ", "   ", "\t"):
+            with self.subTest(token=repr(bad)):
+                code, _out, err = self.run_console(["--admin-token", bad])
+                self.assertEqual(code, 1, err)
+                self.assertIn("no operator credential", err)
+
+    def test_the_refusal_never_echoes_the_credential_it_read(self):
+        """A console that fails to start writes to somebody's terminal and
+        very often to a log. The value it rejected was meant to be secret
+        even when it is junk."""
+        secret = "not-a-real-token-but-still-a-secret-9f3a"
+        code, out, err = self.run_console(
+            ["--admin-token-file", self.token_file(
+                '{"admin_token": %d}' % 4242)])
+        self.assertEqual(code, 1)
+        self.assertNotIn("4242", err)
+        self.assertNotIn("4242", out)
+        # And a badly-formed file's CONTENTS never reach the message either.
+        code, out, err = self.run_console(
+            ["--admin-token-file", self.token_file(secret)])
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, err, "the file's contents were echoed")
+        self.assertNotIn(secret, out)
+
+    def test_no_admin_token_starts_read_only_and_issuance_answers_503(self):
+        """The deliberate opt-out. It must work, it must say what it is,
+        and its 503 must not claim the mint refused anything."""
+        port = free_port()
+        proc, out, _err = start_console(port, extra=["--no-admin-token"],
+                                        token_file=False)
+        self.addCleanup(stop, proc)
+        banner = wait_for(lambda: "?k=" in out.text and out.text,
+                          "the read-only console banner")
+        self.assertIn("cannot issue", banner)
+        self.assertIn("read-only", banner.lower())
+        self.assertNotIn("minting credential", banner,
+                         "a console with NO credential said its captured "
+                         "stdout holds a minting credential")
+        key = re.search(r"\?k=([A-Za-z0-9_\-]+)", banner).group(1)
+        status, hdrs, _b = raw_request(port, "GET", "/?k=" + key)
+        self.assertEqual(status, 200)
+        cookie = hdrs.get("Set-Cookie").split(";")[0]
+        # Read-only really is read-only, and really does still read.
+        status, _h, body = raw_request(port, "GET", "/api/descriptor",
+                                       headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+        status, _h, body = raw_request(
+            port, "POST", "/api/issue", body={"amount_mc": 1000, "count": 1},
+            headers={"Cookie": cookie})
+        self.assertEqual(status, 503, body)
+        err = json.loads(body)["error"]
+        self.assertEqual(err["reason"], "no_admin_credential")
+        # The pinned vocabulary: the mint never saw this request, so nothing
+        # here may report it as something the mint refused. The detail is
+        # allowed to say the mint did NOT refuse it -- that is the point --
+        # so this looks for the CLAIM, not for the word.
+        detail = err["detail"].lower()
+        self.assertIn("did not send", detail)
+        self.assertIn("never saw it", detail)
+        self.assertIn("did not refuse it", detail)
+        for claim in ("the mint refused", "the mint rejected",
+                      "rejected by the mint", "refused by the mint",
+                      "the mint answered"):
+            self.assertNotIn(claim, detail,
+                             "a request the mint never received was reported "
+                             "as something the mint did")
+
+    def test_asking_for_no_credential_is_not_overridden_by_one(self):
+        """--no-admin-token used to be checked only AFTER the credential
+        lookup, so on any machine where the default mint-admin-keys.json
+        existed the flag was silently ignored and the console came up
+        holding a live minting credential. Naming a credential alongside it
+        is now refused as the contradiction it is."""
+        for extra in (["--no-admin-token", "--admin-token", "some-secret"],
+                      ["--no-admin-token", "--admin-token-file",
+                       STATE["token_file"]]):
+            with self.subTest(argv=extra):
+                code, out, err = self.run_console(extra)
+                self.assertEqual(code, 2, err)
+                self.assertIn("contradictory", err)
+                self.assertNotIn("?k=", out)
+
+    def test_a_read_only_console_still_needs_its_session_cookie(self):
+        """--no-admin-token drops the operator credential, not the lock on
+        the console's own door."""
+        port = free_port()
+        proc, _out, _err = start_console(port, extra=["--no-admin-token"],
+                                         token_file=False)
+        self.addCleanup(stop, proc)
+        status, _h, body = raw_request(
+            port, "POST", "/api/issue", body={"amount_mc": 1, "count": 1})
+        self.assertEqual(status, 401, body)
 
 
 class TestAuthUnit(unittest.TestCase):

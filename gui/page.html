@@ -163,9 +163,12 @@ text-align:center;margin-right:8px;font-weight:700}
   <div class="note">There is one current wallet on this page. This dropdown
     and the <b>active</b> wallet in sections 2 and 3 are the same thing —
     change either and both follow.</div>
-  <button id="f-go">Issue into wallet</button>
+  <div id="f-cost" class="note"></div>
   <div class="warn">Issuing creates new money out of nothing. It is signed into
-    the supply snapshot and cannot be undone.</div>
+    the supply snapshot and cannot be undone. Crediting it to the wallet is an
+    exchange like any other, so the mint burns part of it on the way in — the
+    line above says how much, before you press.</div>
+  <button id="f-go">Issue into wallet</button>
   <div id="f-out"></div>
 </div>
 
@@ -193,7 +196,8 @@ text-align:center;margin-right:8px;font-weight:700}
   <h2><span class="step">3</span>Send &amp; receive</h2>
   <div class="sub" style="margin-bottom:14px">active wallet:
     <b id="active-name">none</b> &nbsp;·&nbsp; balance
-    <b id="active-balance">-</b></div>
+    <b id="active-balance">-</b>
+    <span id="active-stale" class="tag" hidden>last known</span></div>
 
   <h3>Pay</h3>
   <div class="row">
@@ -264,15 +268,28 @@ let quoteSeq = 0;
    writing the running mint's settings over what they are typing. */
 let settingsEdited = false;
 let settingsInitialised = false;
-/* app.py requires a session cookie on every /api/* route, handed out when
-   the browser opened the one-time URL printed in its terminal. Null while
-   that is working. Otherwise {kind, reason, detail} where kind is
-   "unauthorized" (401: no cookie, or not this server's) or "blocked"
-   (403/421: the Host or Origin check refused the request). The two mean
-   very different things, so they never share a message — and neither is
-   ever allowed to look like "the mint is stopped" or "you have no
-   wallets", which is exactly what an un-guarded failure path renders. */
-let authFailure = null;
+/* Why this page is not seeing app.py, or null while it is. FOUR kinds, and
+   they are four different truths:
+     unauthorized  401: no session cookie, or not one this server issued.
+                   app.py is alive and refused us.
+     blocked       403/421: the Host or Origin check refused the request. It
+                   did not arrive addressed to this server's own loopback
+                   address, which nothing the operator types can cause.
+     unreachable   the fetch itself failed: app.py is not answering on this
+                   address at all. This says NOTHING about the mint. A mint
+                   started from this page is a separate process and app.py's
+                   own goodbye line is "A mint started from here keeps
+                   running" — so it very probably still is.
+     timeout       the deadline passed with no answer. Whether the request
+                   arrived, whether app.py is alive, whether the mint is up:
+                   all undetermined.
+   All four mean the same thing about the screen, and that is the whole
+   point of holding them in one variable: every figure below was read at
+   some earlier moment, or was never read at all. None of them is ever
+   allowed to render as "the mint is stopped" or "you have no wallets",
+   which is exactly what the un-guarded unreachable path used to do — it
+   reported a stopped mint to an operator whose mint was up and serving. */
+let linkFailure = null;
 /* True only once the OPERATOR has picked a recipient with their own hand.
    The select's own value cannot answer this: the very first renderWallets()
    runs before any wallet exists, when the only option on offer is the
@@ -314,32 +331,45 @@ async function api(path, body, ms) {
       const reason = err.reason || ("http_" + res.status);
       const detail = err.detail || ("The server answered " + res.status +
                                     " with no explanation.");
-      noteAuthStatus(res.status, reason, detail);
-      return {ok: false, reason: reason, detail: detail, data: data};
+      noteHttpStatus(res.status, reason, detail);
+      // BOTH machine codes are carried up, never one. app.py sends its own
+      // `reason` (which may name a local fault: bad_request, wallet_error)
+      // and `cause`, the closed money vocabulary walletops determined at the
+      // moment of failure. A caller that reads only `reason` never sees the
+      // cause at all, which is how the closed set stopped reaching the
+      // screen last round. failCode() below decides which one speaks.
+      return {ok: false, reason: reason, detail: detail,
+              cause: err.cause || "", data: data};
     }
     if (data === null) {
       return {ok: false, reason: "bad_response",
               detail: "The server answered with something that is not JSON."};
     }
-    if (authFailure) clearAuthFailure();   // we are back in
+    if (linkFailure) clearLinkFailure();   // we are back in
     return {ok: true, data: data};
   } catch (e) {
+    // Neither of these is an answer, so neither is allowed to be rendered
+    // as one. They set the same page-wide "I do not know" state a 401 does.
     if (e.name === "AbortError") {
-      return {ok: false, reason: "timeout",
-              detail: "No answer after " + Math.round(limit / 1000) +
-                      " seconds. Nothing is hanging in the background — press " +
-                      "Refresh to see the real state."};
+      const detail = "No answer after " + Math.round(limit / 1000) +
+                     " seconds, so this page stopped waiting. It cannot tell " +
+                     "whether the request never arrived or is still being " +
+                     "worked on, and it will not guess.";
+      setLinkFailure("timeout", "timeout", detail);
+      return {ok: false, reason: "timeout", detail: detail};
     }
-    return {ok: false, reason: "unreachable",
-            detail: "Could not reach the GUI server at all (" + e.message +
-                    "). Is app.py still running in your terminal?"};
+    const detail = "Could not reach the GUI server at all (" + e.message +
+                   "). Is app.py still running in your terminal?";
+    setLinkFailure("unreachable", "unreachable", detail);
+    return {ok: false, reason: "unreachable", detail: detail};
   } finally { clearTimeout(timer); }
 }
 
-/* ---------- authentication ---------- */
+/* ---------- is this page seeing app.py at all? ---------- */
 /* app.py hands this page a session cookie when it is opened at the URL it
    printed, and requires that cookie on every /api/* route, GET included.
-   Two failures have to be told apart:
+   Four failures have to be told apart, and none of them may be told as
+   any of the others:
      401        no cookie, or not one this server issued — the page was
                 opened without the key, or app.py has restarted since (it
                 mints a fresh key in memory every start and writes it
@@ -347,33 +377,48 @@ async function api(path, body, ms) {
      403 / 421  the Host or Origin check refused the request, meaning it
                 did not arrive addressed to this server's own loopback
                 address. Nothing the operator does at the keyboard causes
-                that, which is why it gets its own, louder sentence.
+                that, which is why it gets its own, louder sentence;
+     no answer  the fetch failed outright: nothing is listening here. This
+                is a fact about app.py and about NOTHING ELSE — above all
+                it is not a report that the mint is stopped;
+     no answer
+     in time    the deadline passed. Undetermined, and said so.
    Either way the page stops pretending it knows anything: no spinner, no
    empty state, no "no mint is running". */
-/* The status code alone is NOT enough to classify this, and treating it as
-   enough was a bug worth spelling out: app.py also raises 403
-   "not_authorized" from /api/mint/issue when the MINT rejects the operator
-   credential — an ordinary stale mint-admin-keys.json — and a page that
-   reads that as the Host check firing tells the operator an attack is in
-   progress and disables a Stop button that would have worked. So only the
-   two reasons app.py's own gate emits count, and any other 401/403 is left
-   to the ordinary error path that renders it next to the control that
-   caused it. */
+/* The status code alone is NOT enough to classify an HTTP failure, and
+   treating it as enough was a bug worth spelling out: app.py also raises
+   403 "not_authorized" from /api/mint/issue when the MINT rejects the
+   operator credential — an ordinary stale mint-admin-keys.json — and a
+   page that reads that as the Host check firing tells the operator an
+   attack is in progress and disables a Stop button that would have
+   worked. So only the two reasons app.py's own gate emits count, and any
+   other 401/403 is left to the ordinary error path that renders it next
+   to the control that caused it. */
 const BLOCKED_REASONS = {not_loopback: true, cross_site: true};
-function noteAuthStatus(status, reason, detail) {
+function noteHttpStatus(status, reason, detail) {
   if (status === 401 && reason === "unauthorized") {
-    setAuthFailure("unauthorized", reason, detail);
+    setLinkFailure("unauthorized", reason, detail);
   } else if ((status === 403 || status === 421) && BLOCKED_REASONS[reason]) {
-    setAuthFailure("blocked", reason, detail);
+    setLinkFailure("blocked", reason, detail);
   }
 }
-function setAuthFailure(kind, reason, detail) {
-  authFailure = {kind: kind, reason: reason, detail: detail};
-  renderAuthBanner();
-  // Immediately, not at the next poll: a 401 that arrives in the middle of
-  // a Pay or a Receive must leave every control that moves money dead and
-  // no button stuck on "paying...". Pure DOM work, so it is safe to do
-  // from inside api().
+/* The two kinds where app.py answered at all. The other two mean the
+   server did not, which is why the poll keeps retrying them: an operator
+   who restarts app.py gets the page back without pressing anything, and
+   one who is locked out has to go and fetch a URL instead. */
+const ANSWERED = {unauthorized: true, blocked: true};
+function setLinkFailure(kind, reason, detail) {
+  const same = linkFailure && linkFailure.kind === kind &&
+               linkFailure.reason === reason && linkFailure.detail === detail;
+  linkFailure = {kind: kind, reason: reason, detail: detail};
+  // Already in this exact state and already drawn in it: re-drawing every
+  // four seconds would only shuffle the text under the operator's eyes.
+  if (same) return;
+  renderLinkBanner();
+  // Immediately, not at the next poll: a failure that arrives in the
+  // middle of a Pay or a Receive must leave every control that moves money
+  // dead and no button stuck on "paying...". Pure DOM work, so it is safe
+  // to do from inside api().
   renderMint();
   // Every other panel that is showing a figure read from app.py, too. A
   // lockout that arrives from Issue, Pay, Receive or Recover used to leave
@@ -387,23 +432,56 @@ function setAuthFailure(kind, reason, detail) {
   // make, so it is voided rather than left on screen looking agreed to.
   invalidateQuote();
   say($("p-quote"), "warn bad", "No cost can be checked and nothing can be " +
-      "paid: this page is locked out. See the message at the top.");
+      "paid: " + failureBecause() + ". See the message at the top.");
 }
-function clearAuthFailure() {
-  authFailure = null;
-  renderAuthBanner();
+function clearLinkFailure() {
+  if (!linkFailure) return;
+  linkFailure = null;
+  renderLinkBanner();
 }
-function renderAuthBanner() {
+/* One clause, so that every panel says the same true thing about why it is
+   caveated. "Refused" and "did not answer" are not interchangeable. */
+function failureBecause() {
+  if (!linkFailure) return "";
+  if (linkFailure.kind === "unauthorized")
+    return "this page is not signed in, and app.py answers it nothing";
+  if (linkFailure.kind === "blocked")
+    return "app.py is refusing this page's requests";
+  if (linkFailure.kind === "timeout")
+    return "app.py did not answer this page in time";
+  return "this page cannot reach app.py at all";
+}
+/* The short kicker the caveats lead with. */
+function failureTag() {
+  if (!linkFailure) return "";
+  if (linkFailure.kind === "unauthorized") return "Not signed in";
+  if (linkFailure.kind === "blocked") return "Refused";
+  if (linkFailure.kind === "timeout") return "No answer in time";
+  return "Cannot reach the GUI server";
+}
+function renderLinkBanner() {
   const el = $("auth-banner");
-  if (!authFailure) {
+  if (!linkFailure) {
     el.hidden = true; el.className = "banner"; el.innerHTML = ""; return;
   }
-  const said = '<div class="note">app.py said: ' + esc(authFailure.detail) +
-               '  [' + esc(authFailure.reason) + ']</div>';
+  const kind = linkFailure.kind;
+  const said = '<div class="note">' +
+    (ANSWERED[kind] ? "app.py said: " + esc(plain(linkFailure.detail))
+                    : esc(plain(linkFailure.detail))) +
+    '  [' + esc(linkFailure.reason) + ']</div>';
+  // The one sentence that has to be in all four of these, because it is the
+  // one an operator will otherwise supply for themselves and get wrong.
+  const notStopped =
+    '<b>This is not a report about the mint.</b> A mint started from this ' +
+    'page is a separate process with its own port, and app.py says so as it ' +
+    'exits: <i>"A mint started from here keeps running."</i> It may well be ' +
+    'up and serving right now. This page cannot see it, which is a different ' +
+    'thing, and the only one of the two it is entitled to tell you.';
   el.hidden = false;
-  el.className = "banner" + (authFailure.kind === "blocked" ? " alarm" : "");
-  el.innerHTML = authFailure.kind === "unauthorized"
-    ? '<span class="kick">Not signed in</span>' +
+  el.className = "banner" + (kind === "blocked" ? " alarm" : "");
+  if (kind === "unauthorized") {
+    el.innerHTML =
+      '<span class="kick">Not signed in</span>' +
       '<span class="ttl">This page is not signed in, so nothing on it is ' +
       'live.</span> Either it ' +
       'was opened without the key from the terminal, or its session has ' +
@@ -413,8 +491,10 @@ function renderAuthBanner() {
       'state, and no button here can move money until you are back in. ' +
       'Reopen the <b>http://127.0.0.1:&lt;port&gt;/?k=…</b> URL that app.py ' +
       'printed in the terminal it is running in; that link is what sets the ' +
-      'session cookie. Then press Refresh.' + said
-    : '<span class="kick">&#9888; Refused &mdash; check this before doing ' +
+      'session cookie. Then press Refresh.' + said;
+  } else if (kind === "blocked") {
+    el.innerHTML =
+      '<span class="kick">&#9888; Refused &mdash; check this before doing ' +
       'anything else</span>' +
       '<span class="ttl">app.py refused this request as coming from ' +
       'somewhere other than itself.</span> It answers only requests ' +
@@ -427,6 +507,168 @@ function renderAuthBanner() {
       'wallet in its workdir, so check the address bar against what app.py ' +
       'printed, and if you cannot account for the difference, close the tab ' +
       'and stop app.py.' + said;
+  } else if (kind === "timeout") {
+    el.innerHTML =
+      '<span class="kick">No answer in time</span>' +
+      '<span class="ttl">app.py did not answer before this page gave up ' +
+      'waiting, so the state below is undetermined.</span> This page cannot ' +
+      'tell whether the request never arrived, or arrived and is taking ' +
+      'longer than the deadline it was given, and it will not pick one: ' +
+      'nothing below is known to be current, and nothing here can move ' +
+      'money until something answers. ' + notStopped + ' The page keeps ' +
+      'retrying every few seconds on its own; <b>Refresh</b> retries now. ' +
+      'If a payment was in flight when this appeared, its outcome is ' +
+      'undetermined too — once the page is answering again, use <b>Recover ' +
+      'interrupted payments</b> under History to ask the mint what really ' +
+      'happened before you pay again.' + said;
+  } else {
+    el.innerHTML =
+      '<span class="kick">Cannot reach the GUI server</span>' +
+      '<span class="ttl">This page cannot reach app.py, so it does not know ' +
+      'the state of anything below.</span> Its requests are not being ' +
+      'answered at all: nothing is listening at this address. Most often ' +
+      'that is app.py having been stopped in its terminal, or the terminal ' +
+      'itself having been closed. ' + notStopped + ' Everything below is the ' +
+      'last thing this page managed to read, if it read anything, and no ' +
+      'button here can move money. Start app.py again, open the ' +
+      '<b>http://127.0.0.1:&lt;port&gt;/?k=…</b> URL it prints — it is a new ' +
+      'key every start — and this page will pick up again by itself; ' +
+      '<b>Refresh</b> retries now.' + said;
+  }
+}
+
+/* ---------- what went wrong, in English ---------- */
+/* The closed set of machine reasons a failed wallet operation carries,
+   turned into the sentence an operator reads. Two rules run this table and
+   both are the point of it:
+     - "the mint rejected it" is said ONLY for mint_rejected. A request the
+       mint never received was not rejected by it, and a page that says so
+       sends its operator to debug the wrong process.
+     - unknown reads as unknown. It is never dressed up as a cause.
+   Anything not in this table is shown as the server spelled it, because
+   inventing an explanation for a code this page has never seen is the
+   exact failure this table exists to stop. */
+const REASON_ENGLISH = {
+  // NOT "so it never saw this request". A dead socket establishes that no
+  // ANSWER came back; it does not establish that the request never landed.
+  // The whole reason the wallet persists before sending (§5.1) and the whole
+  // reason recover() exists is that it may have. walletops stopped
+  // over-claiming this last round and the sentence it now hands up says
+  // "undetermined" -- so a headline that said "never saw it" was printed
+  // directly above a detail that contradicted it.
+  mint_unreachable: "the mint did not answer and refused nothing, so " +
+    "whether it ever saw this request is undetermined",
+  mint_stopped: "the mint is not running",
+  mint_rejected: "the mint answered and refused it",
+  already_spent: "that token had already been spent — bearer value is " +
+    "one-shot, and somebody redeemed it first",
+  malformed_token: "that string is not a token: a truncated paste, or not " +
+    "a token at all",
+  wrong_mint: "that token was issued by a different mint, so this one has " +
+    "no record of it",
+  insufficient_funds: "this wallet does not hold enough",
+  unknown: "why this failed is undetermined — this page does not know, and " +
+    "will not guess",
+  // Spellings this page has also been handed. Same sentences, so the
+  // screen reads the same whichever layer phrased the failure.
+  not_from_this_mint: "that token was issued by a different mint, so this " +
+    "one has no record of it",
+  coins_not_from_this_mint: "the mint did not recognise this wallet's own " +
+    "stored coins as its own: nothing you typed is wrong, the wallet file " +
+    "is bound to a different mint than the one answering on this address",
+  rejected_by_mint: "the mint answered and refused it",
+  wrong_lock_secret: "that token is locked, and the secret offered does " +
+    "not open it",
+  bad_lock_witness: "that token is locked, and the witness offered is the " +
+    "wrong length",
+  lock_expired: "that token's lock deadline has passed",
+  refund_too_early: "that token's lock has not expired yet, so it cannot " +
+    "be refunded",
+  not_refundable: "that token has no refund path the mint will honour",
+  amount_mismatch: "the wallet built an exchange whose inputs did not " +
+    "equal its outputs plus the mint's burn, and the mint refused it",
+  duplicate_request: "the same request was replayed with different " +
+    "contents, and the mint refused it",
+  timeout: "nothing answered before this page gave up waiting, so whether " +
+    "it happened is undetermined",
+  unreachable: "this page could not reach the GUI server at all",
+  unauthorized: "app.py would not answer: this page is not signed in"
+};
+function reasonKey(reason) {
+  return String(reason === undefined || reason === null ? "" : reason)
+    .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+function reasonEnglish(reason) {
+  return REASON_ENGLISH[reasonKey(reason)] || "";
+}
+/* The one machine code a failed api() call is explained by, chosen from the
+   two app.py sends.
+     - `reason` wins when this page has English for it: it is the most
+       specific thing the answering layer said.
+     - otherwise the closed-set `cause` speaks, which is how a failure whose
+       reason is a phrase this page has never seen ("bad mint response")
+       still reaches the screen as the cause walletops actually determined.
+     - `cause` is NOT consulted when it is "unknown", because app.py defaults
+       every local fault it raises on its own to "unknown" — a bad name, a
+       bad amount, an empty paste. That default is the absence of a money
+       cause, not a finding that the cause is undetermined, and printing
+       "undetermined" over a detail that plainly says what is wrong would be
+       this page asserting something it was not told. With no code it has
+       English for, whyHtml/whyText lead with the server's own sentence.
+   History rows are the other half of this and are handled where they are
+   rendered: there the recorded cause ALWAYS speaks, "unknown" included,
+   because walletops writes that row only when it determined the cause was
+   undetermined and phrases the detail to say so. */
+function failCode(r) {
+  if (!r) return "";
+  if (reasonEnglish(r.reason)) return r.reason;
+  if (r.cause && reasonKey(r.cause) !== "unknown" && reasonEnglish(r.cause))
+    return r.cause;
+  return r.reason || "";
+}
+/* A section number is a citation, not an explanation, and the operator of
+   this page was promised they would not have to read the spec. Strip it
+   and leave the English sentence that was already around it. Nothing else
+   is removed: the words a lower layer wrote are the words shown. */
+function plain(text) {
+  return String(text === undefined || text === null ? "" : text)
+    .replace(/\s*\(\s*§[^)]*\)/g, "")
+    .replace(/§\s*\d+(?:\.\d+)*/g, "")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+/* One capital and one full stop, so a phrase from a table can open a line. */
+function sentence(text) {
+  const t = plain(text);
+  if (!t) return "";
+  return t.charAt(0).toUpperCase() + t.slice(1) +
+         (/[.!?]$/.test(t) ? "" : ".");
+}
+/* Same rule as whyHtml below, for the places that want one run of text
+   rather than two blocks. Never says the same thing twice: when this page
+   has no English for the code, the server's own sentence IS the headline
+   rather than being repeated under one. */
+function whyText(reason, detail) {
+  const eng = reasonEnglish(reason);
+  const said = plain(detail);
+  if (eng && said) return sentence(eng) + " " + said;
+  return sentence(eng || said) || "Nothing that answered said why.";
+}
+/* The reason in English first, then whatever the layer that knows added,
+   then the machine code for whoever is debugging. If this page has never
+   seen the code, the server's own sentence leads and nothing is invented
+   to sit above it. */
+function whyHtml(reason, detail, cls) {
+  const eng = reasonEnglish(reason);
+  const said = plain(detail);
+  const head = eng ? sentence(eng) : (said || "This did not work, and " +
+    "nothing that answered said why.");   // never invented, only reported
+  const rest = (eng && said) ? said : "";
+  return '<div class="' + (cls || "warn bad") + '">' + esc(head) + '</div>' +
+    (rest || reason ? '<div class="note">' + esc(rest) +
+      (reason ? (rest ? "  " : "") + "[" + esc(reasonKey(reason)) + "]" : "") +
+      '</div>' : "");
 }
 
 /* ---------- small helpers ---------- */
@@ -472,11 +714,18 @@ function policyWords(p) {
 function payCost(amount, q, p) {
   const payBurn = (q && q.burn_mc) || 0;
   const recvBurn = burnFor(amount, p);
+  const out = (q && q.inputs_mc !== null && q.inputs_mc !== undefined)
+              ? q.inputs_mc : amount + payBurn;
+  const change = (q && q.change_mc) || 0;
   return {
     amount_mc: amount,
-    out_mc: (q && q.inputs_mc !== null && q.inputs_mc !== undefined)
-            ? q.inputs_mc : amount + payBurn,
-    change_mc: (q && q.change_mc) || 0,
+    out_mc: out,
+    change_mc: change,
+    // What actually leaves the payer: the coins spent, less the change that
+    // comes back. Three numbers are in play here -- asked for, out, into the
+    // recipient -- and this is the one the operator had to work out for
+    // themselves from the other two.
+    net_out_mc: out - change,
     pay_burn_mc: payBurn,
     recv_burn_mc: recvBurn,
     recipient_mc: recvBurn === null ? null : amount - recvBurn,
@@ -489,12 +738,21 @@ function costSentence(c, who, from) {
   // stand-in gets capitalised when it opens a sentence.
   const to = who || "whoever redeems the tokens";
   const To = who || "Whoever redeems the tokens";
-  let s = "Paying " + mc(c.amount_mc) + " takes " + mc(c.out_mc) + " out of " +
-          (from || "this wallet") +
+  const payer = from || "this wallet";
+  let s = "Paying " + mc(c.amount_mc) + " spends " + mc(c.out_mc) + " of " +
+          payer + "'s coins" +
           (c.pay_burn_mc ? " (" + mc(c.amount_mc) +
           " in tokens plus " + mc(c.pay_burn_mc) + " burned on the split)" : "") +
           (c.change_mc ? ", and " + mc(c.change_mc) + " comes back as change" : "") +
           ". ";
+  // Coins spent and change back are two numbers; the one that matters to
+  // the payer is the difference, and leaving it to be worked out was the
+  // finding. Said outright whenever it is not just the amount typed.
+  if (c.pay_burn_mc || c.change_mc) {
+    s += "So " + payer + " ends up " + mc(c.net_out_mc) + " lighter — that, " +
+         "not " + mc(c.amount_mc) + ", is what this payment costs " +
+         payer + ". ";
+  }
   if (c.recv_burn_mc === null) {
     s += "The mint burns AGAIN when the tokens are redeemed, and this page " +
          "cannot read the burn policy right now, so " + to + " will get " +
@@ -513,7 +771,7 @@ function costSentence(c, who, from) {
   return s;
 }
 function say(el, cls, text) { el.innerHTML = '<div class="' + cls + '">' + esc(text) + '</div>'; }
-function fail(el, r) { say(el, "warn bad", r.detail + "  [" + r.reason + "]"); }
+function fail(el, r) { el.innerHTML = whyHtml(failCode(r), r.detail); }
 function when(ms) {
   if (!ms) return "-";
   const d = new Date(ms);
@@ -533,10 +791,10 @@ function working(btn, label) {
 }
 function done(btn) {
   if (btn.dataset.label) btn.textContent = btn.dataset.label;
-  // Re-enabling a control while the page is locked out would be a lie: the
-  // next click can only fail the same way. done() runs after api() has
-  // already noticed the 401, so it is the last word on the button.
-  btn.disabled = !!authFailure;
+  // Re-enabling a control while the page cannot see app.py would be a lie:
+  // the next click can only fail the same way. done() runs after api() has
+  // already noticed the failure, so it is the last word on the button.
+  btn.disabled = !!linkFailure;
 }
 function tokenBlock(tokens, heading, cls) {
   const text = tokens.join("\n");
@@ -545,6 +803,49 @@ function tokenBlock(tokens, heading, cls) {
     '<textarea readonly id="' + id + '" style="margin-top:6px">' + esc(text) + '</textarea>' +
     '<button class="sec small" style="margin-top:8px" onclick="copyFrom(\'' + id + '\',this)">' +
     'Copy ' + tokens.length + ' token' + (tokens.length === 1 ? '' : 's') + '</button>';
+}
+/* Is what is on screen really the only copy? ASKED, never asserted.
+   The wallet writes every payment string into its own file BEFORE the
+   exchange is sent, and that persist-before-send is what makes recover()
+   possible at all -- so for a PAYMENT "this is the only copy" was simply
+   false, and it was printed on the two most alarming paths this page has:
+   a payment with no recipient, and a delivery that failed after the money
+   had already left. An operator who believes it treats a reload or a closed
+   tab as money destroyed.
+   GET /api/wallet/outstanding reads those same strings back. This asks it
+   and reports what came back: when the read-back cannot be confirmed it
+   says it could not confirm it, rather than promising a recovery it has not
+   seen. (The ISSUE panel's "ONLY copy" sentence is a different claim and is
+   TRUE: /api/mint/issue persists nothing, and the mint keeps ledger-key
+   hashes, never secrets. It is deliberately left alone.) */
+async function savedCopyNote(name, tokens) {
+  const r = await api("/api/wallet/outstanding?name=" + encodeURIComponent(name));
+  if (!r.ok) {
+    return '<div class="note">This page could not check whether these strings ' +
+      'can be read back from ' + esc(name) + "'s wallet file: " +
+      esc(whyText(failCode(r), r.detail)) +
+      ' Save them now -- it does not know whether they are recoverable, and ' +
+      'it will not guess.  [' + esc(reasonKey(failCode(r))) + ']</div>';
+  }
+  const back = [];
+  const payments = (r.data && r.data.payments) || [];
+  for (let i = 0; i < payments.length; i++) {
+    const ts = payments[i].tokens || [];
+    for (let j = 0; j < ts.length; j++) back.push(ts[j].token);
+  }
+  const found = tokens.filter(t => back.indexOf(t) !== -1).length;
+  if (tokens.length && found === tokens.length) {
+    return '<div class="note ok">These are <b>not</b> the only copy. All ' +
+      found + ' of these strings are also stored in ' + esc(name) + "'s wallet " +
+      'file, and this page just read every one of them back from it. Saving ' +
+      'them is still the quick way to hand the money over; losing this screen ' +
+      'is not losing the money.</div>';
+  }
+  return '<div class="note">' + found + ' of these ' + tokens.length +
+    ' strings could be read back from ' + esc(name) + "'s wallet file just now" +
+    (found ? ', and the rest could not' : '') +
+    '. Save them: this page will not tell you the rest are recoverable when ' +
+    'it has not seen them.</div>';
 }
 function copyFrom(id, btn) {
   const el = $(id);
@@ -563,13 +864,18 @@ window.copyFrom = copyFrom;
 
 /* ---------- mint ---------- */
 function renderMint() {
-  if (authFailure) return renderLockedOut();
+  if (linkFailure) return renderLockedOut();
+  // app.py answered, but not with a mint state: it failed the status read
+  // for some reason of its own. "stopped" is not a thing this page may
+  // conclude from that — the mint runs in its own process and the failure
+  // was app.py's, so the honest word is the one below.
+  if (mint.unknown) return renderMintUnknown();
   const running = !!mint.running;
   $("hdr-dot").className = "dot" + (running ? "" : " off");
   $("hdr-state").textContent = running
     ? (mint.mint_id || "mint") + "  .  " + (mint.base_url || "") +
       "  .  up " + since(mint.started_at_ms)
-    : "no mint running" + (mint.last_error ? "  .  last error: " + mint.last_error : "");
+    : "no mint running" + (mint.last_error ? "  .  last error: " + plain(mint.last_error) : "");
   $("stopped-banner").hidden = running;
   $("m-stats").innerHTML = [
     ["State", running ? "running" : "stopped"],
@@ -612,6 +918,7 @@ function renderMint() {
     }
   }
   renderPolicy(running);
+  renderIssueCost();
   $("f-go").disabled = !running || busy;
   $("w-create").disabled = !running || busy;
   $("r-go").disabled = !running || busy || !active;
@@ -621,17 +928,28 @@ function renderMint() {
   if (!running) { $("p-go").disabled = true; }
 }
 
-/* Locked out: say "unknown", never "stopped" and never "none".
-   A 401 tells us nothing at all about the mint or the wallets, so every
-   figure that would normally be read from the server is blanked rather
-   than left showing a stale or invented state, and everything that would
-   act on money is disabled. Refresh stays live: it is how the operator
-   finds out they are back in. */
+/* Not seeing app.py: say "unknown", never "stopped" and never "none".
+   None of the four failures tells us anything about the mint or the
+   wallets, so every figure that would normally be read from the server is
+   blanked rather than left showing a stale or invented state, and
+   everything that would act on money is disabled — Start mint included.
+   Start was the one control left live here, and it was the worst one to
+   leave: the page offered the operator an action that could only fail the
+   same way, on a mint that may already be running. Refresh stays live: it
+   is how the operator finds out they are back. */
+const LOCKED_HEADER = {
+  unauthorized: "not signed in - this page cannot see the mint or the wallets",
+  blocked: "refused - this page is not reaching app.py at its own address",
+  timeout: "no answer in time - the mint and the wallets are undetermined",
+  unreachable: "cannot reach app.py - this page does not know what the mint " +
+               "or the wallets are doing"
+};
 function renderLockedOut() {
   $("hdr-dot").className = "dot unk";
-  $("hdr-state").textContent = authFailure.kind === "unauthorized"
-    ? "not signed in - this page cannot see the mint or the wallets"
-    : "refused - this page is not reaching app.py at its own address";
+  $("hdr-state").textContent = LOCKED_HEADER[linkFailure.kind] ||
+                               LOCKED_HEADER.unreachable;
+  // Not hidden because the mint is running -- hidden because this page has
+  // no idea whether it is, and that banner asserts that it is not.
   $("stopped-banner").hidden = true;
   $("m-stats").innerHTML = [
     ["State", "unknown"], ["Mint id", "-"], ["Port", "-"], ["Process", "-"]
@@ -639,7 +957,39 @@ function renderLockedOut() {
              '</div><div class="l">' + esc(p[0]) + '</div></div>').join("");
   $("m-policy").className = "note bad";
   $("m-policy").textContent =
-    "Burn policy: cannot be read while this page is locked out.";
+    "Burn policy: cannot be read while " + failureBecause() + ".";
+  $("f-cost").className = "note bad";
+  $("f-cost").textContent =
+    "What issuing would cost cannot be worked out while " +
+    failureBecause() + ", and nothing here can issue anything.";
+  for (const id of ["m-start", "m-stop", "f-go", "w-create", "r-go",
+                    "h-recover", "t-go", "p-requote", "p-go"]) {
+    $(id).disabled = true;
+  }
+}
+
+/* app.py is answering, but it could not say what the mint is doing. That
+   is a narrower ignorance than the one above -- the wallet panels below
+   may still be reading fine -- but it is ignorance, and the mint controls
+   are dead either way: Start cannot know it would not collide with a mint
+   that is already up. */
+function renderMintUnknown() {
+  $("hdr-dot").className = "dot unk";
+  $("hdr-state").textContent = "mint state unknown - app.py could not say" +
+    (mint.last_error ? "  .  " + plain(mint.last_error) : "");
+  $("stopped-banner").hidden = true;
+  $("m-stats").innerHTML = [
+    ["State", "unknown"], ["Mint id", "-"], ["Port", "-"], ["Process", "-"]
+  ].map(p => '<div class="stat"><div class="n">' + esc(p[1]) +
+             '</div><div class="l">' + esc(p[0]) + '</div></div>').join("");
+  $("m-policy").className = "note bad";
+  $("m-policy").textContent = "Burn policy: not known — app.py could not " +
+    "say whether a mint is running, so this page is not guessing at one. " +
+    "A mint started from here runs in its own process and is unaffected by " +
+    "this; press Refresh once app.py is answering again.";
+  $("f-cost").className = "note bad";
+  $("f-cost").textContent = "What issuing would cost cannot be worked out " +
+    "while the mint state is unknown.";
   for (const id of ["m-start", "m-stop", "f-go", "w-create", "r-go",
                     "h-recover", "t-go", "p-requote", "p-go"]) {
     $(id).disabled = true;
@@ -669,6 +1019,51 @@ function renderPolicy(running) {
              : " Edit it under Mint settings before pressing Start mint.");
 }
 
+/* What pressing "Issue into wallet" will really do, before it is pressed.
+   Issuing is one call that creates the money and a second that redeems it
+   into the wallet, and the second is an exchange like any other, so it
+   burns. Paying discloses both halves of its cost up front; this used to
+   disclose only the half that says "cannot be undone" and leave the burn
+   to the result line, after the money was gone. Pure: no DOM, no fetch. */
+function issueCostSentence(amount, count, name, p) {
+  if (!(amount > 0) || !(count > 0)) {
+    return "Enter a whole amount and a count above zero to see what issuing " +
+           "would create, burn and credit.";
+  }
+  const who = name || "the active wallet";
+  const created = amount * count;
+  const many = count > 1
+    ? count + " tokens of " + mc(amount) + " creates " + mc(created)
+    : mc(amount) + " creates " + mc(amount);
+  // One /api/wallet/receive call takes all of them, and a burn is charged
+  // once per exchange on the sum of its inputs -- not once per token.
+  const burn = burnFor(created, p);
+  const head = "Issuing " + many + " out of nothing. ";
+  if (burn === null) {
+    return head + "Crediting it to " + who + " is an exchange, so the mint " +
+      "burns part of it — and this page cannot read the burn policy right " +
+      "now, so " + who + " will be credited somewhat less than " +
+      mc(created) + ".";
+  }
+  if (burn === 0) {
+    return head + "Crediting it to " + who + " burns nothing under the " +
+      "policy in force, so " + who + " is credited the whole " +
+      mc(created) + ".";
+  }
+  return head + "Crediting it to " + who + " burns " + mc(burn) + ", so " +
+    who + " is credited " + mc(created - burn) + " — not " + mc(created) +
+    ". That burn is charged once on the whole batch, not once per token.";
+}
+function renderIssueCost() {
+  const el = $("f-cost");
+  const amount = parseInt($("f-amount").value, 10);
+  const count = parseInt($("f-count").value, 10);
+  const text = issueCostSentence(amount, count, active, policy);
+  el.className = "note" + (policy === null || burnFor(amount * count, policy)
+                           ? " bad" : "");
+  el.textContent = text;
+}
+
 /* The running mint's own settings, written back into the form, so that a
    Stop followed by a Start cannot quietly change the mint's economics. */
 function applyDescriptor(d) {
@@ -683,15 +1078,21 @@ function applyDescriptor(d) {
   $("m-exempt").value = p.exempt_below_mc;
   settingsEdited = false;
   renderPolicy(!!mint.running);
+  renderIssueCost();     // the issue cost is a function of the same policy
 }
 
 async function refreshMint() {
   const r = await api("/api/mint/status");
   if (!r.ok) {
-    mint = {running: false, last_error: r.detail};
+    // `unknown`, not `running: false`. The mint is a separate process; a
+    // status read that failed says something about the reader, not about
+    // the mint, and the page that wrote "stopped" here told an operator
+    // their live mint was down.
+    mint = {running: false, unknown: true, last_error: r.detail,
+            last_reason: r.reason};
     if (r.reason === "gui_incomplete" || r.reason === "component_error") {
       $("fatal-banner").hidden = false;
-      $("fatal-banner").textContent = r.detail;
+      $("fatal-banner").textContent = plain(r.detail);
     }
     renderMint();
     return;
@@ -706,13 +1107,13 @@ async function refreshMint() {
 async function refreshDescriptor() {
   const r = await api("/api/mint/descriptor");
   $("m-desc").textContent = r.ok ? JSON.stringify(r.data, null, 2)
-                                 : r.detail + "  [" + r.reason + "]";
+                                 : plain(r.detail) + "  [" + r.reason + "]";
   if (r.ok) applyDescriptor(r.data);
 }
 
 async function refreshLogs() {
   const r = await api("/api/mint/logs?lines=200");
-  if (!r.ok) { $("m-logs").textContent = r.detail + "  [" + r.reason + "]"; return; }
+  if (!r.ok) { $("m-logs").textContent = plain(r.detail) + "  [" + r.reason + "]"; return; }
   const lines = (r.data.lines || []);
   $("m-logs").textContent = lines.length ? lines.join("\n") : "(log is empty)";
   $("m-logs").scrollTop = $("m-logs").scrollHeight;
@@ -764,9 +1165,12 @@ async function issueInto() {
     // The mint stores hashes, never secrets: an issued token that is not shown
     // here is money nobody can ever spend. So show it, loudly.
     $("f-out").innerHTML = '<div class="warn bad">The money was created but ' +
-      esc(name) + ' did not take it (' + esc(got.reason) + ' - ' + esc(got.detail) +
-      '). These token strings are the ONLY copy. Save them, then paste them into ' +
-      'Receive below.</div>' + tokenBlock(tokens, "", "warn bad");
+      esc(name) + ' did not take it. ' +
+      esc(whyText(failCode(got), got.detail)) +
+      ' These token strings are the ONLY copy. Save them, then paste them into ' +
+      'Receive below.</div>' +
+      '<div class="note">[' + esc(reasonKey(failCode(got))) + ']</div>' +
+      tokenBlock(tokens, "", "warn bad");
     return;
   }
   const rej = got.data.rejected || [];
@@ -781,7 +1185,7 @@ async function issueInto() {
     ': credited ' + esc(mc(got.data.accepted_mc)) + ' to ' + esc(name) +
     '. Balance now ' + esc(mc(got.data.balance_mc)) + '.</div>' +
     (rej.length ? '<div class="warn bad">' + rej.length +
-      ' token(s) rejected: ' + esc(rej.map(x => x.reason).join(", ")) + '</div>' +
+      ' token(s) rejected: ' + esc(rejectedInEnglish(rej)) + '</div>' +
       tokenBlock(rej.map(x => x.token), "Rejected tokens:", "note") : "");
   await refreshWallets();
 }
@@ -790,29 +1194,34 @@ async function issueInto() {
 function renderWallets() {
   const list = $("w-list");
   if (!wallets.length) {
-    // "no wallets" and "app.py would not tell us" are not the same answer,
+    // "no wallets" and "app.py did not tell us" are not the same answer,
     // and only one of them means it is safe to go and create some.
-    list.innerHTML = authFailure
-      ? '<div class="warn bad">This is <b>not</b> an empty wallet list: this ' +
-        'page is locked out and app.py refused to say what is in the workdir. ' +
-        'See the message at the top.</div>'
+    list.innerHTML = linkFailure
+      ? '<div class="warn bad">This is <b>not</b> an empty wallet list: ' +
+        failureBecause() + ', so it has not been told what is in the ' +
+        'workdir. See the message at the top.</div>'
       : '<div class="note">No wallets yet. Create two — say ' +
         '<b>alice</b> and <b>bob</b> — then fund one above and pay the other ' +
         'below.</div>';
   } else {
-    // Known wallets, but we have just been refused: these figures are the
-    // last ones that were true, and saying so is the difference between a
-    // stale balance and a wrong one.
-    const stale = authFailure
-      ? '<div class="warn bad">Locked out — these are the last balances this ' +
-        'page managed to read, not current ones. See the message at the ' +
-        'top.</div>'
+    // Known wallets, but we have just stopped being answered: these
+    // figures are the last ones that were true, and saying so is the
+    // difference between a stale balance and a wrong one.
+    const stale = linkFailure
+      ? '<div class="warn bad">' + failureTag() + ' — ' +
+        sentence(failureBecause()) + ' These are the last balances this page ' +
+        'managed to read, not current ones, and the mint may have moved ' +
+        'money since. See the message at the top.</div>'
       : "";
     list.innerHTML = stale + wallets.map(w => {
       const bal = w.balance_mc === null || w.balance_mc === undefined
         ? (w.error ? "unreadable" : "?") : mc(w.balance_mc);
-      const tag = w.error ? '<span class="tag bad">' + esc(w.error.slice(0, 60)) + '</span>'
-        : (w.connected ? "" : '<span class="tag">last known</span>');
+      // While this page is not being answered, EVERY balance is last-known,
+      // whatever the last read said about the wallet being connected. The
+      // regression that made this round was two balances shown with no tag
+      // at all, under a banner that was itself wrong.
+      const tag = w.error ? '<span class="tag bad">' + esc(plain(w.error).slice(0, 60)) + '</span>'
+        : ((w.connected && !linkFailure) ? "" : '<span class="tag">last known</span>');
       return '<div class="wallet' + (w.name === active ? " active" : "") +
         '" data-name="' + esc(w.name) + '"><span class="nm">' + esc(w.name) +
         '</span>' + tag + '<span class="bal">' + esc(bal) + '</span></div>';
@@ -836,6 +1245,15 @@ function renderWallets() {
   const me = wallets.filter(w => w.name === active)[0];
   $("active-name").textContent = active || "none";
   $("active-balance").textContent = me ? mc(me.balance_mc) : "-";
+  // The same figure as the row eight lines above, so it carries the same
+  // caveat. A balance printed bare in the header while its own row is
+  // tagged "last known" under a "these are not current" note is the page
+  // asserting as current a number it does not know — the exact defect this
+  // round is about, in a smaller font.
+  const headerStale = !!me && me.balance_mc !== null &&
+                      me.balance_mc !== undefined &&
+                      (!!linkFailure || !me.connected);
+  $("active-stale").hidden = !headerStale;
   renderMint();
 }
 /* Follows `chosen` unconditionally: this select mirrors one piece of state
@@ -875,7 +1293,7 @@ async function refreshWallets() {
     // A failed list leaves whatever was on screen on screen, which for a
     // page that has never had a successful read is an empty panel that
     // looks exactly like "no wallets". Re-render so it says what it is.
-    if (authFailure) renderWallets();
+    if (linkFailure) renderWallets();
     return;
   }
   wallets = r.data.wallets || [];
@@ -928,20 +1346,33 @@ async function refreshQuote() {
   const seq = quoteSeq;
   const stale = () => seq !== quoteSeq;
   const amount = parseInt($("p-amount").value, 10);
-  if (authFailure) {
+  if (linkFailure) {
     say($("p-quote"), "warn bad", "No cost can be checked and nothing can be " +
-        "paid: this page is locked out. See the message at the top.");
+        "paid: " + failureBecause() + ". See the message at the top.");
     return;
   }
   if (!active) { say($("p-quote"), "note", "Pick an active wallet first."); return; }
+  if (mint.unknown) {
+    say($("p-quote"), "warn bad", "No cost can be checked: app.py could not " +
+        "say whether a mint is running, so this page does not know. It is " +
+        "not saying the mint is stopped.");
+    return;
+  }
   if (!mint.running) { say($("p-quote"), "note", "The mint is stopped."); return; }
   if (!(amount > 0)) { say($("p-quote"), "note", "Enter an amount above zero."); return; }
   $("p-quote").innerHTML = '<div class="note">checking...</div>';
   const r = await api("/api/wallet/quote", {name: active, amount_mc: amount});
   if (stale()) return;                 // the operator moved on while we asked
   if (!r.ok) {
-    $("p-quote").innerHTML = '<div class="warn bad">Cannot pay ' + esc(mc(amount)) +
-      ': ' + esc(r.detail) + '</div>';
+    // This is where insufficient funds lands, and the quote refuses before
+    // Pay can be pressed — so for most operators this is the FIRST money
+    // error they ever meet, and for a long time it was the one server
+    // sentence on the page that went to the screen raw: an unscrubbed
+    // section citation, and the amount printed twice because the wallet's
+    // own sentence already names it. It goes through the same whyHtml as
+    // every other failure now: English headline from the closed set, the
+    // wallet's sentence under it with citations stripped, machine code last.
+    $("p-quote").innerHTML = whyHtml(failCode(r), r.detail, "warn bad");
     return;
   }
   // The mint is the authority on the burn; if the descriptor has not been
@@ -993,13 +1424,37 @@ async function payNow() {
   const r = await api("/api/wallet/pay", {name: active, amount_mc: amount});
   if (!r.ok) { busy = false; done($("p-go")); fail($("p-out"), r); await refreshWallets(); return; }
   const tokens = r.data.tokens || [];
+  // The PAYER's half of the promise, checked. The recipient's half was
+  // already checked below; this half was not, and a policy change between
+  // the quote and the payment moves both of them. What left the wallet is
+  // the amount paid plus the burn charged on the split -- the change is
+  // back in the wallet and never left.
+  const paidOut = (typeof r.data.amount_mc === "number" &&
+                   typeof r.data.burn_mc === "number")
+                  ? r.data.amount_mc + r.data.burn_mc : null;
+  const quotedOut = (q.cost.net_out_mc === null ||
+                     q.cost.net_out_mc === undefined) ? null : q.cost.net_out_mc;
+  const outMismatch = (paidOut !== null && quotedOut !== null &&
+                       paidOut !== quotedOut)
+    ? '<div class="warn bad">That is not what the cost line said would leave ' +
+      esc(active) + ' (' + esc(mc(quotedOut)) + '). ' +
+      esc(mc(Math.abs(paidOut - quotedOut))) +
+      (paidOut > quotedOut ? ' more' : ' less') + ' moved than the estimate ' +
+      'promised. This page cannot say why — the usual reason is the mint\'s ' +
+      'burn policy changing between the estimate and the payment, but nothing ' +
+      'here has shown that is what happened.</div>'
+    : '';
   const spent = '<div class="note ok">' + esc(active) + ' paid ' +
-    esc(mc(r.data.amount_mc)) + '; its balance is now ' + esc(mc(r.data.balance_mc)) + '.</div>';
+    esc(mc(r.data.amount_mc)) +
+    (paidOut === null ? '' : ', which took ' + esc(mc(paidOut)) +
+      ' out of the wallet') +
+    '; its balance is now ' + esc(mc(r.data.balance_mc)) + '.</div>' + outMismatch;
   if (!to) {
     $("p-out").innerHTML = spent +
       tokenBlock(tokens, "These token strings ARE the money. Anyone holding one " +
-                 "can spend it, and this is the only copy.", "warn");
+                 "can spend it.", "warn");
     busy = false; done($("p-go"));
+    $("p-out").innerHTML += await savedCopyNote(active, tokens);
     await refreshWallets(); await refreshHistory(); return;
   }
   working($("p-go"), "delivering to " + to + "...");
@@ -1007,10 +1462,13 @@ async function payNow() {
   busy = false; done($("p-go"));
   if (!got.ok) {
     $("p-out").innerHTML = spent +
-      '<div class="warn bad">' + esc(to) + ' did not take the payment (' +
-      esc(got.reason) + ' - ' + esc(got.detail) + '). The money is NOT lost, but ' +
-      'these strings are the only copy of it — save them and paste them into ' +
-      'Receive.</div>' + tokenBlock(tokens, "", "warn bad");
+      '<div class="warn bad">' + esc(to) + ' did not take the payment. ' +
+      esc(whyText(failCode(got), got.detail)) +
+      ' The money is NOT lost: save these strings and paste them ' +
+      'into Receive.</div>' +
+      '<div class="note">[' + esc(reasonKey(failCode(got))) + ']</div>' +
+      tokenBlock(tokens, "", "warn bad") +
+      await savedCopyNote(active, tokens);
   } else {
     const rej = got.data.rejected || [];
     // The estimate promised a figure; say so if reality disagreed, rather
@@ -1018,13 +1476,15 @@ async function payNow() {
     const promised = q.cost.recipient_mc;
     const mismatch = (promised !== null && promised !== undefined &&
                       got.data.accepted_mc !== promised && !rej.length)
-      ? '<div class="warn bad">That is not what the cost line said (' +
-        esc(mc(promised)) + '). The mint\'s burn policy must have changed ' +
-        'between the estimate and the payment.</div>' : '';
+      ? '<div class="warn bad">That is not what the cost line said ' +
+        esc(to) + ' would get (' + esc(mc(promised)) + '). This page cannot ' +
+        'say why — the usual reason is the mint\'s burn policy changing ' +
+        'between the estimate and the payment, but nothing here has shown ' +
+        'that is what happened.</div>' : '';
     $("p-out").innerHTML = spent + '<div class="note ok">' + esc(to) + ' received ' +
       esc(mc(got.data.accepted_mc)) + ' and now holds ' + esc(mc(got.data.balance_mc)) +
       '.</div>' + mismatch + (rej.length ? '<div class="warn bad">' + rej.length +
-      ' token(s) rejected: ' + esc(rej.map(x => x.reason + " " + x.detail).join("; ")) +
+      ' token(s) rejected: ' + esc(rejectedInEnglish(rej)) +
       '</div>' + tokenBlock(rej.map(x => x.token), "Rejected:", "note") : "");
   }
   await refreshWallets(); await refreshHistory(); refreshQuote();
@@ -1052,8 +1512,10 @@ async function receiveNow() {
   if (rej.length) {
     html += '<table><thead><tr><th>Rejected token</th><th>Why</th></tr></thead><tbody>' +
       rej.map(x => '<tr><td style="font-family:var(--mono);font-size:11px">' +
-        esc(x.token) + '</td><td class="bad">' + esc(x.reason) +
-        (x.detail ? ' - ' + esc(x.detail) : '') + '</td></tr>').join("") +
+        esc(x.token) + '</td><td class="bad">' +
+        esc(sentence(reasonEnglish(x.reason) || x.reason)) +
+        (x.detail ? '<div class="note">' + esc(plain(x.detail)) + '</div>' : '') +
+        '</td></tr>').join("") +
       '</tbody></table>';
   }
   // Take the accepted lines out of the box and leave the rejected ones in,
@@ -1080,6 +1542,19 @@ async function receiveNow() {
   }
   $("r-out").innerHTML = html;
   await refreshWallets(); await refreshHistory();
+}
+
+/* The reasons a batch was partly refused, deduplicated, in English. Each
+   rejected token keeps its own reason in the table above; this is the
+   one-line version for a result headline. */
+function rejectedInEnglish(rej) {
+  const seen = [];
+  for (const x of rej || []) {
+    const text = sentence(reasonEnglish(x && x.reason) ||
+                          (x && x.reason) || "unknown");
+    if (seen.indexOf(text) < 0) seen.push(text);
+  }
+  return seen.join(" ");
 }
 
 /* app.py truncates a rejected token to this many characters on its way out
@@ -1131,32 +1606,34 @@ function trimAccepted(submitted, rejected) {
 }
 
 /* ---------- history ---------- */
-/* Locked out, with the last rows this page genuinely read kept underneath a
-   caveat -- but only if they belong to the wallet that is active now. A
+/* Not being answered, with the last rows this page genuinely read kept
+   underneath a caveat that names which of the four failures it is -- but
+   only if they belong to the wallet that is active now. A
    table of alice's entries under bob's name would be a worse lie than an
-   empty one. Pure DOM, so setAuthFailure can call it from inside api(). */
+   empty one. Pure DOM, so setLinkFailure can call it from inside api(). */
 function renderHistoryStale() {
   const mine = historyHtml && historyName === active;
   $("h-note").textContent = mine ? historyNote : "";
   $("h-body").innerHTML = mine
-    ? '<tr><td colspan="4" class="bad"><b>Locked out</b> \u2014 the entries ' +
-      'below are the last ones this page managed to read, not current ones. ' +
-      'See the message at the top.</td></tr>' + historyHtml
-    : '<tr><td colspan="4" class="bad"><b>Not an empty history</b>: this page ' +
-      'is locked out and app.py refused to say what this wallet has done. ' +
-      'See the message at the top.</td></tr>';
+    ? '<tr><td colspan="4" class="bad"><b>' + esc(failureTag()) + '</b> ' +
+      '\u2014 the entries below are the last ones this page managed to read, ' +
+      'not current ones. See the message at the top.</td></tr>' + historyHtml
+    : '<tr><td colspan="4" class="bad"><b>Not an empty history</b>: ' +
+      esc(failureBecause()) + ', so it has not been told what this wallet ' +
+      'has done. See the message at the top.</td></tr>';
 }
 
 async function refreshHistory() {
   const body = $("h-body");
   $("h-note").textContent = "";
-  if (authFailure) { renderHistoryStale(); return; }
+  if (linkFailure) { renderHistoryStale(); return; }
   if (!active) { body.innerHTML = '<tr><td colspan="4">No active wallet.</td></tr>'; return; }
   const r = await api("/api/wallet/history?limit=50&name=" + encodeURIComponent(active));
   if (!r.ok) {
-    if (authFailure) { renderHistoryStale(); return; }
-    body.innerHTML = '<tr><td colspan="4" class="bad">' + esc(r.detail) +
-      '  [' + esc(r.reason) + ']</td></tr>';
+    if (linkFailure) { renderHistoryStale(); return; }
+    body.innerHTML = '<tr><td colspan="4" class="bad">' +
+      esc(whyText(failCode(r), r.detail)) +
+      '  [' + esc(reasonKey(failCode(r))) + ']</td></tr>';
     return;
   }
   const rows = r.data.history || [];
@@ -1180,11 +1657,30 @@ async function refreshHistory() {
         "not exist.") +
       " The order is newest first, by the order they were written.";
   }
-  historyHtml = rows.length ? rows.map(h =>
-    '<tr><td>' + esc(h.ts_ms ? when(h.ts_ms) : "not recorded") + '</td><td>' + esc(h.kind) +
+  // A row that carries a machine reason keeps it for good -- it is what an
+  // operator debugs from months later -- so it is shown in English beside
+  // the sentence the row was written with, and an unmapped one is shown as
+  // it was stored rather than guessed at.
+  historyHtml = rows.length ? rows.map(h => {
+    // `cause` is the key app.py's /api/wallet/history actually emits, and
+    // walletops records under. Reading `h.reason` made this whole block
+    // dead code: it is undefined on every row the server sends, so no row
+    // ever got its English headline. `h.reason` is still accepted second so
+    // a row from any other producer of this shape is not silently dropped.
+    // An empty cause means the op committed — no headline, nothing failed.
+    // "unknown" DOES get its headline and reads as undetermined, because
+    // walletops writes that row only when it determined nothing was
+    // recorded, and it is the row an operator debugs from months later.
+    const code = h.cause || h.reason;
+    const why = code
+      ? '<b>' + esc(sentence(reasonEnglish(code) || String(code))) +
+        '</b> ' : "";
+    return '<tr><td>' + esc(h.ts_ms ? when(h.ts_ms) : "not recorded") +
+    '</td><td>' + esc(h.kind) +
     '</td><td class="num">' + esc(h.amount_mc === null ? "-" : mc(h.amount_mc)) +
-    '</td><td class="note" style="margin:0">' + esc(h.detail) + '</td></tr>').join("")
-    : "";
+    '</td><td class="note" style="margin:0">' + why + esc(plain(h.detail)) +
+    '</td></tr>';
+  }).join("") : "";
   historyNote = $("h-note").textContent;
   historyName = active;
   body.innerHTML = historyHtml || '<tr><td colspan="4">Nothing yet.</td></tr>';
@@ -1321,6 +1817,10 @@ $("m-refresh").addEventListener("click", refreshAll);
 $("m-logs-refresh").addEventListener("click", refreshLogs);
 $("m-logbox").addEventListener("toggle", () => { if ($("m-logbox").open) refreshLogs(); });
 $("f-go").addEventListener("click", issueInto);
+// Issuing discloses its whole cost before the click, the way paying does,
+// so the figures have to follow the boxes as they are typed in.
+$("f-amount").addEventListener("input", renderIssueCost);
+$("f-count").addEventListener("input", renderIssueCost);
 // Picking here is picking the active wallet: one concept, two places to
 // say it. setActive re-renders, which puts this select back in step.
 $("f-wallet").addEventListener("change", () => {
@@ -1344,14 +1844,21 @@ $("h-refresh").addEventListener("click", refreshHistory);
 $("h-recover").addEventListener("click", recoverNow);
 $("t-go").addEventListener("click", lookupToken);
 
-renderAuthBanner();      // hides it explicitly; nothing has failed yet
+renderLinkBanner();      // hides it explicitly; nothing has failed yet
 refreshAll().then(refreshQuote);
-// The poll stops while locked out: hammering a server that will keep
-// answering 401 buys nothing, and the banner would flicker over the
-// operator's reading of it. Refresh re-tries by hand, and a single
-// success clears the banner and starts the poll answering again.
-setInterval(() => { if (!busy && !authFailure) { refreshMint(); refreshWallets(); } }, 4000);
-setInterval(() => { if (mint.running && !authFailure) $("hdr-state").textContent =
+// The poll stops while app.py is ANSWERING and refusing: hammering a
+// server that will keep answering 401 buys nothing, and the operator has
+// to go and fetch a URL before anything can change. It keeps running when
+// nothing is answering at all, because that is the case that fixes itself
+// the moment app.py is started again, and a page that recovers on its own
+// is one fewer thing to know. setLinkFailure does no DOM work while the
+// failure is unchanged, so nothing flickers under the operator's reading.
+setInterval(() => {
+  if (busy) return;
+  if (linkFailure && ANSWERED[linkFailure.kind]) return;
+  refreshMint(); refreshWallets();
+}, 4000);
+setInterval(() => { if (mint.running && !linkFailure) $("hdr-state").textContent =
   (mint.mint_id || "mint") + "  .  " + (mint.base_url || "") + "  .  up " +
   since(mint.started_at_ms); }, 1000);
 </script></body></html>

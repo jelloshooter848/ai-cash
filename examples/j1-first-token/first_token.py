@@ -36,17 +36,25 @@ from aicash.tokencodec import format_token, ledger_key, new_secret
 from aicash.signing import generate_keypair
 from aicash.wallet import MintClient, Wallet
 
+# §7.1 operator funding is gated on this. MintConfig.admin_token has no
+# default: a mint that says nothing does not build, so this demo has to
+# decide, and the honest demo of an operator-funded journey is a gated
+# mint whose credential gets presented on the admin call.
+ADMIN_TOKEN = "j1-operator-credential"
+
 
 def admin_issue(port: int, outputs: list[dict]) -> dict:
     """Call the non-normative /admin/issue endpoint (MintClient has no
-    method for it — operator funding is outside Layer 0)."""
+    method for it — operator funding is outside Layer 0). The operator
+    credential rides in X-Admin-Token; without it the mint answers 401."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
         conn.request(
             "POST",
             "/admin/issue",
             json.dumps({"outputs": outputs}).encode(),
-            {"Content-Type": "application/json"},
+            {"Content-Type": "application/json",
+             "X-Admin-Token": ADMIN_TOKEN},
         )
         resp = conn.getresponse()
         body = json.loads(resp.read().decode())
@@ -71,6 +79,7 @@ def main() -> None:
         burn_policy=policy,
         signing_private=private,
         signing_public=public,
+        admin_token=ADMIN_TOKEN,
     )
     # NOTE: policy / windows must be passed AGAIN to the Ledger and kept
     # consistent with MintConfig by hand — nothing derives one from the other.

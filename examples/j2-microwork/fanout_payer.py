@@ -68,6 +68,13 @@ class FlakyMintClient(MintClient):
         return status, raw
 
 
+
+# §7.1 operator funding is gated on this credential. MintConfig has no
+# default admin_token: a mint that says nothing does not build, so this
+# demo decides, and a demo that issues wants a credential.
+ADMIN_TOKEN = "j2-operator-credential"
+
+
 def admin_issue(port: int, outputs: list) -> dict:
     """POST /admin/issue — MintClient exposes no admin method, so raw HTTP."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
@@ -76,7 +83,8 @@ def admin_issue(port: int, outputs: list) -> dict:
             "POST",
             "/admin/issue",
             canonical_json({"outputs": outputs}),
-            {"Content-Type": "application/json"},
+            {"Content-Type": "application/json",
+             "X-Admin-Token": ADMIN_TOKEN},
         )
         resp = conn.getresponse()
         body = json.loads(resp.read().decode("utf-8"))
@@ -101,6 +109,7 @@ def main() -> int:
         burn_policy=policy,
         signing_private=priv,
         signing_public=pub,
+        admin_token=ADMIN_TOKEN,
     )
     # NOTE: Ledger duplicates values MintConfig already holds — the
     # integrator must keep them consistent by hand.

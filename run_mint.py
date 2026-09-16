@@ -34,7 +34,7 @@ import threading, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "impl"))
 
 from aicash.burncalc import BurnPolicy
-from aicash.mintapi import MintConfig, make_mint
+from aicash.mintapi import ADMIN_ISSUANCE_OPEN, MintConfig, make_mint
 from aicash.signing import generate_keypair, pubkey_b64u
 
 # Anything nonzero below this is rejected rather than accepted silently:
@@ -385,10 +385,28 @@ def main():
     ap.add_argument("--open-issuance", action="store_true",
                     help="DANGEROUS: leave /admin/issue unauthenticated, which "
                          "lets anyone who can reach the port mint without limit. "
-                         "MintConfig.admin_token=None means 'allow everyone', "
-                         "not 'allow no one'.")
+                         "This flag is the ONLY way to get one from this "
+                         "launcher: MintConfig has no default admin_token, so a "
+                         "mint built without saying anything does not start at "
+                         "all. Passing this flag is opting in by name "
+                         "(MintConfig.admin_token=ADMIN_ISSUANCE_OPEN).")
     args = ap.parse_args()
 
+    if isinstance(args.admin_token, str) and not args.admin_token.strip():
+        # MintConfig refuses this too, and that refusal is the one that
+        # matters -- but it arrives as a traceback out of the dataclass, and
+        # a launcher that can see the problem in its own arguments should say
+        # so in its own words first. An all-whitespace token is what an empty
+        # file or an unset variable looks like after shell expansion
+        # (--admin-token "$AICASH_ADMIN_TOKEN" with nothing in it), and it is
+        # a credential every caller can send. The value is not echoed: it was
+        # meant to be a secret.
+        ap.error("--admin-token is empty or only whitespace, which is not a "
+                 "credential: /admin/issue would be gated on a header anyone "
+                 "can send. This is usually a shell variable that expanded to "
+                 "nothing. Pass a real token, drop the flag to have one "
+                 "generated, or pass --open-issuance to run with no "
+                 "credential on purpose.")
     if args.open_issuance and args.admin_token:
         ap.error("--admin-token with --open-issuance is contradictory: "
                  "--open-issuance makes /admin/issue accept everyone, so the "
@@ -414,11 +432,30 @@ def main():
         args.keys, args.mint_id, args.model_class, args.pin_baseline)
     generated_token = None
     if args.open_issuance:
+        # Two different values on purpose. `config_admin_token` is the mint's
+        # POLICY and is the named sentinel, which is what makes an open mint
+        # greppable in source and refuses to be reached by omission;
+        # `admin_token` is the CREDENTIAL that gets handed to the console and
+        # printed, and there is none. Never let the sentinel leak into the
+        # second: it is not a token, and anything that treats it as one (an
+        # X-Admin-Token header, a JSON field, a log line) would be a lie.
         admin_token = None
+        config_admin_token = ADMIN_ISSUANCE_OPEN
+        # Not f"port {args.port}": this runs BEFORE the bind, so with the
+        # default --port 0 it printed "port 0", which is not an address
+        # anyone can reach. A warning about an open mint that names the
+        # wrong port is a warning a reader discounts. It does not say "the
+        # port is printed below" either: this goes to stderr and the startup
+        # JSON that carries the port goes to stdout, and under a process
+        # manager those are two different files -- pointing a reader at an
+        # address on a stream they may not have is not a warning, it is a
+        # dead end. The real port is re-announced ON THIS STREAM after the
+        # bind (see below).
         print("WARNING: /admin/issue is unauthenticated. Anyone who can reach "
-              f"port {args.port} can mint without limit.", file=sys.stderr)
+              "this mint can mint without limit.", file=sys.stderr)
     elif args.admin_token:
         admin_token = args.admin_token
+        config_admin_token = admin_token
     else:
         # The credential used to be printed in the startup JSON. On a laptop
         # that is convenient; under a process manager stdout is a log stream
@@ -428,6 +465,7 @@ def main():
         # one read away — but out of the log unless explicitly asked for.
         admin_token = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
         generated_token = admin_token
+        config_admin_token = admin_token
 
     prune_interval_s = args.prune_interval_hours * 3600.0
     pinned_prunes = bool(pins.get("prunes_spent_records"))
@@ -446,7 +484,12 @@ def main():
                                exempt_below_mc=args.exempt_below_mc),
         signing_private=private,
         signing_public=public,
-        admin_token=admin_token,
+        # Always one of the three named states — a generated credential, one
+        # supplied on the command line, or ADMIN_ISSUANCE_OPEN behind
+        # --open-issuance. This launcher has never been able to produce an
+        # unset one, which is why it was not the source of the open-by-default
+        # hole; it is now structurally impossible rather than merely true.
+        admin_token=config_admin_token,
         # §8(b) requires the mint to publish its retention policy truthfully.
         # If the prune thread is running — or ever has run for this mint_id —
         # this mint really does drop spent records, so the descriptor has to
@@ -499,6 +542,13 @@ def main():
         sys.exit(f"started, then failed to persist startup state: {exc}")
 
     base = f"http://127.0.0.1:{port}"
+    if args.open_issuance:
+        # The second half of the pre-bind warning, now that the port is a
+        # real number. Same stream as the first half on purpose: whoever is
+        # reading the warnings gets the address the warning is about without
+        # having to correlate two files.
+        print(f"WARNING: this open mint is listening on {base} — "
+              f"POST {base}/admin/issue needs no credential.", file=sys.stderr)
     print(json.dumps({
         "mint_id": args.mint_id,
         "url": base,
@@ -575,11 +625,19 @@ def main():
     for _sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(_sig, request_stop)
 
+    # What /admin/issue actually requires, not what it usually requires.
+    # This line used to say "(operator credential)" unconditionally, which
+    # on an --open-issuance mint credited a gate that is not there -- the
+    # one banner an operator reads at startup, telling them the opposite of
+    # the truth about the endpoint that creates money.
+    issue_note = ("NO CREDENTIAL — open to anyone who can reach this port"
+                  if config_admin_token is ADMIN_ISSUANCE_OPEN
+                  else "operator credential")
     print(f"\nmint is up. ctrl-c or SIGTERM to stop."
           f"\n  descriptor  GET  {base}/v3/mints"
           f"\n  exchange    POST {base}/v3/exchange"
           f"\n  status      POST {base}/v3/status  (or GET /v3/status/<id>)"
-          f"\n  issue       POST {base}/admin/issue  (operator credential)",
+          f"\n  issue       POST {base}/admin/issue  ({issue_note})",
           flush=True)
     try:
         # Short timeout rather than a bare wait(): the loop then does not

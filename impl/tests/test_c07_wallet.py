@@ -16,7 +16,7 @@ from typing import NamedTuple
 from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger, OutputSpec
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import ADMIN_ISSUANCE_DISABLED, MintConfig, MintServer
 from aicash.tokencodec import b64u_encode, format_token, ledger_key, new_secret
 from aicash.wallet import (
     InsufficientFunds,
@@ -118,7 +118,7 @@ class WalletTest(unittest.TestCase):
         *,
         burn_policy=POLICY,
         burn_policy_next=None,
-        admin_token=None,
+        admin_token=ADMIN_ISSUANCE_DISABLED,
     ) -> Mint:
         from aicash.signing import generate_keypair
 

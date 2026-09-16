@@ -37,8 +37,22 @@ behaviour. The pieces it does own are the ones a browser forces on you:
     a door that should still not face the street. It is not a reason to
     relax the loopback bind, and there is no flag that relaxes it.
   * NO TRACEBACK EVER REACHES THE PAGE. Every route returns JSON; failures
-    return ``{"error": {"reason", "detail"}}`` with a detail a non-expert
-    can act on.
+    return ``{"error": {"reason", "detail", "cause"}}`` with a detail a
+    non-expert can act on.
+  * A FAILURE SAYS WHY IT FAILED, AND ONLY WHAT IS KNOWN. ``cause`` is a
+    machine reason from ONE closed set, shared verbatim with walletops.py
+    and page.html (see CAUSES below). It is carried through from the layer
+    that determined it, never re-guessed here: a wallet error keeps the
+    cause walletops recorded, and this file only ever ADDS the one thing it
+    alone can know -- that the mint PROCESS is not running -- which is the
+    difference between ``mint_unreachable`` and ``mint_stopped``. Anything
+    undetermined is ``unknown`` and says so in words. The failures this
+    file raises on its own obey the same rule: ``mint_unreachable`` is
+    named at the two raise sites where nothing answered (a URLError or an
+    OSError on the socket) and NOWHERE else, so a mint that answers http
+    500, or non-JSON, or a descriptor with no mint id, is reported as
+    ``bad_mint_response`` / ``unknown`` -- it answered, and what it did
+    with the request is undetermined.
 
 gui/mintctl.py and gui/walletops.py are written against a pinned contract
 and may be missing or newer than this file. Every use of them goes through
@@ -91,6 +105,52 @@ WALLET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 MINT_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 
 
+#: THE closed failure-cause vocabulary, identical in gui/walletops.py.
+#: Every error body carries exactly one of these in ``error.cause``, and
+#: every history row for an operation that did not commit carries one too.
+#: The rule that matters: "the mint rejected it" belongs to mint_rejected
+#: (and already_spent) ALONE -- a request the mint never received was not
+#: refused by it -- and ``unknown`` is rendered as undetermined, never
+#: dressed up as the likeliest story.
+CAUSES = (
+    "mint_unreachable",
+    "mint_stopped",
+    "mint_rejected",
+    "already_spent",
+    "malformed_token",
+    "wrong_mint",
+    "insufficient_funds",
+    "unknown",
+)
+
+#: This file's OWN reasons that are also causes. Everything else this
+#: server raises is a local fault (a bad name, a bad amount, a broken
+#: component) with no determined cause in the money vocabulary, and says
+#: ``unknown`` rather than borrowing a story from the mint.
+#:
+#: ``mint_unreachable`` is deliberately NOT here. The reason slug says
+#: "this server could not use the mint"; the CAUSE says "the mint never
+#: answered at all", and those are not the same finding -- a mint that
+#: answers http 500, or answers with something that is not JSON, or
+#: answers a descriptor with no mint_id in it, has plainly answered.
+#: Mapping the slug to the cause asserted the stronger claim on every one
+#: of those paths, directly above a detail that said the mint answered.
+#: So the two transport failures that really are unreachable name the
+#: cause explicitly at the raise site (see ``_mint_http``), every other
+#: path says ``unknown`` and spells out in its detail what the mint
+#: actually did.
+_REASON_CAUSE = {
+    "mint_stopped": "mint_stopped",
+    "wallet_error": "unknown",
+}
+
+
+def clean_cause(value) -> str:
+    """Any cause, coerced into the closed set. Never widens it."""
+    text = str(value or "")
+    return text if text in CAUSES else "unknown"
+
+
 SESSION_COOKIE = "aicash_gui_session"
 # One browser is one session. A handful covers a second tab, a reopened
 # window and a re-exchange after a restart; the oldest is dropped rather
@@ -99,13 +159,21 @@ MAX_SESSIONS = 32
 
 
 class GuiError(Exception):
-    """An error with an HTTP status, a machine reason and a human detail."""
+    """An HTTP status, a machine reason, a human detail and a cause.
 
-    def __init__(self, status: int, reason: str, detail: str):
+    ``cause`` defaults to whatever this file's own reason vocabulary maps
+    to -- which is ``unknown`` for everything except the two failures this
+    server determines itself -- so a raise site that has not thought about
+    the cause says "undetermined" rather than inheriting a story.
+    """
+
+    def __init__(self, status: int, reason: str, detail: str, cause=None):
         super().__init__(f"{reason}: {detail}")
         self.status = status
         self.reason = reason
         self.detail = detail
+        self.cause = clean_cause(
+            cause if cause is not None else _REASON_CAUSE.get(reason))
 
 
 def _cookie_values(header, name: str) -> list:
@@ -123,6 +191,24 @@ def _cookie_values(header, name: str) -> list:
         if sep and key.strip() == name:
             out.append(value.strip().strip('"'))
     return out
+
+
+def _trimmed(value):
+    """A pasted credential with its surrounding whitespace removed.
+
+    Why this is safe rather than a loosened comparison: the key is
+    ``secrets.token_urlsafe``, whose alphabet is ``A-Za-z0-9-_`` -- it
+    contains no whitespace at any position, so stripping whitespace can
+    never turn one valid key into another, and cannot turn a wrong key into
+    a right one. What it removes is the trailing space or newline a
+    terminal copy picks up, which used to produce a bare 401 whose message
+    described none of it: the one place in this flow where the error did
+    not name the actual problem.
+
+    Non-str values pass through untouched, so the comparison below still
+    decides them.
+    """
+    return value.strip() if isinstance(value, str) else value
 
 
 def _secret_eq(known, presented) -> bool:
@@ -212,7 +298,28 @@ class _Auth:
         # compare_digest on str raises TypeError on it. See _secret_eq.
         if not self.enabled:
             return True
-        return _secret_eq(self.key, presented)
+        return _secret_eq(self.key, _trimmed(presented))
+
+    def key_is_whitespace_damaged(self, presented) -> bool:
+        """True when what was pasted IS this key, with whitespace inside it.
+
+        The diagnosis, not a second door: this is only ever used to choose
+        a 401 page that names the actual problem. A key that fails for any
+        other reason -- one character off, a different key, an empty one --
+        answers False here and gets the ordinary refusal.
+
+        It is the internal-whitespace case, because the surrounding kind is
+        already accepted by key_ok. A terminal that wrapped the URL, or a
+        copy that took the line break with it, produces exactly this: the
+        right secret with a space or a newline through the middle of it.
+        Still compare_digest, still on bytes, still constant-time.
+        """
+        if not self.enabled or not isinstance(presented, str):
+            return False
+        squeezed = "".join(presented.split())
+        if squeezed == _trimmed(presented):
+            return False        # nothing internal to blame; it is just wrong
+        return _secret_eq(self.key, squeezed)
 
     def session_ok(self, cookie_header) -> bool:
         if not self.enabled:
@@ -299,6 +406,24 @@ class _Components:
                 self._mintctl_mod = module
             return self._mint
 
+    def mint_running(self):
+        """Is the mint PROCESS up? True/False, or None when unknowable.
+
+        The one fact this file knows and walletops.py cannot: it supervises
+        the mint, walletops only has a socket. Handing it over is what lets
+        a stranded wallet operation record ``mint_stopped`` instead of the
+        weaker ``mint_unreachable`` -- and never the reverse, because None
+        (mintctl broken, absent, or lying) leaves the weaker claim standing.
+        """
+        try:
+            control = self.mint()
+            status = control.status()
+            if isinstance(status, dict) and "running" in status:
+                return bool(status["running"])
+        except Exception:               # noqa: BLE001 - a supervisor that
+            return None                 # cannot answer knows nothing
+        return None
+
     def wallet(self, store_path: str, base_url: str):
         """A fresh WalletOps for one wallet file.
 
@@ -312,9 +437,19 @@ class _Components:
                     "walletops", ("WalletOps", "WalletOpsError"))
             module = self._walletops_mod
         try:
-            return module.WalletOps(store_path, base_url)
+            ops = module.WalletOps(store_path, base_url)
         except Exception as exc:
             raise self._translate(exc, f"WalletOps({os.path.basename(store_path)})")
+        # Set, not passed to the constructor: the pinned contract fixes
+        # WalletOps(store_path, base_url), and a component build that has
+        # never heard of this attribute must keep working. One that has
+        # uses it to tell "the mint did not answer" from "the mint is not
+        # running" when it records why an operation failed.
+        try:
+            ops.mint_running = self.mint_running
+        except Exception:               # noqa: BLE001 - it is an extra, not
+            pass                        # a requirement
+        return ops
 
     # -- calling --------------------------------------------------------
     @staticmethod
@@ -331,14 +466,26 @@ class _Components:
         return slug[:60] or "error"
 
     def _translate(self, exc: BaseException, what: str) -> GuiError:
-        """Turn a component exception into a GuiError, keeping its message."""
+        """Turn a component exception into a GuiError, keeping its message.
+
+        And its CAUSE. walletops.py determined it at the moment of failure
+        with facts this file no longer has; the only thing added here is
+        the one fact this file has and it did not -- a mint process that is
+        not running -- and only to sharpen ``mint_unreachable``. Nothing is
+        ever re-guessed, and a component that reports no cause is
+        ``unknown``, not "probably a rejection".
+        """
         if isinstance(exc, GuiError):
             return exc
         ops_err = getattr(self._walletops_mod, "WalletOpsError", None)
         if ops_err is not None and isinstance(exc, ops_err):
             reason = getattr(exc, "reason", None) or "wallet_error"
             detail = getattr(exc, "detail", None) or str(exc)
-            return GuiError(400, self._reason(reason), str(detail) or str(exc))
+            cause = clean_cause(getattr(exc, "cause", None))
+            if cause == "mint_unreachable" and self.mint_running() is False:
+                cause = "mint_stopped"
+            return GuiError(400, self._reason(reason), str(detail) or str(exc),
+                            cause)
         mint_err = getattr(self._mintctl_mod, "MintControlError", None)
         if mint_err is not None and isinstance(exc, mint_err):
             return GuiError(400, "mint_control", str(exc) or type(exc).__name__)
@@ -525,10 +672,12 @@ class Api:
         if status["running"] and status["base_url"]:
             return status["base_url"]
         if required:
-            detail = "The mint is not running. Start it in the MINT panel first."
+            detail = ("The mint is not running, so nothing was sent to it "
+                      "and nothing was refused by it. Start it in the MINT "
+                      "panel first.")
             if status["last_error"]:
                 detail += f" Last error: {status['last_error']}"
-            raise GuiError(409, "mint_stopped", detail)
+            raise GuiError(409, "mint_stopped", detail, "mint_stopped")
         # Stopped: MintControl keeps the last known base_url, and the note
         # written by the last successful start covers a GUI restart with a
         # component that does not.
@@ -557,21 +706,28 @@ class Api:
             payload = exc.read()
             status = exc.code
         except urllib.error.URLError as exc:
+            # Nothing answered: the one shape that IS mint_unreachable.
             raise GuiError(
                 502, "mint_unreachable",
                 f"The mint says it is running but did not answer at {base} "
-                f"({exc.reason}). Try stopping and starting it.") from None
+                f"({exc.reason}). Try stopping and starting it.",
+                "mint_unreachable") from None
         except OSError as exc:
             raise GuiError(
                 502, "mint_unreachable",
-                f"Could not reach the mint at {base}: {exc}") from None
+                f"Could not reach the mint at {base}: {exc}",
+                "mint_unreachable") from None
         try:
             obj = json.loads(payload or b"{}")
         except ValueError:
+            # It ANSWERED -- badly. Saying "the mint did not answer" here
+            # would contradict this very sentence, and this server has no
+            # idea what the mint did with the request, so: undetermined.
             raise GuiError(
-                502, "mint_unreachable",
-                f"The mint answered {status} with something that is not "
-                f"JSON.") from None
+                502, "bad_mint_response",
+                f"The mint answered http {status} with something that is "
+                f"not JSON, so what it did with the request is "
+                f"undetermined.", "unknown") from None
         return status, obj
 
     # -- mint routes ----------------------------------------------------
@@ -654,9 +810,12 @@ class Api:
     def route_mint_descriptor(self, _query, _body) -> dict:
         status, obj = self._mint_http("GET", "/v3/mints")
         if status != 200 or not isinstance(obj, dict) or "mint_id" not in obj:
+            # Reaching here means _mint_http got an answer: a mint that
+            # answers badly is not a mint that did not answer.
             raise GuiError(
-                502, "mint_unreachable",
-                f"The mint did not return a descriptor (http {status}).")
+                502, "bad_mint_response",
+                f"The mint answered http {status} but not with a descriptor, "
+                f"so which mint is running is undetermined.", "unknown")
         return obj
 
     def route_mint_issue(self, _query, body) -> dict:
@@ -692,8 +851,12 @@ class Api:
             descriptor = self.route_mint_descriptor(None, None)
             mint_id = descriptor.get("mint_id")
         if not isinstance(mint_id, str) or not mint_id:
-            raise GuiError(502, "mint_unreachable",
-                           "Could not determine which mint is running.")
+            # Only reachable after the descriptor call succeeded, i.e.
+            # after the mint answered. Nothing was issued, and why the
+            # answer carried no usable mint_id is undetermined.
+            raise GuiError(502, "bad_mint_response",
+                           "The mint answered, but not with a mint id this "
+                           "GUI can use, so nothing was issued.", "unknown")
         secrets = [new_secret() for _ in range(count)]
         outputs = [{"amount_mc": amount, "secret_hash": ledger_key(s)}
                    for s in secrets]
@@ -737,9 +900,13 @@ class Api:
                                "base64url.") from None
         status, obj = self._mint_http("POST", "/v3/status", {"hashes": [key]})
         if status != 200:
-            raise GuiError(502, "mint_unreachable",
+            # The mint answered; it just did not answer 200. That is not
+            # "the mint did not answer", and it is not a refusal of a
+            # money operation either -- a lookup moves nothing.
+            raise GuiError(502, "bad_mint_response",
                            f"The mint answered http {status} to the status "
-                           f"lookup.")
+                           f"lookup, so this token's state is undetermined.",
+                           "unknown")
         results = obj.get("results") if isinstance(obj, dict) else None
         first = results[0] if isinstance(results, list) and results else None
         return {"query": text, "ledger_key": key, "result": first, "raw": obj}
@@ -842,10 +1009,20 @@ class Api:
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            # cause is carried through EXACTLY as the component recorded it
+            # (coerced into the closed set, never re-derived here): it is
+            # the permanent record of why an operation did not commit, and
+            # this layer knows nothing about that moment that the component
+            # did not. A row with no cause is an op that committed ("") or
+            # one whose cause was never recorded ("unknown") -- and the
+            # component's own detail says which.
+            cause = row.get("cause")
             out.append({"ts_ms": _as_int(row.get("ts_ms")),
                         "kind": str(row.get("kind", "")),
                         "amount_mc": _as_int(row.get("amount_mc")),
-                        "detail": str(row.get("detail", ""))})
+                        "detail": str(row.get("detail", "")),
+                        "cause": "" if cause in (None, "") else
+                                 clean_cause(cause)})
         return {"name": name, "history": out}
 
     def route_wallet_receive(self, _query, body) -> dict:
@@ -876,7 +1053,8 @@ class Api:
             if isinstance(item, dict):
                 rejected.append({"token": str(item.get("token", ""))[:120],
                                  "reason": str(item.get("reason", "rejected")),
-                                 "detail": str(item.get("detail", ""))})
+                                 "detail": str(item.get("detail", "")),
+                                 "cause": clean_cause(item.get("cause"))})
         return {"name": name,
                 "accepted": _as_int(raw.get("accepted"), 0),
                 "accepted_mc": _as_int(raw.get("accepted_mc"), 0),
@@ -927,6 +1105,96 @@ class Api:
                 "burn_mc": _as_int(raw.get("burn_mc")),
                 "balance_mc": summary["balance_mc"]}
 
+    def route_wallet_outstanding(self, query, _body) -> dict:
+        """The payment strings this wallet handed out, read back from disk.
+
+        Why this route exists: page.html tells the operator that the token
+        strings in its result panel are "the only copy" of the money, and
+        it is not -- every one of them was written into the wallet file
+        before the exchange was sent and is still there. Without a way to
+        read them back, that sentence was true in practice: a reload, a
+        closed tab or a delivery that failed halfway really did destroy the
+        only accessible copy of real value.
+
+        Nothing new is persisted to make this work (see walletops.py for
+        the reasoning: a sidecar of bearer strings is a second complete
+        copy of live money on disk, bought for durability the store already
+        has). This is a READ.
+
+        WHAT IT DOES NOT REACH, because the claim is about money and a
+        half-true recovery story is worse than none:
+
+          * page.html does not call this route. The sentence "these
+            strings are the only copy of it" is still printed after a
+            failed delivery, so today the read-back is reachable from
+            Python and from this API and not from the screen. Wiring it up
+            is a page.html change, and page.html is not this file.
+          * it recovers PAYMENTS, not issuance. /api/mint/issue returns
+            freshly issued strings and persists nothing anywhere -- the
+            mint keeps ledger-key hashes, never secrets -- so for those
+            strings "the only copy" is simply TRUE until a wallet takes
+            them. That is exactly why crediting them is a separate,
+            retryable step, and it is the reason the issue panel must not
+            be dismissed before the credit succeeds.
+
+        It returns live bearer secrets, so it is behind the same session
+        cookie as every other route, and it is a GET only in the sense that
+        it changes nothing -- it is not cacheable and the response carries
+        no-store like all of them.
+
+        What it does widen, stated rather than glossed: a session that
+        could already spend every wallet here can now also read back the
+        strings of payments ALREADY HANDED OVER -- money that is morally
+        the payee's until they redeem it. That is a real difference, and it
+        is accepted because the same secrets are sitting in plaintext in
+        the wallet file two directories away (0600, same user), because
+        this API is loopback-only and cookie-gated, and because the
+        alternative is a GUI that really does destroy the operator's own
+        money on a reload. Anyone who can reach this route can already
+        empty every wallet it serves.
+        """
+        name, path = self._wallet_ops(query)
+        limit = _strict_int(query.get("limit"), 20) or 20
+        limit = max(1, min(limit, 100))
+        with self._wallet(name, path, self.base_url(required=False)) as ops:
+            fn = getattr(ops, "outstanding_payments", None)
+            if not callable(fn):
+                raise GuiError(
+                    503, "gui_incomplete",
+                    "gui/walletops.py does not define outstanding_payments. "
+                    "Payment strings can still be copied from the result "
+                    "panel when a payment is made, but this GUI cannot read "
+                    "them back out of the wallet file.")
+            what = f"WalletOps({name}).outstanding_payments"
+            raw = self.components.call(what, fn, limit=limit)
+        raw = self.components.expect_dict(raw, what, ("payments",))
+        payments = []
+        for item in self.components.expect_list(raw.get("payments"), what):
+            if not isinstance(item, dict):
+                continue
+            tokens = []
+            for token in (item.get("tokens") or []):
+                if not isinstance(token, dict):
+                    continue
+                state = token.get("state")
+                tokens.append({
+                    "token": str(token.get("token", "")),
+                    "amount_mc": _as_int(token.get("amount_mc")),
+                    # unspent | spent | unknown | None. None is "the mint
+                    # was not asked", which is not the same as "unknown to
+                    # the ledger", and the two must not merge.
+                    "state": state if state in ("unspent", "spent", "unknown")
+                             else None})
+            payments.append({"op_id": str(item.get("op_id", "")),
+                             "amount_mc": _as_int(item.get("amount_mc")),
+                             "live_mc": _as_int(item.get("live_mc")),
+                             "tokens": tokens})
+        return {"name": name,
+                "checked": bool(raw.get("checked")),
+                "mint_id": raw.get("mint_id") if isinstance(
+                    raw.get("mint_id"), str) else None,
+                "payments": payments}
+
     def route_wallet_recover(self, _query, body) -> dict:
         name, path = self._wallet_ops(body)
         base = self.base_url(required=True)
@@ -958,6 +1226,7 @@ ROUTES = {
     ("POST", "/api/wallet/pay"): "route_wallet_pay",
     ("POST", "/api/wallet/quote"): "route_wallet_quote",
     ("POST", "/api/wallet/recover"): "route_wallet_recover",
+    ("GET", "/api/wallet/outstanding"): "route_wallet_outstanding",
     ("GET", "/api/token/status"): "route_token_status",
 }
 
@@ -979,6 +1248,26 @@ _ALLOWED_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # loopback host with a port and is refused.
 _HOST_RE = re.compile(
     r"^(?:(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?|::1)$")
+
+# The 401 for a key that IS this GUI's key with whitespace through the
+# middle of it -- a terminal that wrapped the URL, a copy that took the line
+# break with it. Says what is wrong, because a bare "wrong key" for a key
+# that is character-for-character right is the one message in this flow that
+# sent the operator looking in the wrong place. It quotes nothing back:
+# no key, no session, not even the length of what was pasted.
+LOCKED_PAGE_WHITESPACE = """<!doctype html><meta charset=utf-8>
+<title>aicash operator - locked</title>
+<body style="font:15px/1.5 system-ui;padding:40px;max-width:44em">
+<h1>That key has whitespace in it</h1>
+<p>What you opened is this GUI's key with a space or a line break
+<em>inside</em> it &mdash; which is what happens when the terminal wraps the
+address over two lines and only part of it is selected, or when a copy takes
+the line break along.</p>
+<p>Go back to the terminal window running <code>app.py</code>, copy the whole
+address as ONE unbroken line, and open it again. A space at either end is
+fine; one in the middle is not, because it is not the same key.</p>
+</body>
+"""
 
 # Deliberately says nothing an attacker could use: no key, no session, no
 # port list, no hint about what the routes are. Just where the operator's
@@ -1082,13 +1371,26 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             code, text = 500, json.dumps(
                 {"error": {"reason": "bad_component_response",
+                           "cause": "unknown",
                            "detail": "A component returned something that "
                                      "cannot be sent as JSON."}})
         self._send(code, self._redact(text).encode("utf-8"),
                    "application/json; charset=utf-8")
 
-    def _error(self, code: int, reason: str, detail: str):
-        self._json(code, {"error": {"reason": reason, "detail": detail}})
+    def _error(self, code: int, reason: str, detail: str, cause=None):
+        """One error envelope, and it always carries a cause.
+
+        ``cause`` defaults through the reason vocabulary, which maps
+        everything this file raises on its own to ``unknown`` except the
+        two it actually determines. A caller that has a better cause --
+        every GuiError does -- passes it.
+        """
+        self._json(code, {"error": {
+            "reason": reason,
+            "detail": detail,
+            "cause": clean_cause(
+                cause if cause is not None else _REASON_CAUSE.get(reason)),
+        }})
 
     def _host_ok(self) -> bool:
         """Refuse a Host header that is not a loopback LITERAL.
@@ -1240,13 +1542,22 @@ class Handler(BaseHTTPRequestHandler):
         if method in ("GET", "HEAD") and path in ("/", "/index.html"):
             if has_cookie:
                 return True
-            if self.auth.key_ok(query.get("k")):
+            presented = query.get("k")
+            if self.auth.key_ok(presented):
                 self._set_cookie = (
                     "%s=%s; HttpOnly; SameSite=Strict; Path=/"
                     % (SESSION_COOKIE, self.auth.new_session()))
                 return True
             self.close_connection = True
-            self._send(401, LOCKED_PAGE.encode("utf-8"),
+            # A key that is right but for whitespace THROUGH it gets a page
+            # that names that, instead of the generic refusal: it is the one
+            # failure here whose cause the server can see and the operator
+            # cannot. Every other wrong key -- a character off, a stale one,
+            # an empty one -- is refused exactly as before, with no hint.
+            page = (LOCKED_PAGE_WHITESPACE
+                    if self.auth.key_is_whitespace_damaged(presented)
+                    else LOCKED_PAGE)
+            self._send(401, page.encode("utf-8"),
                        "text/html; charset=utf-8")
             return False
         if not has_cookie:
@@ -1257,7 +1568,7 @@ class Handler(BaseHTTPRequestHandler):
                 "address printed in the terminal that is running app.py — "
                 "it contains a key, and opening it is what hands this "
                 "browser the cookie every API route requires. The key "
-                "itself is not accepted here.")
+                "itself is not accepted here.", "unknown")
             return False
         return True
 
@@ -1332,7 +1643,7 @@ class Handler(BaseHTTPRequestHandler):
             result = getattr(self.api, name)(query, body)
             return self._json(200, result)
         except GuiError as exc:
-            return self._error(exc.status, exc.reason, exc.detail)
+            return self._error(exc.status, exc.reason, exc.detail, exc.cause)
         except Exception as exc:
             # The whole point of this clause: the operator gets one sentence,
             # never a stack trace, and the trace goes to this process's stderr

@@ -7,11 +7,14 @@ through the Ledger (L17).
 """
 
 import contextlib
+import copy
+import dataclasses
 import hashlib
 import http.client
 import io
 import json
 import os
+import pickle
 import re
 import socket
 import sqlite3
@@ -24,8 +27,10 @@ from typing import NamedTuple
 from aicash import mintapi
 from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
-from aicash.ledgerstore import Ledger
+from aicash.ledgerstore import Ledger, OutputSpec
 from aicash.mintapi import (
+    ADMIN_ISSUANCE_DISABLED,
+    ADMIN_ISSUANCE_OPEN,
     MAX_BODY_BYTES,
     MAX_IDEMPOTENCY_KEY_LEN,
     MAX_REQUEST_SECONDS,
@@ -49,6 +54,14 @@ T0 = 1_756_000_000_000
 DAY_MS = 86_400_000
 MINT_ID = "testmint"
 POLICY = BurnPolicy(rate_ppm=10_000, cap_mc=1_000, exempt_below_mc=10)
+
+# The harness mints ARE gated. MintConfig.admin_token no longer has a
+# default (an unset credential used to mean "allow everyone"), and the
+# right answer for a harness that issues on nearly every test is a real
+# credential rather than ADMIN_ISSUANCE_OPEN: these tests then exercise the
+# same authorized code path an operator runs, and the one test that wants
+# an open mint has to say ADMIN_ISSUANCE_OPEN where a reader can grep it.
+HARNESS_ADMIN_TOKEN = "c06-harness-admin-credential"
 
 
 def sha256_b64u(data: bytes) -> str:
@@ -138,7 +151,18 @@ class Mint(NamedTuple):
     pub: bytes
 
 
-class MintApiTest(unittest.TestCase):
+class MintHarness:
+    """Mint-building and mint-driving helpers, and NOTHING else.
+
+    Deliberately not a TestCase and deliberately carrying no test methods.
+    A class that only wants ``start_mint``/``issue``/``exchange`` mixes this
+    in beside ``unittest.TestCase``; subclassing ``MintApiTest`` instead
+    would inherit that class's ~22 test methods and re-run every one of them
+    under the new name, which inflates the module's test count with
+    re-executions and roughly doubles its runtime without testing anything
+    new.
+    """
+
     maxDiff = None
 
     def start_mint(
@@ -146,7 +170,7 @@ class MintApiTest(unittest.TestCase):
         *,
         max_batch=256,
         performance=None,
-        admin_token=None,
+        admin_token=HARNESS_ADMIN_TOKEN,
         profiles=("supervision",),
         burn_policy=POLICY,
         max_lock_expiry_ms=30 * DAY_MS,
@@ -183,7 +207,9 @@ class MintApiTest(unittest.TestCase):
 
     def issue(self, mint: Mint, amount_mc: int, secret: bytes):
         headers = {}
-        if mint.config.admin_token is not None:
+        # A str is a credential to present; ADMIN_ISSUANCE_OPEN and
+        # ADMIN_ISSUANCE_DISABLED are policies, not headers.
+        if isinstance(mint.config.admin_token, str):
             headers["X-Admin-Token"] = mint.config.admin_token
         status, body, _ = http_json(
             mint.port,
@@ -205,6 +231,10 @@ class MintApiTest(unittest.TestCase):
 
     def status_batch(self, mint: Mint, hashes: list):
         return http_json(mint.port, "POST", "/v3/status", {"hashes": hashes})
+
+
+class MintApiTest(MintHarness, unittest.TestCase):
+    """C06's own end-to-end conformance tests (B1-B9)."""
 
     # ------------------------------------------------------------------
     # B1
@@ -294,8 +324,10 @@ class MintApiTest(unittest.TestCase):
         status, _, _ = http_raw(mint.port, "GET", "/v3/mints")
         self.assertEqual(status, 200)
 
-        # A mint with no admin token configured serves /admin/issue bare.
-        mint2 = self.start_mint(admin_token=None)
+        # A mint that opted in BY NAME serves /admin/issue bare. This used
+        # to be what a mint built with no admin_token at all did; now it is
+        # the only way to get one, and it is spelled out in source.
+        mint2 = self.start_mint(admin_token=ADMIN_ISSUANCE_OPEN)
         status, body, _ = http_json(
             mint2.port,
             "POST",
@@ -454,6 +486,9 @@ class MintApiTest(unittest.TestCase):
                 burn_policy=POLICY,
                 signing_private=priv,
                 signing_public=pub,
+                # This test issues, so it wants a credential; it used to
+                # issue bare off the old open-by-default config.
+                admin_token=HARNESS_ADMIN_TOKEN,
             )
             return MintServer(config, ledger)
 
@@ -464,6 +499,7 @@ class MintApiTest(unittest.TestCase):
             status, body, _ = http_json(
                 port1, "POST", "/admin/issue",
                 {"outputs": [out_hash(100_000, s0)]},
+                {"X-Admin-Token": HARNESS_ADMIN_TOKEN},
             )
             self.assertEqual(status, 200, body)
             status, body, _ = http_json(
@@ -1178,6 +1214,8 @@ class MintConfigValidationTest(unittest.TestCase):
             burn_policy=POLICY,
             signing_private=priv,
             signing_public=pub,
+            # These configs are never served; nothing here wants issuance.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
         )
 
     def test_valid_mint_ids_accepted(self):
@@ -1213,6 +1251,8 @@ class MakeMintTest(unittest.TestCase):
             burn_policy=POLICY,
             signing_private=priv,
             signing_public=pub,
+            # Wiring tests; no test in this class calls /admin/issue.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
         )
         defaults.update(kw)
         return MintConfig(**defaults)
@@ -1366,7 +1406,9 @@ class RateSchemaConformance(unittest.TestCase):
         priv, pub = generate_keypair()
         base = dict(mint_id="rate-test", baseline_model_class="b",
                     burn_policy=BurnPolicy(0, 0, 10),
-                    signing_private=priv, signing_public=pub)
+                    signing_private=priv, signing_public=pub,
+                    # Descriptor-shape tests; no issuance.
+                    admin_token=ADMIN_ISSUANCE_DISABLED)
         base.update(over)
         return MintConfig(**base)
 
@@ -1837,6 +1879,8 @@ class DeploymentHardeningTest(unittest.TestCase):
             signing_public=pub,
             recovery_window_ms=90 * DAY_MS,
             max_lock_expiry_ms=30 * DAY_MS,
+            # Single-writer/flock tests; these mints never issue.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
         )
         return MintServer(config, ledger)
 
@@ -1958,6 +2002,8 @@ class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
             burn_policy=POLICY,
             signing_private=priv,
             signing_public=pub,
+            # max_batch/body-cap arithmetic; no issuance anywhere in here.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
             **kw,
         )
 
@@ -2023,6 +2069,8 @@ class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
             max_batch=max_batch,
             max_lock_expiry_ms=30 * DAY_MS,
             recovery_window_ms=90 * DAY_MS,
+            # Oversized-body tests drive /v3/exchange only.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
         )
         server = MintServer(config, ledger)
         port = server.start()
@@ -2225,3 +2273,464 @@ class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
         # The other remedy the message prints works at the untouched cap.
         mintapi.MAX_BODY_BYTES = original
         self.assertEqual(self.make_config(max_batch=2728).max_batch, 2728)
+
+
+# ======================================================================
+# The publish blocker: an absent admin credential is REFUSAL, not
+# permission.
+#
+# The defect these pin: MintConfig.admin_token defaulted to None and
+# admin_authorized() returned True for None, so any program that built a
+# mint from a default config served POST /admin/issue -- unlimited
+# issuance -- to anyone who could reach the port. Nothing failed a check;
+# there was no check.
+#
+# Every test below fails if the refusal is removed, and the ones that
+# matter most are the ones asserting that openness cannot be reached by
+# SAYING NOTHING: it has to be spelled ADMIN_ISSUANCE_OPEN in source.
+# ======================================================================
+
+
+class AdminCredentialIsMandatoryTest(unittest.TestCase):
+    """MintConfig will not build without one of the three named states."""
+
+    def config(self, **kw):
+        priv, pub = generate_keypair()
+        base = dict(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+        )
+        base.update(kw)
+        return MintConfig(**base)
+
+    def test_a_config_that_says_nothing_will_not_build(self):
+        """THE regression. Omitting admin_token used to yield an open mint;
+        it now yields no mint at all."""
+        with self.assertRaises(ValueError) as caught:
+            self.config()
+        msg = str(caught.exception)
+        self.assertIn("admin_token was not set", msg)
+        # The refusal has to be actionable: it names all three ways out.
+        self.assertIn("ADMIN_ISSUANCE_DISABLED", msg)
+        self.assertIn("ADMIN_ISSUANCE_OPEN", msg)
+        self.assertIn("X-Admin-Token", msg)
+
+    def test_none_is_rejected_and_says_what_it_used_to_mean(self):
+        """None was the old spelling of "allow everyone". It must not be
+        quietly re-read as "allow no one" either -- code carrying it
+        forward asked for something, and has to say which."""
+        with self.assertRaises(ValueError) as caught:
+            self.config(admin_token=None)
+        msg = str(caught.exception)
+        self.assertIn("no longer means anything", msg)
+        self.assertIn("allow everyone", msg)
+        self.assertIn("ADMIN_ISSUANCE_OPEN", msg)
+        self.assertIn("ADMIN_ISSUANCE_DISABLED", msg)
+
+    def test_the_empty_string_is_not_a_credential(self):
+        """An empty token would gate /admin/issue on a header every caller
+        can send -- open issuance wearing a credential's clothes."""
+        with self.assertRaises(ValueError) as caught:
+            self.config(admin_token="")
+        self.assertIn("NON-EMPTY", str(caught.exception))
+
+    def test_whitespace_is_not_a_credential_either(self):
+        """The empty-string hole reached the way it actually happens.
+
+        `if not tok` lets " ", "\n" and "\t" through because they are
+        truthy, so a credential read from an empty token file or an unset
+        environment variable produced a mint gated on a header every caller
+        can send -- the same defect as the empty string, arrived at by the
+        more likely route. It must be REFUSED, not trimmed: trimming would
+        bring the mint up on a credential nobody supplied.
+        """
+        for bad in (" ", "   ", "\t", "\n", "\r\n", " \t \n "):
+            with self.assertRaises(ValueError, msg=repr(bad)) as caught:
+                self.config(admin_token=bad)
+            msg = str(caught.exception)
+            self.assertIn("whitespace", msg, repr(bad))
+            # The guidance has to be here too: this is somebody's mint
+            # failing to start, and they need the three names.
+            self.assertIn("ADMIN_ISSUANCE_DISABLED", msg)
+
+    def test_whitespace_inside_a_real_credential_is_left_alone(self):
+        """Only an ALL-whitespace token is refused. A token that merely
+        contains a space is a token, and it must not be altered."""
+        for good in ("has space inside", " leading", "trailing ", "a b"):
+            self.assertEqual(
+                self.config(admin_token=good).admin_token, good,
+                "a real credential was rejected or silently rewritten")
+
+    def test_a_non_credential_non_mode_value_is_rejected(self):
+        for bad in (0, 1, True, b"bytes-are-not-a-token", ["list"], object()):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.config(admin_token=bad)
+
+    def test_the_rejected_value_is_not_echoed_into_the_message(self):
+        """§3.1 requirement 5: whatever was passed was meant to be a
+        credential, and a ValueError from a mint that fails to start goes
+        straight into a log. Name the type, never the value."""
+        with self.assertRaises(ValueError) as caught:
+            self.config(admin_token=b"a-real-secret-in-the-wrong-type")
+        msg = str(caught.exception)
+        self.assertNotIn("a-real-secret-in-the-wrong-type", msg)
+        self.assertIn("bytes", msg)
+
+    def test_the_three_named_states_all_build(self):
+        self.assertEqual(self.config(admin_token="s3cret").admin_token, "s3cret")
+        self.assertIs(
+            self.config(admin_token=ADMIN_ISSUANCE_DISABLED).admin_token,
+            ADMIN_ISSUANCE_DISABLED,
+        )
+        self.assertIs(
+            self.config(admin_token=ADMIN_ISSUANCE_OPEN).admin_token,
+            ADMIN_ISSUANCE_OPEN,
+        )
+
+    def test_the_modes_are_distinguishable_and_not_falsy_tokens(self):
+        """ADMIN_ISSUANCE_* are identity-compared sentinels, not strings: a
+        caller cannot reach one by sending a header, and they cannot be
+        confused with each other."""
+        self.assertIsNot(ADMIN_ISSUANCE_OPEN, ADMIN_ISSUANCE_DISABLED)
+        self.assertNotIsInstance(ADMIN_ISSUANCE_OPEN, str)
+        self.assertNotIsInstance(ADMIN_ISSUANCE_DISABLED, str)
+        self.assertEqual(repr(ADMIN_ISSUANCE_OPEN), "ADMIN_ISSUANCE_OPEN")
+        self.assertEqual(
+            repr(ADMIN_ISSUANCE_DISABLED), "ADMIN_ISSUANCE_DISABLED"
+        )
+
+
+class AdminIssuanceOverHttpTest(MintHarness, unittest.TestCase):
+    """End to end over real HTTP, one class per issuance state."""
+
+    def test_a_gated_mint_still_issues_for_the_right_credential(self):
+        mint = self.start_mint(admin_token="the-right-credential")
+        req = {"outputs": [out_hash(100_000, new_secret())]}
+        for headers in (None, {"X-Admin-Token": "the-wrong-credential"},
+                        {"X-Admin-Token": ""}):
+            status, body, _ = http_json(
+                mint.port, "POST", "/admin/issue", req, headers
+            )
+            self.assertEqual(status, 401, (headers, body))
+            self.assertEqual(body, {"status": "unauthorized"})
+        status, body, _ = http_json(
+            mint.port, "POST", "/admin/issue", req,
+            {"X-Admin-Token": "the-right-credential"},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["outputs_confirmed"], 1)
+
+    def test_a_disabled_mint_refuses_every_caller_including_the_operator(self):
+        mint = self.start_mint(admin_token=ADMIN_ISSUANCE_DISABLED)
+        req = {"outputs": [out_hash(100_000, new_secret())]}
+        for headers in (None, {"X-Admin-Token": ""},
+                        {"X-Admin-Token": "ADMIN_ISSUANCE_DISABLED"},
+                        {"X-Admin-Token": "None"},
+                        {"X-Admin-Token": "anything-at-all"}):
+            status, body, _ = http_json(
+                mint.port, "POST", "/admin/issue", req, headers
+            )
+            self.assertEqual(status, 401, (headers, body))
+            self.assertEqual(body, {"status": "unauthorized"})
+
+    def test_a_disabled_mint_is_still_a_conforming_layer_0_mint(self):
+        """L2/§3.7: shutting /admin/issue must not touch the anonymous
+        bearer-access right. Issuance happens in-process instead."""
+        mint = self.start_mint(admin_token=ADMIN_ISSUANCE_DISABLED)
+        s0, s1 = new_secret(), new_secret()
+        mint.ledger.issue([OutputSpec(amount_mc=100_000,
+                                      secret_hash=ledger_key(s0))])
+        status, body, _ = self.exchange(
+            mint, "disabled-x", [tok(100_000, s0)], [out_hash(99_000, s1)]
+        )
+        self.assertEqual(status, 200, body)
+        status, _, _ = http_raw(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        status, _, _ = self.status_batch(mint, [ledger_key(s1)])
+        self.assertEqual(status, 200)
+
+    def test_openness_requires_saying_the_word(self):
+        """The grep property. A mint that serves /admin/issue bare exists
+        only where ADMIN_ISSUANCE_OPEN is written down: saying nothing
+        raises, and the other named state refuses."""
+        req = {"outputs": [out_hash(50_000, new_secret())]}
+
+        with self.assertRaises(ValueError):
+            self.start_mint(admin_token=None)
+
+        shut = self.start_mint(admin_token=ADMIN_ISSUANCE_DISABLED)
+        status, _, _ = http_json(shut.port, "POST", "/admin/issue", req)
+        self.assertEqual(status, 401)
+
+        opened = self.start_mint(admin_token=ADMIN_ISSUANCE_OPEN)
+        status, body, _ = http_json(opened.port, "POST", "/admin/issue", req)
+        self.assertEqual(status, 200, body)
+
+    def test_an_open_mint_announces_itself_at_construction(self):
+        """Explicitly chosen is allowed; silent is not. The whole defect
+        class was "nothing gets reported"."""
+        with self.assertLogs("aicash.mintapi", level="WARNING") as captured:
+            self.start_mint(admin_token=ADMIN_ISSUANCE_OPEN)
+        text = "\n".join(r.getMessage() for r in captured.records)
+        self.assertIn("UNAUTHENTICATED", text)
+        self.assertIn("ADMIN_ISSUANCE_OPEN", text)
+
+
+class IssuanceModeIdentitySurvivesCopyingTest(MintHarness, unittest.TestCase):
+    """The modes are compared with `is`, so a copy must BE the original.
+
+    MintConfig.__post_init__ validates admin_token by identity and
+    admin_authorized() authorizes by identity. That makes ordinary copying
+    a correctness question, not a curiosity: ``dataclasses.replace`` on a
+    MintConfig is on the live path (SupervisionServer rebuilds every
+    supervision mint's config with it), and a config that has been through
+    ``copy.deepcopy`` or a pickle round trip has to come out the other side
+    holding the same objects it went in with.
+
+    Before __copy__/__deepcopy__/__reduce__ existed, it did not:
+      * a deep-copied ADMIN_ISSUANCE_OPEN mint fell through to the non-str
+        branch of admin_authorized() and refused EVERY caller, silently --
+        the safe direction, but a deliberate choice reversed with nothing
+        said anywhere; and
+      * a deep-copied ADMIN_ISSUANCE_DISABLED config could not be rebuilt
+        at all: dataclasses.replace() raised "is not one of the named
+        issuance modes" about a value whose own repr printed
+        ADMIN_ISSUANCE_DISABLED.
+    """
+
+    MODES = (ADMIN_ISSUANCE_OPEN, ADMIN_ISSUANCE_DISABLED)
+
+    def config(self, admin_token, **kw):
+        priv, pub = generate_keypair()
+        base = dict(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            admin_token=admin_token,
+        )
+        base.update(kw)
+        return MintConfig(**base)
+
+    def test_copy_deepcopy_and_pickle_all_return_the_same_object(self):
+        for mode in self.MODES:
+            with self.subTest(mode=repr(mode)):
+                self.assertIs(copy.copy(mode), mode)
+                self.assertIs(copy.deepcopy(mode), mode)
+                self.assertIs(pickle.loads(pickle.dumps(mode)), mode)
+                for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+                    self.assertIs(
+                        pickle.loads(pickle.dumps(mode, proto)), mode, proto
+                    )
+        # The private "nobody said" sentinel too: it is the value the
+        # construction-time refusal keys off, so a copy of it that is merely
+        # equal would be a non-credential that no branch recognises.
+        self.assertIs(
+            copy.deepcopy(mintapi._ADMIN_TOKEN_UNSET),
+            mintapi._ADMIN_TOKEN_UNSET,
+        )
+        self.assertIs(
+            pickle.loads(pickle.dumps(mintapi._ADMIN_TOKEN_UNSET)),
+            mintapi._ADMIN_TOKEN_UNSET,
+        )
+
+    def test_a_deep_copied_config_keeps_the_policy_it_was_built_with(self):
+        for mode in self.MODES:
+            with self.subTest(mode=repr(mode)):
+                copied = copy.deepcopy(self.config(mode))
+                self.assertIs(copied.admin_token, mode)
+                # ...and is still rebuildable, which is what
+                # SupervisionServer.__init__ does to every mint it wraps.
+                replaced = dataclasses.replace(
+                    copied, profiles=("supervision",)
+                )
+                self.assertIs(replaced.admin_token, mode)
+
+    def test_a_deep_copied_open_mint_is_still_open_over_http(self):
+        """The silent reversal, pinned end to end: an ADMIN_ISSUANCE_OPEN
+        config that has been through deepcopy must still serve bare
+        /admin/issue. If identity is lost the mint runs and refuses
+        everyone, reporting nothing."""
+        mint = self.start_mint(admin_token=ADMIN_ISSUANCE_OPEN)
+        copied_config = copy.deepcopy(mint.config)
+        self.assertIs(copied_config.admin_token, ADMIN_ISSUANCE_OPEN)
+        # Its own ledger file: one ledger is served by exactly one process
+        # (the single-writer claim), and this test is about the config, not
+        # about sharing state with the mint it was copied from.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ledger = Ledger(
+            os.path.join(tmp.name, "ledger.sqlite3"),
+            FakeClock(T0),
+            POLICY,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        server = MintServer(copied_config, ledger)
+        port = server.start()
+        self.addCleanup(server.stop)
+        status, body, _ = http_json(
+            port, "POST", "/admin/issue",
+            {"outputs": [out_hash(100_000, new_secret())]},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["outputs_confirmed"], 1)
+
+    def test_a_mode_that_is_only_a_look_alike_is_refused_and_said_so(self):
+        """A mode built elsewhere is not the object, and the refusal must
+        not claim it "is not one of the named issuance modes" while
+        printing one of those very names."""
+        impostor = mintapi._AdminIssuanceMode("ADMIN_ISSUANCE_OPEN")
+        self.assertEqual(repr(impostor), "ADMIN_ISSUANCE_OPEN")
+        with self.assertRaises(ValueError) as caught:
+            self.config(impostor)
+        msg = str(caught.exception)
+        self.assertNotIn("is not one of the named issuance modes", msg)
+        self.assertIn("compared by identity", msg)
+        self.assertIn("aicash.mintapi", msg)
+
+
+class GuidanceNamesAWorkingImportTest(unittest.TestCase):
+    """The refusal tells the reader what to do; that instruction must run.
+
+    The whole value of a loud ValueError is that the next thing the reader
+    types works. The message names two sentinels, so it has to say where
+    they come from, and the import it prints has to be one Python accepts.
+    """
+
+    def guidance(self):
+        priv, pub = generate_keypair()
+        with self.assertRaises(ValueError) as caught:
+            MintConfig(
+                mint_id=MINT_ID,
+                baseline_model_class="frontier-2026",
+                burn_policy=POLICY,
+                signing_private=priv,
+                signing_public=pub,
+            )
+        return str(caught.exception)
+
+    def test_the_message_names_the_module_the_sentinels_live_in(self):
+        msg = self.guidance()
+        self.assertIn("ADMIN_ISSUANCE_DISABLED", msg)
+        self.assertIn("ADMIN_ISSUANCE_OPEN", msg)
+        self.assertIn("from aicash.mintapi import", msg)
+
+    def test_the_import_line_it_prints_actually_executes(self):
+        """Run the exact line out of the message, and check it binds the
+        real objects rather than anything merely equal to them."""
+        lines = [ln.strip() for ln in self.guidance().splitlines()]
+        imports = [ln for ln in lines if ln.startswith("from aicash")]
+        self.assertTrue(imports, self.guidance())
+        for line in imports:
+            with self.subTest(line=line):
+                ns = {}
+                exec(compile(line, "<guidance>", "exec"), ns)
+                bound = {k: v for k, v in ns.items() if not k.startswith("__")}
+                self.assertTrue(bound, line)
+                for name, value in bound.items():
+                    self.assertIs(value, getattr(mintapi, name), name)
+
+
+class AdminAuthorizedUnitTest(unittest.TestCase):
+    """admin_authorized() directly, including the comparison it must use."""
+
+    def core(self, admin_token):
+        priv, pub = generate_keypair()
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            admin_token=admin_token,
+        )
+        return mintapi._Core.__new__(mintapi._Core), config
+
+    def authorized(self, admin_token, presented):
+        core, config = self.core(admin_token)
+        core.config = config
+        return mintapi._Core.admin_authorized(core, presented)
+
+    def test_disabled_refuses_every_presented_value(self):
+        for presented in (None, "", "x", "ADMIN_ISSUANCE_OPEN", " "):
+            self.assertFalse(
+                self.authorized(ADMIN_ISSUANCE_DISABLED, presented),
+                repr(presented),
+            )
+
+    def test_open_accepts_every_presented_value(self):
+        for presented in (None, "", "x"):
+            self.assertTrue(self.authorized(ADMIN_ISSUANCE_OPEN, presented))
+
+    def test_a_secret_matches_only_itself(self):
+        self.assertTrue(self.authorized("abcdef", "abcdef"))
+        for presented in (None, "", "abcde", "abcdeg", "abcdef ", " abcdef",
+                          "ABCDEF"):
+            self.assertFalse(self.authorized("abcdef", presented),
+                             repr(presented))
+
+    def test_the_comparison_is_still_constant_time(self):
+        """Not weakened by the refusal work: the match arm goes through
+        hmac.compare_digest, never ==."""
+        calls = []
+        real = mintapi.hmac.compare_digest
+
+        def spy(a, b):
+            calls.append((a, b))
+            return real(a, b)
+
+        original = mintapi.hmac.compare_digest
+        mintapi.hmac.compare_digest = spy
+        self.addCleanup(
+            setattr, mintapi.hmac, "compare_digest", original
+        )
+        self.assertTrue(self.authorized("abcdef", "abcdef"))
+        self.assertFalse(self.authorized("abcdef", "abcdeg"))
+        self.assertEqual(len(calls), 2)
+        for a, b in calls:
+            self.assertIsInstance(a, bytes)
+            self.assertIsInstance(b, bytes)
+        # ...and the refusing states never reach it at all: there is no
+        # comparison to win when the answer is a flat no.
+        calls.clear()
+        self.assertFalse(self.authorized(ADMIN_ISSUANCE_DISABLED, "abcdef"))
+        self.assertEqual(calls, [])
+
+
+class DescriptorCompletenessTest(MintHarness, unittest.TestCase):
+    """§3.6: "All fields mandatory unless marked profile-scoped"."""
+
+    def test_signing_pubkey_next_is_published_as_an_explicit_null(self):
+        """signing_pubkey_next is typed `null | {...}` and carries no
+        profile marking, so it is mandatory and nullable. An ABSENT key
+        reads to a §3.6 client as a mint predating the field; an explicit
+        null says "no rotation announced". Rotation itself stays out of
+        scope (L17), so the value is null and nothing may set it without
+        the cross-signature §3.6 requires."""
+        mint = self.start_mint()
+        status, raw, _ = http_raw(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        desc = json.loads(raw.decode("utf-8"))
+        self.assertIn("signing_pubkey_next", desc)
+        self.assertIsNone(desc["signing_pubkey_next"])
+        # Its sibling nullable-change-notice field is published the same
+        # way, which is the precedent this follows.
+        self.assertIn("burn_policy_next", desc)
+        self.assertIsNone(desc["burn_policy_next"])
+
+    def test_every_mandatory_3_6_field_is_present(self):
+        mint = self.start_mint()
+        _, raw, _ = http_raw(mint.port, "GET", "/v3/mints")
+        desc = json.loads(raw.decode("utf-8"))
+        for key in (
+            "mint_id", "baseline_model_class", "mint_time",
+            "denominations_mc", "burn_policy", "burn_policy_next", "supply",
+            "performance", "limits", "signing_pubkey", "signing_pubkey_next",
+            "lock_params", "retention", "profiles", "activity",
+        ):
+            self.assertIn(key, desc, key)

@@ -23,7 +23,11 @@ from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger
 from aicash import mintapi
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import (
+    ADMIN_ISSUANCE_DISABLED,
+    MintConfig,
+    MintServer,
+)
 from aicash.signing import generate_keypair, verify_obj
 from aicash import supervision
 from aicash.supervision import SupervisionServer
@@ -76,11 +80,25 @@ def _sup_body_cap():
 
 
 
+# This suite funds bearer tokens over C06's /admin/issue (see issue_token),
+# so its mints need a real operator credential. It is a fixed literal because
+# it is a test harness secret with no confidentiality value -- what matters is
+# that the mints here are GATED, so a regression that reopens /admin/issue is
+# caught by test_admin_issue_is_refused_without_the_harness_credential rather
+# than passing silently on an open mint.
+ADMIN_TOKEN = "c10-harness-operator-credential"
+
+
 def api(port, method, path, obj=None, key=None):
     """One HTTP round trip; returns (status, parsed json body)."""
     headers = {}
     if key is not None:
         headers["Authorization"] = "Bearer " + key
+    if path == "/admin/issue":
+        # C06 gates issuance on X-Admin-Token. The harness presents the
+        # credential its mints were built with; tests that want to prove the
+        # gate exists build the request without this helper.
+        headers["X-Admin-Token"] = ADMIN_TOKEN
     body = None if obj is None else json.dumps(obj).encode("utf-8")
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
@@ -239,6 +257,7 @@ class SupervisionTest(unittest.TestCase):
             signing_private=priv,
             signing_public=pub,
             profiles=profiles,
+            admin_token=ADMIN_TOKEN,
         )
         server = SupervisionServer(config, ledger)
         port = server.start()
@@ -265,6 +284,7 @@ class SupervisionTest(unittest.TestCase):
             signing_private=priv,
             signing_public=pub,
             profiles=(),
+            admin_token=ADMIN_TOKEN,
         )
         server = SupervisionServer(config, ledger)
         port = server.start()
@@ -1114,6 +1134,49 @@ class SupervisionTest(unittest.TestCase):
         _, entry = api(m.port, "GET", "/v3/status/" + ledger_key(nxt))
         self.assertEqual(entry["result"]["state"], "unspent")
 
+    def test_admin_issue_is_refused_without_the_harness_credential(self):
+        """The harness funds over /admin/issue with a credential, so it would
+        keep passing if the gate were removed and the mint went open. This
+        pins the gate directly, bypassing api()'s header: a supervision mint
+        must answer 401 to an /admin/issue with NO X-Admin-Token and with a
+        WRONG one, and must issue nothing in either case.
+
+        The supervision profile inherits C06's admin route, so an open
+        /admin/issue here mints without limit on a mint that also holds
+        operator credentials, caps and freezes.
+        """
+        m = self.start_mint()
+        secret = new_secret()
+        body = json.dumps(
+            {"outputs": [{"amount_mc": 1000,
+                          "secret_hash": ledger_key(secret)}]}
+        ).encode("utf-8")
+
+        def raw_issue(headers):
+            conn = http.client.HTTPConnection("127.0.0.1", m.port, timeout=30)
+            try:
+                conn.request("POST", "/admin/issue", body, headers)
+                resp = conn.getresponse()
+                resp.read()
+                return resp.status
+            finally:
+                conn.close()
+
+        self.assertEqual(raw_issue({}), 401)
+        self.assertEqual(raw_issue({"X-Admin-Token": ""}), 401)
+        self.assertEqual(raw_issue({"X-Admin-Token": "wrong"}), 401)
+        self.assertEqual(raw_issue({"X-Admin-Token": ADMIN_TOKEN + "x"}), 401)
+        # Nothing was created by any of those.
+        _, desc = api(m.port, "GET", "/v3/mints")
+        self.assertEqual(desc["supply"]["cumulative_issued_mc"], 0)
+        _, entry = api(m.port, "GET", "/v3/status/" + ledger_key(secret))
+        self.assertEqual(entry["result"]["state"], "unknown")
+        # And the credential the harness holds does work, so the 401s above
+        # are the gate refusing, not the route being broken.
+        self.assertEqual(raw_issue({"X-Admin-Token": ADMIN_TOKEN}), 200)
+        _, desc = api(m.port, "GET", "/v3/mints")
+        self.assertEqual(desc["supply"]["cumulative_issued_mc"], 1000)
+
     # ------------------------------------------------------------------ #
     # requirement sweep: errors, scoping, invariant enforcement          #
     # ------------------------------------------------------------------ #
@@ -1832,6 +1895,11 @@ class SupervisionTest(unittest.TestCase):
             signing_private=priv,
             signing_public=pub,
             profiles=(),
+            # The SAME credential the supervision mint gets, deliberately:
+            # test_layer0_body_refusals_match_a_plain_c06_mint compares the
+            # two servers on identical wire bytes, so any config difference
+            # between them would be a difference this comparison is not about.
+            admin_token=ADMIN_TOKEN,
         )
         server = MintServer(config, ledger)
         port = server.start()
@@ -2228,6 +2296,8 @@ class SupervisionStartupTest(unittest.TestCase):
             burn_policy=NO_BURN,
             signing_private=priv,
             signing_public=pub,
+            # This harness never issues; it only contends for the ledger file.
+            admin_token=ADMIN_ISSUANCE_DISABLED,
         )
         server = SupervisionServer(config, ledger)
         self.addCleanup(server.stop)
@@ -2280,6 +2350,7 @@ class SupervisionStartupTest(unittest.TestCase):
                 burn_policy=NO_BURN,
                 signing_private=priv,
                 signing_public=pub,
+                admin_token=ADMIN_ISSUANCE_DISABLED,
             ),
             ledger,
         )
