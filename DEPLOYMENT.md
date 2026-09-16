@@ -162,9 +162,11 @@ rm -rf "$BUILD"
 Run verbatim on this build: the wheel builds, installs with `cryptography`
 resolved from the index, and the source checkout is byte-identical afterwards.
 The `*.db` and `*keys.json` excludes are not about the wheel — the wheel never
-contains them either way (its full namelist is the 14 `aicash` modules,
-`run_mint.py`, `mint_console.py` and dist-info, nothing else) — they are about
-not copying a live signing key and ledger through `/tmp` on the way past.
+contains them either way — built by the recipe above on this build, its full
+namelist is `aicash/__init__.py` and the 14 `aicash` modules, `run_mint.py`,
+`mint_console.py` and five `aicash-0.4.0.dist-info/` entries, nothing else —
+they are about not copying a live signing key and ledger through `/tmp` on
+the way past.
 
 Either way you get the `aicash` package on the path (it lives at `impl/aicash`
 in the tree; `pyproject.toml` maps it) and the launcher installed as
@@ -212,6 +214,28 @@ Two values are permanent from that moment:
    different one. This is deliberate: a silent baseline change reprices every
    outstanding credit while the §3.6 supply counters — denominated in mc — stay
    put, so the invariant still holds and **nothing in the ledger can detect it.**
+
+**What that first start does about the admin credential — nothing you have
+to do, and one thing you have to know.** §1 says a mint refuses to build
+unless `admin_token` names one of three states. That is a library rule, and
+it does **not** mean you must invent a credential before your first start:
+the command above names none, and `run_mint.py` generates one for you
+(`base64url(os.urandom(24))`) and passes it as the `"<secret>"` state. Run
+verbatim on this build, that start printed
+
+```
+  "admin_token": "(written to /var/lib/aicash/mint-admin-keys.json, JSON field \"admin_token\")",
+```
+
+and wrote that file mode 0600 — the credential itself is deliberately kept
+off stdout, because under a process manager stdout is a log. What you have
+to know is where it went: `--admin-token-file` defaults to the **relative**
+path `mint-admin-keys.json`, the same relative-path trap `--keys` has (§9),
+so it lands in the process's working directory — which is why the `cd
+/var/lib/aicash` above and the `WorkingDirectory=` in §6 are load-bearing
+and not decoration. Verified on this build: an unauthenticated `POST
+/admin/issue` against that mint answers **401**, which is the §11 checklist
+line, and it answers 401 without your having configured anything.
 
 Also settled at first start: the burn policy (`--rate-ppm`, `--cap-mc`,
 `--exempt-below-mc`, §7.3/L12) can change later, but §7.3 expects a published
@@ -621,9 +645,15 @@ CA key:
 
 **What losing it actually costs, stated precisely.** Key rotation is
 unimplemented in this build (§10). §3.6 defines the rotation path —
-`signing_pubkey_next`, cross-signed by the current key — and the descriptor this
-code emits has no such field at all. So there is no graceful way to introduce a
-new key. Start over with a fresh keypair under the same `mint_id` and:
+`signing_pubkey_next`, cross-signed by the current key — and the descriptor
+this code emits carries that key **always set to `null`** (`aicash/mintapi.py`
+writes the literal `"signing_pubkey_next": None`; a live `GET /v3/mints` on
+this build returns `"signing_pubkey_next": null`, verified). Nothing ever
+populates it, so the effect is the same and the shape is not: a monitor that
+tests `"signing_pubkey_next" in descriptor` gets **True** and learns nothing.
+Test the value, never the key. Either way there is no graceful way to
+introduce a new key. Start over with a fresh keypair under the same
+`mint_id` and:
 
 - every client that pinned your `signing_pubkey` (TOFU, per §3.6) sees an
   **unchained key change**, which R13 says *is the alarm* — indistinguishable,
@@ -671,7 +701,13 @@ readable copy with `integrity_check` → `ok`.
 
 **Restore = stop, replace, start.** Stop the unit, put the backup at
 `--db`, put the matching `mint-keys.json` at `--keys`, start. There is no replay
-and no reconciliation step; the file *is* the state.
+and no reconciliation step; the file *is* the state. **Wait for the old process
+to be gone before you start the new one**: the ledger takes an advisory
+single-writer lock, and a start against a `--db` the previous mint has not
+released dies on an unhandled `RuntimeError: another mint process already
+serves this ledger` — the one hard stop in §9 that does not get a friendly
+message. Confirm with `systemctl is-active` (or `ss -ltnp` on the mint's port)
+rather than assuming the stop finished.
 
 **Read the rest of this section before you ever do that in production.**
 
@@ -688,18 +724,35 @@ first post-restore snapshot are exactly that pair, they carry the same
 `signing_pubkey`, and both verify. You have signed, with your own key, the
 evidence that §14 and L3 tell your counterparties to read as dilution.
 
-Reproduced end to end on this build, with the installed launcher and the §7
-procedure exactly as written above: take the online backup, issue 9000 mc after
-it, fetch snapshot A (`cumulative_issued_mc=9000`, `outstanding_mc=9000`,
+Reproduced end to end on this build, twice — once as written below, and again
+on 2026-09-16 against the current tree, which reproduced every figure that
+matters (same `signing_pubkey`, `verify_obj` `True` on both snapshots, the
+invariant holding on B, `cumulative_issued_mc` 9000 → 0, and the 9000 mc token
+going from `{"state": "unspent", "amount_mc": 9000}` to `{"state": "unknown"}`)
+and differed only in `snapshot_seq`, for the reason in the first bullet below.
+With the installed launcher and the §7 procedure exactly as written above:
+take the online backup, issue 9000 mc after it, fetch snapshot A
+(`cumulative_issued_mc=9000`, `outstanding_mc=9000`,
 `snapshot_seq=3`), `systemctl stop`, copy the backup over `--db`, start again
 with the **same** `mint-keys.json`. Snapshot B comes back
 `cumulative_issued_mc=0`, `outstanding_mc=0`, `snapshot_seq=1026`, same
 `signing_pubkey`, and `verify_obj` returns `True` on both. Everything a monitor
 would normally catch this with stays quiet:
 
-- `snapshot_seq` moves **forward** (3 → 1026), because the reserved-block
-  scheme guarantees it does — so a `>=` monotonicity assertion on the seq alone
-  passes;
+- **`snapshot_seq` did not go backwards in either restore run here**, so a
+  `>=` monotonicity assertion on the seq alone passed both times. That is an
+  observation about these two restores and **not** a property of the system:
+  a restore can step the seq backwards, and this bullet is not telling you it
+  cannot. The sequence is handed out from reserved blocks whose high-water
+  mark lives in `mintapi_state` *inside `mint.db`*, so a restore rewinds the
+  counter along with everything else, and where it lands is an accident of
+  how much the backup had already reserved. Run above, it jumped 3 → 1026.
+  Re-run on this build on 2026-09-16 with a backup taken at the very start of
+  the mint's life, it went **1 → 1** — flat, and still silently passing `>=`.
+  A backup old enough makes it step backwards, and then a seq-only monitor
+  *would* catch it. Both directions are reachable from the same procedure, so
+  the seq is not a reliable detector of a restore either way: that is the
+  cumulative counters' job, below;
 - the arithmetic invariant `outstanding == issued − burned` holds on B, because
   the restored file is internally consistent;
 - the pinned-pubkey check passes, because the identity did not change.
@@ -863,15 +916,67 @@ filesystem, and `mint.db` growth. The ledger only shrinks when pruning runs
 (§8(b) retention, `Ledger.prune()`, which deletes spent entries and expired
 idempotency records older than `recovery_window_ms` — 90 days by default). On
 this build the launcher runs that on a background thread every
-`--prune-interval-hours` (default 6) and the descriptor's
-`retention.prunes_spent_records` is derived from the same flag, so the published
-claim and the behavior cannot drift apart. Set the interval to 0 and the mint
-both stops pruning and stops claiming to prune — and the file then grows
-forever. Watch for the `prune: deleted N spent ledger entries` line in the
-access log; its absence over a day is the signal that retention has stopped.
+`--prune-interval-hours` (default 6; any positive value below
+`MIN_PRUNE_HOURS` = 0.01 h is refused by argparse, because `prune()` takes
+`BEGIN IMMEDIATE` and blocks every writer while it runs).
 
-**The access log.** `--access-log` gives you `METHOD route STATUS`, route-pattern
-only, never a body. Watch:
+**`prunes_spent_records` is a one-way claim, and `--prune-interval-hours 0`
+does not retract it.** The descriptor field is not derived from this run's
+flag. The first start with pruning on writes `"prunes_spent_records": true`
+into the **key file**, beside `mint_id` and `baseline_model_class`
+(`pin_retention()` in `run_mint.py`), and the mint publishes it from then on
+whatever the flag says — deliberately, because records already deleted cannot
+be undeleted, and over-warning a counterparty is the safe direction.
+Verified on this build, same `--keys` and `--db` across two starts:
+
+```
+run 1, default 6h              retention.prunes_spent_records: true
+key file after run 1           {"private": "<44-char base64url seed>",
+                                "public": "<44-char base64url>",
+                                "mint_id": "p2",
+                                "baseline_model_class": "b1",
+                                "prunes_spent_records": true}
+                               THE SIGNING KEY IS IN THIS FILE, ahead of the
+                               pins, and it is mode 0600. §1 and §7 both say
+                               so; the dump is written out in full here
+                               because an earlier version of this block
+                               showed only the three metadata fields, which
+                               reads as a file that is safe to paste.
+run 2, --prune-interval-hours 0
+                               retention.prunes_spent_records: STILL true
+                               NOTE: pruning is disabled this run, but the
+                               descriptor still says prunes_spent_records:
+                               true — this mint_id has pruned before ...
+```
+
+A mint that has **never** pruned and starts with `0` does publish
+`prunes_spent_records: false` — verified on a fresh `--db`/`--keys` pair. So
+the flag controls the behaviour, only a never-pruned mint's first start
+controls the claim, and once set the claim is as permanent as the baseline.
+Set the interval to 0 on a mint that has already pruned and the ledger grows
+forever while the descriptor goes on promising deletion; that is the drift
+this pin chooses over the other one. Watch for the `prune: deleted N spent
+ledger entries` line in the access log; its absence over a day is the signal
+that retention has stopped.
+
+**The access log.** `--access-log` gives you one line per request, and the
+shape is `TIMESTAMP METHOD route STATUS` — a route *pattern*, never a body and
+never a raw path. Sampled from a live mint on this build:
+
+```
+2026-09-16 06:41:03,123 GET /v3/mints 200
+2026-09-16 06:41:03,131 GET /v3/status/<hash> 200
+2026-09-16 06:41:03,140 POST /v3/status 400
+2026-09-16 06:41:03,148 POST /admin/issue 401
+2026-09-16 06:41:03,156 GET <unknown> 404
+```
+
+Note the last two lines. `/v3/status/<hash>` is written with the literal
+placeholder rather than the entry hash, and a path that matches no route at
+all is logged as `<unknown>` — so this file cannot be used to find out *what*
+someone probed, only that they probed. That is deliberate (a caller who wrongly
+puts a token in a URL must not have it land on disk) and it is a limit on what
+you can investigate from here. Watch:
 - **401s on `/admin/issue`** — someone is probing the issuance credential. If
   `/admin/` is unreachable from outside as §4 requires, any 401 at all is a
   problem.
@@ -917,7 +1022,50 @@ Verified against this build:
 - **A port already in use is a hard stop, not a fallback.** The launcher exits
   with an `ss -ltnp` hint rather than picking another port, because a second
   mint answering on a different port while clients keep talking to the old one
-  is worse than no mint at all.
+  is worse than no mint at all. One thing it does leave behind, verified here:
+  the key file is loaded-or-created *before* the bind, so a start that dies on
+  `Address already in use` with a fresh `--keys` path has already written a new
+  keypair to it. That file is not yet any mint's identity and deleting it is
+  safe — but never delete the one a running mint is using, and never let a
+  retry point `--keys` at it by accident. (The admin-token file and the
+  retention pin are the opposite: those are written only after a successful
+  bind, so a failed start cannot clobber the running mint's credential.)
+- **A `--db` another mint process is already serving is a hard stop, and the
+  only one that arrives as a raw traceback.** The ledger takes an advisory
+  single-writer lock — an `flock(LOCK_EX|LOCK_NB)` on the **ledger file
+  itself**, not on a separate `.lock` file (`_claim_single_writer()` in
+  `impl/aicash/mintapi.py`) — at `server.start()`, and a second mint pointed
+  at the same file dies before it binds. This matters directly to §7's restore
+  procedure, which is *stop, replace, start*: start while the old unit is
+  still draining and this is the refusal you get. Reproduced on this build —
+  two `run_mint.py` on one `--db`, second start:
+
+  ```
+  generated a new mint keypair -> .../k2.json
+  Traceback (most recent call last):
+    File ".../run_mint.py", line 666, in <module>
+      main()
+    File ".../run_mint.py", line 504, in main
+      port = server.start(args.port)
+    File ".../impl/aicash/mintapi.py", line 1472, in start
+      self._core._claim_single_writer()
+    File ".../impl/aicash/mintapi.py", line 716, in _claim_single_writer
+      raise RuntimeError(
+  RuntimeError: another mint process already serves this ledger
+  (.../m.db). One ledger file is served by exactly one mint: §3.6 snapshot
+  monotonicity is ordered per process, so a second server could sign
+  snapshots that are portable proof of nonconformance against this mint_id.
+  Stop the other process, or give this mint its own ledger.
+  ```
+
+  Exit status 1, nothing bound, nothing written to the ledger — but unlike
+  every other hard stop in this list there is no friendly one-line refusal,
+  so the operator meets a Python traceback and has to read the last line of
+  it. Two things it *does* leave behind, both visible above: the keypair was
+  written before the failure (same note as the port bullet), and the message
+  names the ledger file it could not claim. `systemctl restart` is not affected — the unit's stop
+  completes first; the exposure is a manual start, a second unit pointed at
+  the same `--db`, or a restore started too early.
 - **A changed baseline or a mismatched `mint_id` is a hard stop.** Expect the
   unit to fail to start after a fat-fingered `ExecStart` edit; read the message,
   do not "fix" it by deleting the key file.
@@ -959,7 +1107,8 @@ someone is quietly working on; they are the known state of the build.
 **1. The cryptography has never had an independent human review.** Every
 signature, hash-lock, chain-derivation and swap construction in this
 implementation was designed and checked inside the same process that produced
-it. The test suite — 380 cases passing when this line was last updated, and still
+it. The test suite — 394 cases passing when this line was last updated
+(2026-09-16), and still
 growing, so run `python3 -m unittest discover -s tests -t .` from `impl/` for
 today's number rather than trusting a figure in prose — covers the adversarial
 cases the authors *thought of*. No external cryptographer has audited the Ed25519 usage, the domain separation
@@ -970,7 +1119,9 @@ a review before the value at risk exceeds what you would pay for one.
 
 **2. Key rotation is unimplemented.** §3.6/R13 specify rotation — publish
 `signing_pubkey_next`, cross-signed by the current key over
-`{mint_id, pubkey, effective_at}` — and this build emits no such field. There is
+`{mint_id, pubkey, effective_at}` — and this build emits the field as a
+permanent `null` and never fills it in (§7: `"signing_pubkey_next": null` on
+every descriptor; present as a key, empty as a value). There is
 no path from a compromised or suspected-compromised signing key to a new one
 that your counterparties can distinguish from an attack. Plan operationally
 around that: guard the key file as though there is no recovery, because there
@@ -1104,10 +1255,13 @@ it.
 - [ ] Certificate expiry is monitored from outside with weeks of headroom (§8)
 - [ ] Proxy limiter matches the descriptor's published `anonymous_rate`
       exactly — including `burst`, which caddy-ratelimit cannot express (§4.1/§5)
-- [ ] An admin credential is configured, and issuance without it is refused —
+- [ ] An admin credential is in force, and issuance without it is refused —
       checked on the host, not assumed: `curl -si -X POST
       http://127.0.0.1:8787/admin/issue -d '{"outputs":[]}'` with no
-      `X-Admin-Token` must answer **401**, never 200 (§1/§10.8)
+      `X-Admin-Token` must answer **401**, never 200. This launcher generates
+      one unless you pass `--admin-token` or `--open-issuance`, so the box is
+      normally already true; tick it by running the curl, and know where
+      `--admin-token-file` put the credential (§1/§3/§10.8)
 - [ ] `--console-port 0`, or console reachable only through an SSH tunnel (§1).
       The console's own capability-URL auth does **not** substitute for this:
       if the console is running at all, confirm its startup URL was not

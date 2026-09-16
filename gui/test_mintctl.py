@@ -334,7 +334,12 @@ class TestStaleState(MintControlTestCase):
             status,
             {"running": False, "pid": None, "port": None, "mint_id": None,
              "base_url": None, "started_at_ms": None, "last_error": None,
-             "responding": False})
+             # NOT False. False is documented as "a live mint process did
+             # not answer", and on a workdir that has never held a mint
+             # there is no process that could have failed to answer.
+             # Nothing was asked, so the honest value is the third one.
+             "responding": None})
+        self.assertIsNone(status["responding"])
         self.assertEqual(mc.logs(), [])
         self.assertIsNone(mc.admin_token())
 
@@ -905,6 +910,396 @@ def _pid_alive(pid: int) -> bool:
             return fh.read().rpartition(b")")[2].split()[0] not in (b"Z", b"X")
     except OSError:
         return False
+
+
+# ======================================================================
+# "is the mint working" must be ONE answer, measured now
+# ======================================================================
+#: A child that execs with a NULL argv, so the kernel records no command
+#: line for it at all. execve(2) permits argc == 0; os.execv refuses to
+#: build one, so this goes through libc directly. The result is a real,
+#: live, ordinary process whose /proc/<pid>/cmdline is empty -- the same
+#: thing mintctl sees for a process whose command line it may not read,
+#: and for a kernel thread on a box that shows them.
+_NO_ARGV_CHILD = (
+    "import ctypes;"
+    "libc = ctypes.CDLL('libc.so.6', use_errno=True);"
+    "argv = (ctypes.c_char_p * 1)(None);"
+    "libc.execv(b'/bin/cat', argv)"
+)
+
+
+def spawn_without_argv(case) -> int | None:
+    """A live pid whose /proc/<pid>/cmdline is empty, or None.
+
+    Waits for the CHILD WE MEAN: /proc/<pid>/comm has to say ``cat``, which
+    only the second exec can produce. An empty cmdline on its own is not
+    enough to wait on -- execve leaves mm->arg_start zeroed for a moment
+    while it installs the new image, so /proc briefly reports no command
+    line for the FIRST exec too, and returning then hands back a pid that
+    is about to grow a perfectly readable argv.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", _NO_ARGV_CHILD],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    case.addCleanup(_hard_kill, proc)
+    case.addCleanup(lambda: proc.stdin is not None and proc.stdin.close())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            with open("/proc/%d/comm" % proc.pid) as fh:
+                comm = fh.read().strip()
+            with open("/proc/%d/cmdline" % proc.pid, "rb") as fh:
+                empty = not fh.read().strip(b"\0")
+            with open("/proc/%d/stat" % proc.pid, "rb") as fh:
+                state = fh.read().rpartition(b")")[2].split()[0]
+        except OSError:                              # pragma: no cover
+            return None
+        if state in (b"Z", b"X", b"x"):              # pragma: no cover
+            return None                              # execv never took
+        if comm == "cat" and empty:
+            return proc.pid
+        time.sleep(0.05)
+    return None                                      # pragma: no cover
+
+
+class TestRespondingIsMeasuredNotRemembered(MintControlTestCase):
+    """``responding`` answers about NOW, or it is worthless.
+
+    The defect this pins: the descriptor probe used to be cached for a
+    second, so a mint stopped at the OS level went on reading ``responding:
+    True`` for about that long -- long enough for the panel to draw the
+    healthy state while a payment in the same second failed with
+    mint_unreachable. Nothing is faked here: the mint is a real subprocess
+    and it is really SIGSTOPped, which is what a wedged mint is.
+    """
+
+    def test_a_sigstopped_mint_never_reads_as_responding(self):
+        mc, status = self.start_a_mint()
+        pid = status["pid"]
+        self.assertIs(status["responding"], True, "a live mint should answer")
+        os.kill(pid, signal.SIGSTOP)
+        self.addCleanup(lambda: os.kill(pid, signal.SIGCONT))
+        started = time.monotonic()
+        seen = []
+        # The whole window the old cache covered, and then some.
+        while time.monotonic() - started < 4.0:
+            after = mc.status()
+            seen.append((round(time.monotonic() - started, 2),
+                         after["responding"]))
+            self.assertIs(
+                after["responding"], False,
+                "a mint stopped at the OS level read as responding=%r at "
+                "t=%.2fs; readings so far: %r"
+                % (after["responding"], time.monotonic() - started, seen))
+            # ...and it is still RUNNING: wedged is not stopped, and saying
+            # otherwise would invite a second mint onto the same ledger.
+            self.assertTrue(after["running"])
+        self.assertTrue(seen, "the loop never took a reading")
+
+    def test_the_first_reading_after_a_wedge_is_already_false(self):
+        """No grace period. The very next call is the honest one."""
+        mc, status = self.start_a_mint()
+        pid = status["pid"]
+        os.kill(pid, signal.SIGSTOP)
+        self.addCleanup(lambda: os.kill(pid, signal.SIGCONT))
+        self.assertIs(mc.status()["responding"], False)
+
+    def test_responding_comes_back_when_the_mint_does(self):
+        """The other direction: a cache-free probe must also stop lying low."""
+        mc, status = self.start_a_mint()
+        pid = status["pid"]
+        os.kill(pid, signal.SIGSTOP)
+        self.assertIs(mc.status()["responding"], False)
+        os.kill(pid, signal.SIGCONT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if mc.status()["responding"] is True:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("a resumed mint never read as responding again")
+
+    def test_a_dead_mint_is_not_responding_false_it_is_nothing_asked(self):
+        """SIGKILL, not SIGSTOP: there is no process left to ask."""
+        mc, status = self.start_a_mint()
+        pid = status["pid"]
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            after = mc.status()
+            if not after["running"]:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("a SIGKILLed mint never read as stopped")
+        self.assertFalse(after["running"])
+        self.assertIsNone(
+            after["responding"],
+            "there is no process here; 'it did not answer' describes a "
+            "failure that never happened")
+
+
+class TestRunningAndRespondingNeverContradict(MintControlTestCase):
+    """Walk the whole state machine and check the pair at every stop.
+
+    The invariant, in one line: ``running is False`` implies ``responding
+    is None`` (nothing was asked), and ``running is True`` implies
+    ``responding`` is a real boolean (something was asked and either did or
+    did not answer). Every transition below is caused for real.
+    """
+
+    def check(self, status, *, running, responding, where):
+        self.assertIs(status["running"], running, where)
+        self.assertIs(status["responding"], responding, where)
+        if status["running"]:
+            self.assertIsInstance(status["responding"], bool, where)
+        else:
+            self.assertIsNone(status["responding"], where)
+
+    def test_every_state_this_workdir_can_be_in(self):
+        mc = self.control()
+        self.check(mc.status(), running=False, responding=None,
+                   where="never started")
+
+        port = free_port()
+        started = mc.start(mint_id="walk-mint",
+                           baseline_model_class="baseline-v1", port=port,
+                           rate_ppm=0, cap_mc=0, exempt_below_mc=10)
+        self.check(started, running=True, responding=True, where="up")
+        pid = started["pid"]
+
+        os.kill(pid, signal.SIGSTOP)
+        self.check(mc.status(), running=True, responding=False,
+                   where="wedged (SIGSTOP)")
+
+        os.kill(pid, signal.SIGCONT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if mc.status()["responding"] is True:
+                break
+            time.sleep(0.1)
+
+        # The stop this walk used to skip, and the one that let a live mint
+        # be drawn healthy: alive, and the record no longer says where.
+        # Visited HERE so the invariant above is asserted about it rather
+        # than around it -- a sibling test in this file asserting the
+        # opposite is how a third value got in.
+        with open(mc.state_path) as fh:
+            blob = json.load(fh)
+        keep_port = blob.get("port")
+        blob.pop("port", None)
+        with open(mc.state_path, "w") as fh:
+            json.dump(blob, fh)
+        noport = mc.status()
+        self.check(noport, running=True, responding=False,
+                   where="alive with no recorded port")
+        self.assertIsNone(noport["base_url"])
+        self.assertTrue(noport["last_error"])
+        blob["port"] = keep_port
+        with open(mc.state_path, "w") as fh:
+            json.dump(blob, fh)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if mc.status()["responding"] is True:
+                break
+            time.sleep(0.1)
+        self.check(mc.status(), running=True, responding=True,
+                   where="resumed (SIGCONT)")
+
+        stopped = mc.stop(drain_seconds=3)
+        self.check(stopped, running=False, responding=None,
+                   where="stopped cleanly")
+        # ...and the identity a stopped workdir still holds is unchanged
+        self.assertEqual(stopped["mint_id"], "walk-mint")
+        self.assertEqual(stopped["port"], port)
+
+        restarted = mc.start(mint_id="walk-mint",
+                             baseline_model_class="baseline-v1", port=port,
+                             rate_ppm=0, cap_mc=0, exempt_below_mc=10)
+        self.check(restarted, running=True, responding=True,
+                   where="restarted")
+
+        os.kill(restarted["pid"], signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            after = mc.status()
+            if not after["running"]:
+                break
+            # while it IS still seen as running, it must still be a bool
+            self.assertIsInstance(after["responding"], bool)
+            time.sleep(0.1)
+        self.check(after, running=False, responding=None,
+                   where="killed from outside")
+
+
+class TestThreeValuedAnswers(MintControlTestCase):
+    """Booleans this module reports must not flatten a third state."""
+
+    def test_a_virgin_workdir_did_not_fail_to_answer(self):
+        virgin = tempfile.mkdtemp(prefix="mintctl-virgin-")
+        self.addCleanup(__import__("shutil").rmtree, virgin, True)
+        self.assertEqual(os.listdir(virgin), [])
+        mc = self.control(virgin)
+        status = mc.status()
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["pid"])
+        self.assertIsNone(
+            status["responding"],
+            "false means a live mint did not answer; there is no mint here")
+
+    def test_responding_is_none_after_a_clean_stop_too(self):
+        mc, _ = self.start_a_mint()
+        after = mc.stop(drain_seconds=3)
+        self.assertFalse(after["running"])
+        self.assertIsNone(after["responding"],
+                          "nothing was asked, so nothing failed to answer")
+
+    def test_a_live_mint_with_no_recorded_port_cannot_answer(self):
+        """Alive, and the record does not say where. It answers nothing.
+
+        Caused for real: a mint is started, and its supervision file then
+        loses the port -- the shape a hand-edited, partially-restored or
+        older state file has. The process check still recognises it (the
+        argv still serves this ledger), so ``running`` is True; there is
+        no address to probe, so this call got no answer out of it.
+
+        That is responding=False, and the third value is NOT available
+        here. gui/page.html draws the mint from exactly this pair:
+
+            const deaf = running && mint.responding === false;
+
+        and it prints ``last_error`` only when ``!running || deaf``. A
+        third value under a live process therefore drew the FULLY HEALTHY
+        state -- green dot, "up <uptime>", Pay/Issue/Receive/Recover all
+        enabled -- for a mint nothing here can reach, with the one
+        sentence that says so suppressed. The distinction between "asked
+        and got nothing" and "had nowhere to ask" is real and is carried
+        in ``last_error``, which in this state is on the screen.
+        """
+        mc, status = self.start_a_mint()
+        with open(mc.state_path) as fh:
+            blob = json.load(fh)
+        blob.pop("port", None)
+        with open(mc.state_path, "w") as fh:
+            json.dump(blob, fh)
+        after = mc.status()
+        self.assertTrue(after["running"], after)
+        self.assertIsNone(after["port"])
+        self.assertIsNone(after["base_url"])
+        self.assertIs(after["responding"], False,
+                      "a live mint with no address is not answering "
+                      "anything; None here draws the healthy state")
+        note = (after["last_error"] or "").lower()
+        # ...and the sentence beside the indicator says what is undetermined
+        # WITHOUT claiming a request was sent and refused.
+        self.assertIn("does not say which port", note)
+        self.assertIn("nothing was sent", note)
+        # The page's own predicate, spelled out: this state is the amber
+        # one, which is the state in which last_error reaches the screen.
+        deaf = bool(after["running"]) and after["responding"] is False
+        self.assertTrue(deaf, "page.html would draw this mint healthy")
+        self.assertTrue(after["last_error"])
+
+    def test_an_unreadable_command_line_is_not_evidence_of_pid_reuse(self):
+        """A pid whose argv says nothing must not be blamed for anything.
+
+        Real condition, really caused: a child that execs with argc == 0,
+        so the kernel records no command line for it. It is alive, it is
+        not a zombie, and /proc/<pid>/cmdline is empty -- the same thing
+        this module sees for a process whose command line it may not read.
+        Reporting "the number was reused by another program" from that is a
+        conclusion drawn from no evidence at all.
+        """
+        pid = spawn_without_argv(self)
+        if pid is None:                              # pragma: no cover
+            self.skipTest("could not spawn a process with an empty cmdline")
+        mc = self.control()
+        with open(mc.state_path, "w") as fh:
+            json.dump({"pid": pid, "port": 65000, "mint_id": "test-mint",
+                       "proc_start_ticks": None, "started_at_ms": 1,
+                       "last_error": None}, fh)
+        status = mc.status()
+        self.assertFalse(status["running"])
+        note = status["last_error"] or ""
+        self.assertIn("undetermined", note.lower(), note)
+        self.assertNotIn("reused", note.lower(), note)
+
+
+class TestRecordedStart(MintControlTestCase):
+    """What the supervisor knows about the mint this workdir holds."""
+
+    SETTINGS = {"mint_id": "recorded-mint", "baseline_model_class": "baseline-v1",
+                "rate_ppm": 7000, "cap_mc": 900, "exempt_below_mc": 12}
+
+    def test_a_virgin_workdir_records_nothing(self):
+        virgin = tempfile.mkdtemp(prefix="mintctl-norecord-")
+        self.addCleanup(__import__("shutil").rmtree, virgin, True)
+        self.assertIsNone(self.control(virgin).recorded_start())
+
+    def test_it_reports_exactly_what_was_started(self):
+        port = free_port()
+        mc, status = self.start_a_mint(
+            port=port, mint_id=self.SETTINGS["mint_id"],
+            baseline=self.SETTINGS["baseline_model_class"],
+            rate_ppm=self.SETTINGS["rate_ppm"],
+            cap_mc=self.SETTINGS["cap_mc"],
+            exempt_below_mc=self.SETTINGS["exempt_below_mc"])
+        self.assertEqual(mc.recorded_start(), dict(self.SETTINGS, port=port))
+        # and it agrees with the status line about which mint this is
+        self.assertEqual(mc.recorded_start()["mint_id"], status["mint_id"])
+        self.assertEqual(mc.recorded_start()["port"], status["port"])
+
+    def test_it_survives_the_mint_being_stopped(self):
+        """A stopped workdir still HOLDS that mint; the form must show it."""
+        port = free_port()
+        mc, _ = self.start_a_mint(
+            port=port, mint_id=self.SETTINGS["mint_id"],
+            baseline=self.SETTINGS["baseline_model_class"],
+            rate_ppm=self.SETTINGS["rate_ppm"],
+            cap_mc=self.SETTINGS["cap_mc"],
+            exempt_below_mc=self.SETTINGS["exempt_below_mc"])
+        stopped = mc.stop(drain_seconds=3)
+        self.assertFalse(stopped["running"])
+        self.assertEqual(mc.recorded_start(), dict(self.SETTINGS, port=port))
+        self.assertEqual(mc.recorded_start()["mint_id"], stopped["mint_id"])
+        self.assertEqual(mc.recorded_start()["port"], stopped["port"])
+
+    def test_a_second_controller_reads_the_same_record(self):
+        """The real defect-5 shape: a fresh process on a leftover workdir."""
+        port = free_port()
+        mc, _ = self.start_a_mint(
+            port=port, mint_id=self.SETTINGS["mint_id"],
+            baseline=self.SETTINGS["baseline_model_class"],
+            rate_ppm=self.SETTINGS["rate_ppm"],
+            cap_mc=self.SETTINGS["cap_mc"],
+            exempt_below_mc=self.SETTINGS["exempt_below_mc"])
+        mc.stop(drain_seconds=3)
+        fresh = self.control()          # same workdir, nothing in memory
+        self.assertEqual(fresh.recorded_start(), dict(self.SETTINGS, port=port))
+        self.assertEqual(fresh.recorded_start()["mint_id"],
+                         fresh.status()["mint_id"])
+
+    def test_a_record_without_an_argv_reports_only_what_it_has(self):
+        """An old or hand-written state file must not be padded out."""
+        mc = self.control()
+        with open(mc.state_path, "w") as fh:
+            json.dump({"pid": None, "port": 65000, "mint_id": "legacy-mint",
+                       "baseline_model_class": "baseline-v1",
+                       "proc_start_ticks": None, "started_at_ms": 1,
+                       "last_error": None}, fh)
+        self.assertEqual(mc.recorded_start(),
+                         {"mint_id": "legacy-mint", "port": 65000,
+                          "baseline_model_class": "baseline-v1"})
+
+    def test_junk_in_the_record_is_dropped_not_reported(self):
+        mc = self.control()
+        with open(mc.state_path, "w") as fh:
+            json.dump({"pid": None, "port": 999999, "mint_id": "NOT VALID",
+                       "proc_start_ticks": None, "started_at_ms": 1,
+                       "last_error": None}, fh)
+        self.assertIsNone(mc.recorded_start())
 
 
 if __name__ == "__main__":

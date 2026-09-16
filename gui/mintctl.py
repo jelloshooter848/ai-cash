@@ -61,10 +61,18 @@ of them visible to the other two modules as a different call signature:
   tell the GUI, a wallet, or a payer where it went. A GUI restriction, not
   a mint one: an operator who wants an ephemeral port can still start the
   mint by hand.
-* ``status()`` returns one **additive** key, ``responding`` (did the
-  descriptor answer on this call), and keeps the last-known
-  ``port``/``mint_id``/``base_url`` when ``running`` is False, so the panel
-  can still name the mint a stopped workdir holds.
+* ``status()`` returns one **additive** key, ``responding``, and keeps the
+  last-known ``port``/``mint_id``/``base_url`` when ``running`` is False, so
+  the panel can still name the mint a stopped workdir holds. ``responding``
+  is THREE-valued and is always measured on the call that reports it: True
+  the descriptor answered just now, False a live process did not answer,
+  and **None when there was nothing to ask** — a workdir with no mint
+  running has no process that could have failed to answer, and False there
+  would describe a failure that never happened.
+* ``recorded_start()`` is the second additive call: the settings the mint in
+  this workdir was last started with, read back out of the supervision
+  file, so the panel's Start form can show what is actually here instead of
+  its own defaults.
 * ``stop(drain_seconds=...)`` is **this call's** wait budget before SIGKILL.
   The child's own in-flight drain deadline is fixed at start time
   (``child_drain_s``).
@@ -446,8 +454,6 @@ class MintControl:
         # it and falls back to /proc, which is why status() never depends
         # on it being present.
         self._proc: subprocess.Popen | None = None
-        # (monotonic time, port, mint_id, answered) of the last probe
-        self._probe_at: tuple[float, object, object, bool] | None = None
 
     # -- persisted supervision state ------------------------------------
 
@@ -548,7 +554,21 @@ class MintControl:
             return False, (
                 "pid %d is alive but it is a different program — the mint "
                 "that had that pid is gone and the number was reused." % pid)
-        if not _argv_serves_ledger(_proc_argv(pid), self.db_path):
+        argv = _proc_argv(pid)
+        if not argv:
+            # An EMPTY /proc/<pid>/cmdline is not evidence of anything: a
+            # kernel thread has none, and a cmdline this process may not
+            # read reads the same way. Saying "the number was reused"
+            # here would be a confident claim built on no evidence, so
+            # this says what was actually established. The mint is still
+            # reported stopped -- claiming it is up would strand a start
+            # behind a process we cannot identify -- but the sentence no
+            # longer names a cause nobody checked.
+            return False, (
+                "pid %d is alive but its command line could not be read, so "
+                "whether it is this workdir's mint is undetermined; treating "
+                "the mint as stopped." % pid)
+        if not _argv_serves_ledger(argv, self.db_path):
             return False, (
                 "pid %d is alive but it is not this workdir's mint — the "
                 "number was reused by another program." % pid)
@@ -602,13 +622,14 @@ class MintControl:
             self._write_state(new)
         except OSError:
             pass  # reporting the truth matters more than recording it
-        self._probe_at = None
         return new
 
-    def _descriptor(self, port: int, timeout: float = 2.0) -> dict | None:
+    def _descriptor(self, port: int, timeout: float | None = None) -> dict | None:
         """GET /v3/mints on loopback, or None. http.client, not urllib:
         urllib honours http_proxy, and a proxy has no business standing
         between the GUI and 127.0.0.1."""
+        if timeout is None:
+            timeout = self.probe_timeout_s
         if not isinstance(port, int) or not (0 < port < 65536):
             return None
         conn = None
@@ -633,24 +654,29 @@ class MintControl:
     def _descriptor_confirms(self, state: dict) -> bool:
         return self._probe(state.get("port") or 0, state.get("mint_id"))
 
-    #: How long a descriptor probe is reused for. A GET /v3/mints is not
-    #: free — the mint signs a fresh supply snapshot for each one (§3.6) —
-    #: and app.py may call status() several times while serving one page.
-    #: One second is short enough that the panel still feels live.
-    _probe_ttl_s = 1.0
+    #: How long ONE descriptor probe may take. It is also the whole cost of
+    #: the freshness rule below, and app.py sizes its own mint deadline
+    #: around it (see MINT_HTTP_TIMEOUT_S there), so it is named rather than
+    #: written into each call site.
+    probe_timeout_s = 2.0
 
     def _probe(self, port, mint_id) -> bool:
-        """Is the mint we recorded answering on the port we recorded?"""
-        now = time.monotonic()
-        cached = self._probe_at
-        if cached is not None:
-            when, was_port, was_id, result = cached
-            if was_port == port and was_id == mint_id and now - when < self._probe_ttl_s:
-                return result
-        d = self._descriptor(port or 0, timeout=2.0)
-        result = bool(d) and d.get("mint_id") == mint_id
-        self._probe_at = (now, port, mint_id, result)
-        return result
+        """Did the mint we recorded answer on the port we recorded, NOW?
+
+        There is no cache here, deliberately, and there must not be one.
+        This answer is the only evidence status() has for ``responding``,
+        and ``responding`` is what a panel draws a health light from. A
+        probe kept for even one second means a mint that was wedged,
+        SIGSTOPped or killed within that second is still drawn healthy
+        while a payment in the same second fails with mint_unreachable --
+        two adjacent answers to "is the mint working", with the optimistic
+        one on screen. A GET /v3/mints does cost the mint a signed supply
+        snapshot (§3.6); that price is worth paying for an answer that is
+        about now, and the fix for paying it twice in one page is to ask
+        status() once, not to remember what it said.
+        """
+        d = self._descriptor(port or 0)
+        return bool(d) and d.get("mint_id") == mint_id
 
     # -- public API ------------------------------------------------------
 
@@ -658,8 +684,40 @@ class MintControl:
         """Current state of the mint in this workdir.
 
         Keys: running, pid, port, mint_id, base_url, started_at_ms,
-        last_error — plus ``responding``, which is additive: True when the
-        descriptor answered on this call.
+        last_error — plus ``responding``, which is additive and has THREE
+        values, all of them about THIS call:
+
+          True   the mint's descriptor answered, just now.
+          False  a mint process IS running here and this call got no
+                 answer out of it. Two ways that happens and
+                 ``last_error`` says which: the descriptor probe was sent
+                 and nothing came back, or there was no address to send it
+                 to because this workdir's record does not say which port
+                 the process is on. Either way the mint is running and
+                 unusable from here, which is the one thing a health
+                 indicator has to show.
+          None   nothing was asked, because no mint process is running
+                 here. There is no process that could have failed to
+                 answer, so False would report a failure that never
+                 happened -- which is what a virgin workdir used to say.
+
+        So the pair is total and never contradicts itself: ``running`` is
+        False implies ``responding`` is None, and ``running`` is True
+        implies ``responding`` is a real boolean. That is not a style
+        rule. A panel lights its indicator off this pair, and the one that
+        drew this module's output rendered "running with responding not
+        False" as the fully healthy state -- so a third value under a live
+        process meant a mint nobody could reach was drawn green, with the
+        sentence explaining why suppressed. ``responding`` answers "did
+        this call get an answer out of the mint", not "did a probe fail";
+        the difference between a probe that failed and a probe that could
+        not be addressed is real, and it is carried in ``last_error``,
+        which is printed beside the indicator in that state.
+
+        The probe behind it is never cached. ``responding`` is what a panel
+        lights a health indicator from, and a remembered answer makes a
+        mint that died a moment ago read as healthy while a payment in the
+        same second fails with mint_unreachable.
 
         When ``running`` is False, ``pid`` and ``started_at_ms`` are None
         but ``port``/``mint_id``/``base_url`` keep the LAST KNOWN values
@@ -684,9 +742,12 @@ class MintControl:
                     state, alive, reason = adopted, True, None
             port = _clean_port(state.get("port"))
             mint_id = state.get("mint_id")
-            responding = False
+            # None until something is actually asked. See the docstring:
+            # "nothing answered" and "nothing was asked" are different
+            # answers and the panel has to be able to tell them apart.
+            responding = None
             last_error = state.get("last_error")
-            if alive:
+            if alive and port:
                 responding = self._probe(port, mint_id)
                 if responding:
                     last_error = None
@@ -695,6 +756,30 @@ class MintControl:
                         "the mint process (pid %s) is running but is not "
                         "answering on port %s yet — it may be starting up or "
                         "shutting down." % (state.get("pid"), port))
+            elif alive:
+                # Alive, and this workdir's record does not say where. No
+                # request was sent -- and the mint still did not answer
+                # this call, because there was nothing to send it to. That
+                # is responding=False: a live mint this GUI cannot get an
+                # answer out of. The distinction that matters to an
+                # operator (nothing was SENT, so nothing is half-done) is
+                # in the sentence below, which is exactly what a panel
+                # prints in this state.
+                #
+                # Not repaired from argv on purpose: a --port in the
+                # recorded command line is the port the mint was ASKED to
+                # bind, not one it was seen holding, and publishing a
+                # base_url from it would point this GUI's money routes at
+                # whatever else happens to be listening there.
+                responding = False
+                if not last_error:
+                    last_error = (
+                        "the mint process (pid %s) is running but this "
+                        "workdir's record does not say which port it is on, "
+                        "so this GUI has no address to ask: nothing was sent "
+                        "to it, and it cannot answer anything from here until "
+                        "it is stopped and started again."
+                        % (state.get("pid"),))
             base_url = "http://127.0.0.1:%d" % port if port else None
             return {
                 "running": bool(alive),
@@ -711,6 +796,77 @@ class MintControl:
                 "last_error": last_error,
                 "responding": responding,
             }
+
+    #: The flags ``_start`` spells into the child's argv, in the order the
+    #: GUI form asks for them, paired with the name the GUI calls each one.
+    _RECORDED_FLAGS = (
+        ("mint_id", "--mint-id", str),
+        ("baseline_model_class", "--model-class", str),
+        ("port", "--port", int),
+        ("rate_ppm", "--rate-ppm", int),
+        ("cap_mc", "--cap-mc", int),
+        ("exempt_below_mc", "--exempt-below-mc", int),
+    )
+
+    def recorded_start(self) -> dict | None:
+        """The settings the mint in this workdir was last started with.
+
+        Read back out of the supervision file, from the argv actually
+        spawned (or adopted) rather than from anything the GUI remembers
+        separately, so it cannot drift from what status() reports about the
+        same workdir: both come from mint-control.json.
+
+        Returns None when this workdir has never held a mint. Otherwise a
+        dict with a key for every setting it could establish and NOTHING
+        for the ones it could not -- an absent key means "not recorded", and
+        a caller filling the gap from its own defaults is then doing so
+        knowingly. Never invents a value: a workdir whose argv is missing
+        still yields mint_id/port/baseline from the state file's own
+        fields, and the three economic numbers simply do not appear.
+
+        This is the answer to a panel whose Start form and status line
+        disagreed about which mint a workdir holds. The form has defaults;
+        the supervisor has a record; when there is a record the form must
+        show it.
+        """
+        with self._lock:
+            state = self._read_state()
+            if not state:
+                return None
+            argv = state.get("argv")
+            argv = [str(a) for a in argv] if isinstance(argv, list) else []
+            out: dict = {}
+            for key, flag, kind in self._RECORDED_FLAGS:
+                raw = _argv_value(argv, flag) if argv else None
+                if raw is None:
+                    # The two identities are kept as their own fields too,
+                    # and _adopt_orphan writes them for a mint it never
+                    # spawned; fall back to those before giving up.
+                    if key == "mint_id":
+                        raw = state.get("mint_id")
+                    elif key == "baseline_model_class":
+                        raw = state.get("baseline_model_class")
+                    elif key == "port":
+                        raw = state.get("port")
+                if raw is None or isinstance(raw, bool):
+                    continue
+                if kind is int:
+                    try:
+                        value = int(str(raw))
+                    except (TypeError, ValueError):
+                        continue
+                    if key == "port" and not (0 < value < 65536):
+                        continue
+                    if value < 0:
+                        continue
+                else:
+                    value = str(raw)
+                    if not value:
+                        continue
+                    if key == "mint_id" and not MINT_ID_RE.fullmatch(value):
+                        continue
+                out[key] = value
+            return out or None
 
     def start(self, *, mint_id: str, baseline_model_class: str, port: int,
               rate_ppm: int, cap_mc: int, exempt_below_mc: int) -> dict:
@@ -809,7 +965,6 @@ class MintControl:
         # start rotates the file, and a credential whose digest was never
         # captured can never be redacted out of an append-only log again.
         self._remember_token(self.admin_token())
-        self._probe_at = None  # it just answered; do not report a stale probe
         return self.status()
 
     def stop(self, *, drain_seconds: int = 10) -> dict:
@@ -868,7 +1023,6 @@ class MintControl:
                         "SIGTERM and SIGKILL." % pid)
             self._reap(block_s=self.kill_grace_s)
             self._proc = None
-            self._probe_at = None
             self._mark_not_running(state, note)
             return self.status()
 

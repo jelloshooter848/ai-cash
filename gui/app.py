@@ -76,6 +76,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -90,7 +91,75 @@ for _p in (HERE, os.path.join(REPO, "impl")):
 
 DEFAULT_PORT = 8799
 DEFAULT_WORKDIR = os.path.join(HERE, "var")
-MINT_HTTP_TIMEOUT_S = 15.0
+
+# THE DEADLINE BUDGET, WHICH ROUTES IT BINDS, AND WHICH IT DOES NOT.
+#
+# The page gives up on its own: page.html's TIMEOUTS.default is 20s, after
+# which it aborts the fetch and shows ITS message -- "nothing answered
+# before this page gave up waiting" -- instead of the error body this
+# server determined. gui/README.md tells the operator to read ``cause``
+# rather than the status line, so a cause this server computes AFTER the
+# page has stopped listening is a documented answer that cannot be reached.
+#
+# So the budget is sized from the page inwards, not from the socket
+# outwards. The cost of asking the mint anything, once: MintControl's
+# descriptor probe (mintctl.probe_timeout_s, 2s, one per mint_status()
+# call -- and there is no probe cache any more, so it is paid every time)
+# plus the deadline of the call itself.
+#
+# BOUND, measured against a real SIGSTOPped mint:
+#
+#   * every route that goes through _mint_http (mint descriptor, mint
+#     supply, token lookup, issue): 2 + MINT_HTTP_TIMEOUT_S = 10s.
+#   * /api/wallet/list, /api/wallet/summary, /api/wallet/outstanding:
+#     2 + READ_DEADLINE_S = 14s, enforced by Api._read_within() below.
+#     These do not go through _mint_http at all -- they go through
+#     gui/walletops.py into aicash.wallet.MintClient, whose own 30s
+#     deadline this file does not set and cannot shorten from here -- so
+#     before that deadline existed they ran 32s (one wallet), 62s (two
+#     mint calls) and 64s (two wallets, read one after another) against a
+#     wedged mint: the three slowest routes in the product, all of them
+#     unreachable from the page at exactly the moment they matter, and
+#     /api/wallet/list is the one every balance on the screen comes from.
+#
+# NOT BOUND, and deliberately. Every route in this list can outlast the
+# page's abort against a wedged mint, and all of them are named here
+# because an operator watching a panel hang is owed the reason:
+#
+#   * /api/wallet/quote (~31-38s), /api/wallet/pay (~31-38s),
+#     /api/wallet/receive and /api/wallet/recover (~36s) MOVE MONEY.
+#     _read_within() answers by ABANDONING its worker, which is safe for a
+#     read and is not safe here: this server would be reporting an outcome
+#     for an operation still in flight inside the worker it walked away
+#     from, which is the one thing this GUI must never do. They wait for
+#     walletops.py to finish and report what it determined, even when that
+#     lands after the page has stopped listening -- in which case the
+#     operator sees page.html's own "gave up waiting" message, the
+#     wallet's history row is still written by walletops.py, and
+#     /api/wallet/recover (itself slow, for the same reason) is how an
+#     operation left in flight is settled. Shortening them means giving
+#     aicash.wallet.MintClient a timeout, which is a change to a file this
+#     one does not own.
+#   * /api/wallet/create makes a wallet file. Abandoning it would let this
+#     server answer "not created" while the worker it abandoned was still
+#     creating it.
+#   * /api/mint/start and /api/mint/stop are supervised process
+#     transitions with their own timeouts (MintControl.start_timeout_s and
+#     the stop drain). A start that takes 25s has not failed -- it is
+#     starting -- and page.html gives exactly these two their own longer
+#     deadlines (TIMEOUTS.start 90s, TIMEOUTS.stop 70s), so the 20s abort
+#     is not their budget in the first place.
+#
+# PAGE_ABORT_S is what all of that is sized against. Nothing in this file
+# reads it at runtime -- it is the page's number, not this server's -- and
+# the tests are what keep the arithmetic honest: they assert it against
+# the value page.html actually uses, and they measure each bound route
+# against a really wedged mint.
+PAGE_ABORT_S = 20.0
+MINT_HTTP_TIMEOUT_S = 8.0
+# How long a whole READ may take before it answers with what it has. Only
+# ever applied to routes that move no money; see _read_within().
+READ_DEADLINE_S = 12.0
 MAX_BODY_BYTES = 1 << 20
 # A whole-second deadline on one connection. Without it a client that sends
 # "Content-Length: 500" and then four bytes pins a handler thread forever.
@@ -645,6 +714,31 @@ class _Components:
         return value
 
 
+def _local_stamp(ms: int) -> str:
+    """An ms epoch as a readable instant on THIS MACHINE'S clock.
+
+    For operators, not machines: every stamp this file prints is also
+    carried as the raw integer beside it.
+
+    Local, not UTC, and that is the whole point of it. page.html renders
+    every other moment on the screen -- history rows, the supply read time,
+    the wallets read time -- with toLocaleString(), under a comment that
+    says ONE CLOCK, not two. A stamp printed as 14:01:55Z beside a supply
+    line reading 7:01:55 AM is two clocks seven hours apart on one screen,
+    and the age of the reading -- which is the entire reason the stamp is
+    there -- cannot be read off it at all. The server and the browser are
+    the same machine here: app.py binds loopback only and refuses a Host
+    header that is not a loopback literal.
+    """
+    try:
+        local = time.localtime(ms / 1000.0)
+        zone = time.strftime("%Z", local).strip()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", local)
+        return stamp + (" " + zone if zone else "")
+    except (OSError, OverflowError, ValueError):  # pragma: no cover
+        return "unknown time"
+
+
 def _as_int(value, default=None):
     """Lenient int for COMPONENT OUTPUT. Never raises: an unexpected shape
     renders as '-' in the UI rather than failing a whole request."""
@@ -777,10 +871,16 @@ class Api:
             # the mint is STOPPED -- so on screen there was no difference
             # at all.
             #
-            # None, not False, when the component did not say: "it did not
-            # tell us" is a third answer and the page must be able to tell
-            # it from "it told us no". Nothing here infers it from
-            # last_error or from running.
+            # None, not False, and it now reaches here for TWO reasons,
+            # both of them "nobody said no": the component did not report
+            # the field at all, or it reported None because there was no
+            # mint process to ask -- a workdir holding no running mint has
+            # nothing that could have failed to answer, and False there
+            # describes a failure that never happened. Either way "we were
+            # not told no" is a third answer and the page must be able to
+            # tell it from "it told us no". Nothing here infers it from
+            # last_error or from running, and nothing here turns it back
+            # into a boolean.
             "responding": (bool(raw["responding"])
                            if isinstance(raw.get("responding"), bool)
                            else None),
@@ -789,18 +889,170 @@ class Api:
         # GET does not write to the workdir. MintControl.status() keeps the
         # last known port/base_url across a stop by itself, and start()
         # records what a GUI restart would otherwise forget.
-        status["last_start"] = self._recall("last_start") or None
+        last, sources, ignored = self._last_start(status)
+        status["last_start"] = last
+        # WHERE EACH FIELD CAME FROM, beside the fields themselves. Two
+        # records answer "which mint does this workdir hold" and they can
+        # be about different mints; a merged object with no provenance
+        # presents somebody else's economics as this mint's settings.
+        status["last_start_sources"] = sources
+        status["last_start_ignored_note"] = ignored
         return status
 
-    def base_url(self, *, required: bool) -> str:
+    #: Everything the Start form asks for, in the order it asks.
+    _START_FIELDS = ("mint_id", "baseline_model_class", "port",
+                     "rate_ppm", "cap_mc", "exempt_below_mc")
+
+    #: Where a field of ``last_start`` came from, in words a panel can print.
+    _FROM_SUPERVISOR = "the mint supervisor's record for this workdir"
+    _FROM_NOTE = "this GUI's own note of the last mint it started here"
+    _FROM_STATUS = "the status line's own record, on this same call"
+
+    def _last_start(self, status: dict):
+        """What the Start form should show, and where each field came from.
+
+        Returns ``(fields, sources, ignored_note)``: the merged settings,
+        a field -> English-sentence map saying which record each one came
+        out of, and the note that was NOT used (with why), if any.
+
+        Two records answer "which mint does this workdir hold", and they
+        are written by different things at different times:
+
+          * mint-control.json, the SUPERVISOR's, written by MintControl on
+            every start and updated when it adopts a mint it did not
+            spawn. status() above is derived from this file.
+          * ``last_start`` in gui-state.json, THIS server's note, written
+            only by a start that went through route_mint_start here.
+
+        A workdir can easily hold the first and not the second -- a mint
+        started from the command line, a gui-state.json that was never
+        copied along with the ledger, a GUI restarted against somebody
+        else's workdir. When that happened, this route used to answer with
+        the supervisor's mint_id and port while handing the page nothing
+        for the form, so the form fell back to its own built-in defaults
+        (local-test-mint, port 8787) and the two halves of the same panel
+        named two different mints. Then Stop/Start would have rewritten
+        the mint's identity and economics to the defaults nobody typed.
+
+        Filling the gaps fixed that and opened the next one: the two
+        records can be about DIFFERENT MINTS. A note saying mint 'note-mint'
+        on port 9999 with rate 3300 was used to complete a supervisor
+        record for 'legacy-mint' on port 61234, and the page rendered the
+        composite as one mint's settings -- burn-policy sentence, issue
+        cost line and all -- then started legacy-mint with note-mint's
+        economics. So there are three rules here, and all three are about
+        one screen not showing two mints:
+
+          1. The note fills a gap only when it is about the SAME mint. A
+             note that names another mint_id is dropped WHOLE -- its
+             economics belong to that mint, not to this one -- and comes
+             back as ``ignored_note`` rather than silently vanishing.
+          2. ``mint_id`` and ``port`` are then pinned to whatever status()
+             reported ON THIS CALL, because those two are also printed in
+             the stats block beside the form, from status(), while the
+             form is filled from here. Pinning is normally a no-op: for
+             MintControl both answers are derived from mint-control.json
+             under one lock. Where it is not a no-op it is a component
+             disagreeing with itself, and rule 3 keeps that visible.
+          3. Nothing is papered over: when the pin overrides a value,
+             ``sources`` says so in the sentence for that field, so the
+             disagreement is reported rather than hidden.
+
+        Returns (None, None, ignored) only when NEITHER record knows
+        anything -- a genuinely virgin workdir, where the form's own
+        defaults are the honest thing to show.
+        """
+        recorded = None
+        try:
+            control = self.components.mint()
+            fn = getattr(control, "recorded_start", None)
+            if callable(fn):
+                raw = self.components.call("MintControl.recorded_start", fn)
+                if isinstance(raw, dict):
+                    recorded = raw
+        except GuiError:
+            # A supervisor that cannot answer is not a reason to fail a
+            # status read; the note below still covers a GUI restart.
+            recorded = None
+        note = self._recall("last_start")
+        note = note if isinstance(note, dict) else None
+
+        def named(source):
+            value = (source or {}).get("mint_id")
+            return value if isinstance(value, str) and value else None
+
+        # Which mint this workdir holds, most authoritative first. status()
+        # and the supervisor's record come from the same file; the note is
+        # the last resort and is the one that can be about anywhere.
+        held = status.get("mint_id") if isinstance(status.get("mint_id"), str) else None
+        held = held or named(recorded) or named(note)
+        ignored = None
+        note_id = named(note)
+        if note is not None and held and note_id and note_id != held:
+            ignored = {
+                "mint_id": note_id,
+                "port": _as_int(note.get("port")),
+                "why": ("this GUI last started mint %r from here, but this "
+                        "workdir holds %r. Another mint's burn policy is not "
+                        "this mint's, so nothing from that note was used to "
+                        "fill this form." % (note_id, held)),
+            }
+            note = None
+
+        merged: dict = {}
+        sources: dict = {}
+        for field in self._START_FIELDS:
+            for source, label in ((recorded, self._FROM_SUPERVISOR),
+                                  (note, self._FROM_NOTE)):
+                if source is None:
+                    continue
+                value = source.get(field)
+                if value is None or isinstance(value, bool):
+                    continue
+                merged[field] = value
+                sources[field] = label
+                break
+        for field in ("mint_id", "port"):
+            live = status.get(field)
+            if live is None:
+                continue
+            if field in merged and merged[field] != live:
+                sources[field] = (
+                    "%s -- and %s says %r for this field. Both cannot be on "
+                    "one screen at once (the stats block prints the status "
+                    "line's value and the form prints this one), so the "
+                    "status line wins and the disagreement is reported here "
+                    "rather than hidden."
+                    % (self._FROM_STATUS, sources[field], merged[field]))
+            elif field not in merged:
+                sources[field] = self._FROM_STATUS
+            merged[field] = live
+        if not merged:
+            return None, None, ignored
+        return merged, sources, ignored
+
+    def base_url(self, *, required: bool, status: dict | None = None) -> str:
         """Where the mint is. Falls back to the last one we saw.
 
         A stopped mint is not an error for reads: a wallet must still be
         able to show its last known balance, which is what the fallback is
         for. It is an error for anything that needs the mint to answer.
+
+        The refusal it raises when the mint cannot be addressed names the
+        state this server is actually in, because the neighbouring route
+        will be asked the same question in the next second: ``mint_stopped``
+        only when the process is down, ``mint_unreachable`` when a live
+        process has no usable address here.
+
+        ``status`` lets a caller that has ALREADY asked mint_status() hand
+        the answer over instead of paying for a second descriptor probe.
+        That is a deadline question, not a style one: every probe costs up
+        to MintControl.probe_timeout_s against a wedged mint, and the whole
+        route has to answer inside the page's own abort.
         """
         try:
-            status = self.mint_status()
+            if status is None:
+                status = self.mint_status()
         except GuiError:
             # mintctl itself is broken or absent. A read that only wants the
             # last known state should still work — the wallet files are right
@@ -810,6 +1062,31 @@ class Api:
             return self._recall("last_base_url") or "http://127.0.0.1:8787"
         if status["running"] and status["base_url"]:
             return status["base_url"]
+        if required and status["running"]:
+            # A LIVE mint with no address. This branch exists because the
+            # test above is a conjunction and the refusal below is not:
+            # saying "the mint is not running" here contradicted
+            # /api/mint/status, which had just said running: true about the
+            # same pid, in the same second.
+            #
+            # ``mint_stopped`` is not available for it. That cause is the
+            # closed vocabulary's claim about a PROCESS -- it promises the
+            # operator the mint was down, which is how walletops.py records
+            # it in a wallet's permanent history -- and there is a live
+            # process here. ``mint_unreachable`` is the weaker claim ("no
+            # answer; what the mint did or did not see is undetermined")
+            # and weaker is the only safe direction to be wrong in. The
+            # sentence then narrows it to what is actually known, which is
+            # more than the cause promises: nothing was sent at all.
+            detail = ("The mint process (pid %s) is running, but this "
+                      "workdir's record does not say which port it is on, so "
+                      "there was nowhere to send this request and nothing "
+                      "was sent. Stop the mint in the MINT panel and start "
+                      "it again to re-establish its address."
+                      % (status.get("pid"),))
+            if status["last_error"]:
+                detail += f" Last error: {status['last_error']}"
+            raise GuiError(502, "mint_unreachable", detail, "mint_unreachable")
         if required:
             detail = ("The mint is not running, so nothing was sent to it "
                       "and nothing was refused by it. Start it in the MINT "
@@ -824,9 +1101,16 @@ class Api:
                 or self._recall("last_base_url")
                 or "http://127.0.0.1:8787")
 
-    def _mint_http(self, method: str, path: str, body=None, *, admin=False):
-        """One request to the running mint, from this process."""
-        base = self.base_url(required=True)
+    def _mint_http(self, method: str, path: str, body=None, *, admin=False,
+                   base: str | None = None):
+        """One request to the running mint, from this process.
+
+        ``base`` is the same saving as base_url()'s ``status``: a caller
+        that already resolved where the mint is does not pay for a second
+        descriptor probe inside the deadline budget.
+        """
+        if base is None:
+            base = self.base_url(required=True)
         data = None if body is None else json.dumps(body).encode()
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -985,7 +1269,12 @@ class Api:
                 500, "component_error",
                 f"Could not load the aicash token codec from impl/ "
                 f"({exc}).") from None
-        mint_id = self.mint_status()["mint_id"]
+        # One mint_status() for both the id and the address: each one
+        # costs a live descriptor probe, and this route has to produce its
+        # answer -- including its failure cause -- inside the page's abort.
+        status_now = self.mint_status()
+        base = self.base_url(required=True, status=status_now)
+        mint_id = status_now["mint_id"]
         if not mint_id:
             descriptor = self.route_mint_descriptor(None, None)
             mint_id = descriptor.get("mint_id")
@@ -1001,7 +1290,8 @@ class Api:
                    for s in secrets]
         try:
             status, obj = self._mint_http("POST", "/admin/issue",
-                                          {"outputs": outputs}, admin=True)
+                                          {"outputs": outputs}, admin=True,
+                                          base=base)
         except GuiError as exc:
             # ADJACENCY, and a money claim: every other failure in this
             # route happens after the mint ANSWERED. This one is the mint
@@ -1047,11 +1337,31 @@ class Api:
                 "tokens": [format_token(mint_id, amount, s) for s in secrets]}
 
     def route_token_status(self, query, _body) -> dict:
+        """One reading of one ledger key, stamped with when it was taken.
+
+        A LOOKUP IS A READING, NOT A SUBSCRIPTION. Bearer value is
+        one-shot: the instant somebody redeems the string, ``unspent``
+        becomes ``spent`` and the answer on screen stops being true. This
+        route always asks the mint fresh -- there is no cache here and
+        there must not be one -- but the answer it hands back is still a
+        photograph, and a photograph left on a panel while the page
+        re-renders around it reads exactly like a live view. That is how
+        an operator ends up looking at ``state: unspent`` for a token the
+        mint, asked in the same second, calls spent.
+
+        So the reading carries the moment it was taken, in the object the
+        panel actually prints: ``as_of`` in words, ``observed_at_ms`` and
+        the mint's own ``mint_time`` for anything that does arithmetic,
+        and the ``mint_id`` that answered. Nothing here decides how long a
+        reading stays interesting -- it only refuses to present one
+        undated.
+        """
         text = (query.get("token") or "").strip()
         if not text:
             raise GuiError(400, "bad_request",
                            "Paste a token string or a ledger key to look up.")
         key = text
+        token_mint_id = None
         if text.startswith("aicash:"):
             parts = text.split(":")
             if len(parts) != 5:
@@ -1066,7 +1376,30 @@ class Api:
                 raise GuiError(400, "bad_token",
                                "The secret part of that token is not valid "
                                "base64url.") from None
-        status, obj = self._mint_http("POST", "/v3/status", {"hashes": [key]})
+            token_mint_id = parts[2]
+        status_now = self.mint_status()
+        base = self.base_url(required=True, status=status_now)
+        answering = status_now["mint_id"]
+        if (token_mint_id and isinstance(answering, str) and answering
+                and token_mint_id != answering):
+            # ADJACENCY, and the same defect in its other direction: this
+            # mint would answer "unknown" for this key, truthfully, and
+            # that word renders as "no such token" -- when what actually
+            # happened is that the question went to a ledger that was
+            # never asked to hold it. One mint's silence is not another
+            # mint's word, and passing it off as this token's state is a
+            # reading presented with more confidence than its source.
+            raise GuiError(
+                409, "wrong_mint",
+                f"That token says it was issued by mint {token_mint_id!r}, "
+                f"and the mint running here is {answering!r}. This GUI can "
+                f"only ask the mint it supervises, and that mint has no "
+                f"word about another mint's tokens -- so this token's state "
+                f"is undetermined from here.",
+                "wrong_mint")
+        status, obj = self._mint_http("POST", "/v3/status", {"hashes": [key]},
+                                      base=base)
+        observed_at_ms = int(time.time() * 1000)
         if status != 200:
             # The mint answered; it just did not answer 200. That is not
             # "the mint did not answer", and it is not a refusal of a
@@ -1077,7 +1410,27 @@ class Api:
                            "unknown")
         results = obj.get("results") if isinstance(obj, dict) else None
         first = results[0] if isinstance(results, list) and results else None
-        return {"query": text, "ledger_key": key, "result": first, "raw": obj}
+        mint_time = obj.get("mint_time") if isinstance(obj, dict) else None
+        mint_time = _as_int(mint_time)
+        stamp = {
+            "as_of": _local_stamp(observed_at_ms) + " - what the mint said "
+                     "at that moment, by this machine's clock, which is the "
+                     "one every other time on this page is shown in. A "
+                     "reading, not a live view: look it up again to see the "
+                     "state now.",
+            "observed_at_ms": observed_at_ms,
+            "mint_time": mint_time,
+            "mint_id": answering,
+        }
+        if isinstance(first, dict):
+            # Stamped INSIDE the entry, because the entry is what a panel
+            # prints. A timestamp the renderer has to opt into is a
+            # timestamp an undated reading still gets to skip.
+            first = dict(first)
+            first.update(stamp)
+        return {"query": text, "ledger_key": key, "result": first,
+                "raw": obj, "base_url": base,
+                "token_mint_id": token_mint_id, **stamp}
 
     # -- wallet routes --------------------------------------------------
     def _store_path(self, name: str) -> str:
@@ -1101,6 +1454,54 @@ class Api:
         return [e[:-3] for e in entries
                 if e.endswith(".db") and WALLET_NAME_RE.fullmatch(e[:-3])]
 
+    def _read_within(self, what: str, seconds: float, fn, *args, **kwargs):
+        """Run a READ with a wall-clock deadline. Returns (finished, value).
+
+        ``(False, None)`` means the deadline passed and the worker was
+        ABANDONED -- it is still running, and whatever it eventually
+        returns is dropped. That is why this is for reads only: a payment
+        abandoned this way would leave this server describing an outcome
+        while the operation that decides it is still in flight, and every
+        route that moves money is excluded from it by hand (see the
+        deadline budget at the top of this file). Reads move nothing, so
+        the worst an abandoned one costs is one wasted socket.
+
+        The work runs in the worker, not here, so the sqlite connection a
+        WalletOps opens is opened, used and closed on one thread -- which
+        is the same rule _wallet() is built on.
+
+        An exception from the worker is re-raised in the caller, with its
+        own traceback, exactly as if the call had been made here.
+        """
+        box: dict = {}
+
+        def run():
+            try:
+                box["value"] = fn(*args, **kwargs)
+            except BaseException as exc:     # noqa: BLE001 - re-raised below
+                box["error"] = exc
+
+        worker = threading.Thread(target=run, name="read:%s" % what,
+                                  daemon=True)
+        worker.start()
+        worker.join(max(0.0, float(seconds)))
+        if worker.is_alive():
+            return False, None
+        if "error" in box:
+            raise box["error"]
+        return True, box.get("value")
+
+    def _unread_wallet(self, name: str, why: str) -> dict:
+        """The shape of a wallet that was NOT read, in the same fields.
+
+        ``balance_mc`` is None, never 0: page.html counts a wallet whose
+        balance is not a number as unread and marks every total it feeds
+        as a floor, which is the honest rendering. A zero here would be
+        added up as money that is not there.
+        """
+        return {"name": name, "balance_mc": None, "coin_count": None,
+                "mint_id": None, "connected": False, "error": why}
+
     def _summary(self, name: str, base: str) -> dict:
         """One wallet's summary, degraded rather than fatal."""
         try:
@@ -1120,10 +1521,52 @@ class Api:
                     "mint_id": None, "connected": False, "error": exc.detail}
 
     def route_wallet_list(self, _query, _body) -> dict:
+        """Every wallet's balance -- inside one deadline, whatever happens.
+
+        This is the route every balance on the screen comes from, and it
+        reads the wallets one after another, so against a mint that is
+        alive and answering nothing it used to cost one MintClient timeout
+        PER WALLET: 32s for one wallet, 64s for two, growing with the
+        list, all of it long after page.html stopped listening at 20s. The
+        screen showed no balances at all in exactly the situation an
+        operator most wants to see them.
+
+        So the whole fan-out shares one budget. A wallet that is not read
+        inside it comes back in the same shape as any other wallet that
+        could not be read -- balance None, with the reason in ``error`` --
+        which page.html already counts as unread and already marks the
+        totals it feeds as a floor. The answer is never padded with a
+        fabricated zero, and ``complete`` says outright whether this list
+        is the whole list.
+        """
         base = self.base_url(required=False)
         names = self.wallet_names()
-        return {"wallets": [self._summary(n, base) for n in names],
-                "dir": self.wallets_dir}
+        deadline = time.monotonic() + READ_DEADLINE_S
+        wallets, unread = [], []
+        for name in names:
+            left = deadline - time.monotonic()
+            finished, row = (False, None)
+            if left > 0:
+                finished, row = self._read_within(
+                    "wallet/list:%s" % name, left, self._summary, name, base)
+            if not finished:
+                unread.append(name)
+                row = self._unread_wallet(
+                    name,
+                    "Not read. This list has %g seconds to answer before the "
+                    "page stops waiting, and they ran out here -- most often "
+                    "because the mint is alive but answering nothing, which "
+                    "costs every wallet read its own timeout. Nothing was "
+                    "read from this wallet, so no figure here is its balance."
+                    % READ_DEADLINE_S)
+            wallets.append(row)
+        return {"wallets": wallets, "dir": self.wallets_dir,
+                # Is this the whole list? Said in the response rather than
+                # left to be worked out from the rows, because a total
+                # summed off a partial list is this round's whole subject.
+                "complete": not unread,
+                "unread": unread,
+                "deadline_s": READ_DEADLINE_S}
 
     def route_wallet_create(self, _query, body) -> dict:
         name = str(body.get("name") or "").strip()
@@ -1160,7 +1603,21 @@ class Api:
 
     def route_wallet_summary(self, query, _body) -> dict:
         name, _path = self._wallet_ops(query)
-        summary = self._summary(name, self.base_url(required=False))
+        base = self.base_url(required=False)
+        finished, summary = self._read_within(
+            "wallet/summary:%s" % name, READ_DEADLINE_S, self._summary,
+            name, base)
+        if not finished:
+            raise GuiError(
+                504, "wallet_not_read",
+                "This wallet's balance was not read within %g seconds, so "
+                "this server gave up rather than answer after the page had "
+                "stopped waiting. Nothing was read and nothing was changed; "
+                "a mint that is alive but not answering is the usual reason."
+                % READ_DEADLINE_S,
+                # Not mint_unreachable: nobody established that the mint is
+                # what ran out the clock. "unknown" is the honest cause.
+                "unknown")
         if summary["error"] and summary["balance_mc"] is None:
             raise GuiError(502, "wallet_error", summary["error"])
         return summary
@@ -1676,25 +2133,47 @@ class Api:
         name, path = self._wallet_ops(query)
         limit = _strict_int(query.get("limit"), 20) or 20
         limit = max(1, min(limit, 100))
-        with self._wallet(name, path, self.base_url(required=False)) as ops:
-            # The new name first, the old one after it: a component build
-            # from either side of the rename answers the same question,
-            # and neither spelling is required to exist.
-            method = "unredeemed_payments"
-            fn = getattr(ops, method, None)
-            if not callable(fn):
-                method = "outstanding_payments"
+        base = self.base_url(required=False)
+
+        def read():
+            with self._wallet(name, path, base) as ops:
+                # The new name first, the old one after it: a component
+                # build from either side of the rename answers the same
+                # question, and neither spelling is required to exist.
+                method = "unredeemed_payments"
                 fn = getattr(ops, method, None)
-            if not callable(fn):
-                raise GuiError(
-                    503, "gui_incomplete",
-                    "gui/walletops.py defines neither unredeemed_payments "
-                    "nor outstanding_payments. Payment strings can still be "
-                    "copied from the result panel when a payment is made, "
-                    "but this GUI cannot read them back out of the wallet "
-                    "file.")
-            what = f"WalletOps({name}).{method}"
-            raw = self.components.call(what, fn, limit=limit)
+                if not callable(fn):
+                    method = "outstanding_payments"
+                    fn = getattr(ops, method, None)
+                if not callable(fn):
+                    raise GuiError(
+                        503, "gui_incomplete",
+                        "gui/walletops.py defines neither unredeemed_payments "
+                        "nor outstanding_payments. Payment strings can still "
+                        "be copied from the result panel when a payment is "
+                        "made, but this GUI cannot read them back out of the "
+                        "wallet file.")
+                label = f"WalletOps({name}).{method}"
+                return label, self.components.call(label, fn, limit=limit)
+
+        # THE HANDED-OVER FIGURE, INSIDE THE PAGE'S OWN DEADLINE. This one
+        # asks the mint twice (open the wallet, then ask about every string
+        # it handed out), so against a wedged mint it took 62s -- and the
+        # figure it produces is the one the reconciliation on screen
+        # subtracts. A read; abandoning it moves nothing.
+        finished, got = self._read_within(
+            "wallet/outstanding:%s" % name, READ_DEADLINE_S, read)
+        if not finished:
+            raise GuiError(
+                504, "wallet_not_read",
+                "The handed-over value for %s was not read within %g "
+                "seconds, so this server gave up rather than answer after "
+                "the page had stopped waiting. Nothing was read and nothing "
+                "was changed; a mint that is alive but not answering is the "
+                "usual reason, and this figure needs the mint twice."
+                % (name, READ_DEADLINE_S),
+                "unknown")
+        what, raw = got
         raw = self.components.expect_dict(raw, what, ("payments",))
         payments = []
         for item in self.components.expect_list(raw.get("payments"), what):
@@ -1751,21 +2230,105 @@ class Api:
             for token in payment["tokens"]:
                 by_state[token["state"]] += (token["amount_mc"] or 0)
         complete = checked and not by_state["unknown"] and not by_state[None]
+        # THE WHOLE-WALLET FIGURES, RELAYED AND NOT RECOMPUTED. The four
+        # buckets above decompose the payments THIS RESPONSE LISTS, and
+        # ``limit`` windows that list. Until this round the response said
+        # nothing about the window at all, so a wallet with more payments
+        # than the window published a confident ``unredeemed_mc`` that was
+        # short by whatever fell off the end -- measured on a wallet with
+        # 106 payments: the wire answered 3,000 where the component,
+        # reading the same store at the same instant, answered None with
+        # ``unlisted_outstanding_mc`` 200 and a true total of 3,200. The
+        # component's own docstring states the rule for a re-serialising
+        # caller, and this is that caller: relay the window's own account
+        # of itself, or drop the headline.
+        #
+        # Relayed, never derived here. A component build that publishes
+        # none of them leaves them null, and the fallbacks below are
+        # written so that missing information can only make this response
+        # LESS confident, never more.
+        handed_over_mc = _as_int(raw.get("handed_over_mc"))
+        listed_mc = _as_int(raw.get("listed_mc"))
+        unlisted_mc = _as_int(raw.get("unlisted_mc"))
+        unlisted_outstanding_mc = _as_int(raw.get("unlisted_outstanding_mc"))
+        payment_count = _as_int(raw.get("payment_count"))
+        recovered_mc = _as_int(raw.get("recovered_mc"))
+        unaccounted_mc = _as_int(raw.get("unaccounted_mc"))
+        recovered_ops = []
+        for item in (raw.get("recovered_ops") or []):
+            if isinstance(item, dict):
+                recovered_ops.append({"op_id": str(item.get("op_id", "")),
+                                      "amount_mc": _as_int(
+                                          item.get("amount_mc"))})
+        truncated = raw.get("truncated")
+        if not isinstance(truncated, bool):
+            # The component did not say. A full page is the only evidence
+            # left, and it is the same evidence page.html was reduced to
+            # inferring for itself.
+            truncated = (payment_count > len(payments)
+                         if payment_count is not None
+                         else len(payments) >= limit)
+        # Did every payment that still has value outstanding fit in the
+        # window? A number answers it outright; with no number, a full
+        # page has to be taken as "maybe not".
+        fits = (unlisted_outstanding_mc == 0
+                if unlisted_outstanding_mc is not None else not truncated)
         return {"name": name,
                 "checked": checked,
+                # How much this wallet has handed to other people over its
+                # whole life, how many payments that was, and how much of
+                # it this response actually lists. The identity the
+                # component asserts and this route relays unchanged:
+                #   handed_over_mc == listed_mc + unlisted_mc
+                #   listed_mc == unspent + spent + unstated + unchecked
+                #                + unaccounted
+                "handed_over_mc": handed_over_mc,
+                "payment_count": payment_count,
+                "listed_mc": listed_mc,
+                "unlisted_mc": unlisted_mc,
+                # Of the value the window left out, how much the wallet's
+                # own file still shows as handed over rather than retired.
+                # Non-zero here is the one thing that turns an otherwise
+                # complete report's headline into null, and it is
+                # published so a reader can say WHY instead of guessing
+                # from the row count.
+                "unlisted_outstanding_mc": unlisted_outstanding_mc,
+                # Is this the whole of this wallet's payments? Said in the
+                # response rather than left to be worked out from
+                # len(payments), which is what page.html was doing.
+                "truncated": truncated,
+                # Handed over and in none of the four buckets: 0 on every
+                # path the component can reach, and a non-zero is its own
+                # bug said out loud rather than absorbed.
+                "unaccounted_mc": unaccounted_mc,
+                # NOT handed over at all: pay operations that returned no
+                # string to anybody and that recover() put back in the
+                # spendable pool. This value is already inside the
+                # wallet's balance_mc, so it is reported under its own
+                # name and added to nothing above -- counting it twice is
+                # exactly what an operator reading both screens must not
+                # be made to do.
+                "recovered_mc": recovered_mc,
+                "recovered_ops": recovered_ops,
                 "mint_id": raw.get("mint_id") if isinstance(
                     raw.get("mint_id"), str) else None,
                 # The one number that answers "how much of what this
                 # wallet paid out is still unredeemed" -- and it is None
                 # unless every string in the report carries the mint's own
-                # word for it. Any "0" here is 0 because the mint said so
-                # about every string, never because some of them went
-                # unanswered.
-                "unredeemed_mc": (by_state["unspent"] if complete else None),
+                # word for it AND every payment with outstanding value
+                # fitted in the window. Any "0" here is 0 because the mint
+                # said so about every string, never because some of them
+                # went unanswered; any integer here is a whole-wallet
+                # total, never a windowed one.
+                "unredeemed_mc": (by_state["unspent"]
+                                  if complete and fits else None),
                 # ...and the parts, always, so a report that cannot give
                 # the total still says exactly what it does know. These
-                # four sum to the value handed over in the payments
-                # listed: nothing is rounded into another.
+                # four plus unaccounted_mc sum to listed_mc -- the value
+                # handed over in the payments THIS RESPONSE LISTS, not in
+                # the wallet's whole life. Nothing is rounded into
+                # another, and handed_over_mc above is the whole-life
+                # figure they are a window on.
                 "unspent_mc": by_state["unspent"],
                 "spent_mc": by_state["spent"],
                 # The mint answered and has NO LEDGER ENTRY for these --
@@ -1779,7 +2342,13 @@ class Api:
                           "operations left in flight -- POST "
                           "/api/wallet/recover is the one that settles "
                           "those, and it can correctly report nothing to "
-                          "do while this reports money"),
+                          "do while this reports money. unredeemed_mc and "
+                          "the four buckets describe the payments listed "
+                          "here; handed_over_mc, payment_count and "
+                          "truncated describe the whole wallet, and a "
+                          "caller re-serialising any of this must carry "
+                          "truncated and unlisted_outstanding_mc with it "
+                          "or drop its own headline to null"),
                 "payments": payments}
 
     def route_wallet_recover(self, _query, body) -> dict:

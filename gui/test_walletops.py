@@ -8,6 +8,7 @@ Run:  cd <repo root> && python3 -m unittest gui.test_walletops -v
 """
 
 import os
+import random
 import shutil
 import stat
 import sys
@@ -24,7 +25,8 @@ from aicash.burncalc import BurnPolicy                       # noqa: E402
 from aicash.clock import FakeClock                           # noqa: E402
 from aicash.mintapi import MintConfig, make_mint             # noqa: E402
 from aicash.signing import generate_keypair                  # noqa: E402
-from aicash.tokencodec import format_token, ledger_key, new_secret  # noqa: E402
+from aicash.tokencodec import (format_token, ledger_key,        # noqa: E402
+                               new_secret, parse_token)
 from aicash.wallet import MintClient, Wallet                 # noqa: E402
 
 try:                                    # run as `python3 -m unittest gui.test_walletops`
@@ -1035,13 +1037,26 @@ class TestHistoryEfficiency(MintFixture):
             f"history opened {len(count)} connections for {len(rows)} rows",
         )
         # One ops query, one grouped outputs query, one grouped causes
-        # query, one grouped payment-record query. A per-row query is an
-        # N+1 and also means each row is read under its own snapshot.
+        # query, one grouped payment-record query, and the BEGIN/COMMIT
+        # that hold all three store reads in ONE transaction. A per-row
+        # query is an N+1; the transaction is a fixed two statements and
+        # is what makes "one snapshot" true rather than asserted -- a
+        # plain sqlite3 connection opens no transaction for a SELECT, so
+        # without it the three reads see three different databases.
         self.assertLessEqual(
-            len(queries), 4,
+            len(queries), 6,
             f"history ran {len(queries)} queries for {len(rows)} rows:"
             f" {queries}",
         )
+        self.assertEqual(queries[0], "BEGIN",
+                         "the store reads are not inside a transaction, so"
+                         " history's 'one consistent snapshot' is a claim"
+                         " and not a mechanism")
+        self.assertIn("COMMIT", queries, "the read transaction is left open")
+        self.assertLess(queries.index("BEGIN"), queries.index("COMMIT"))
+        self.assertEqual(
+            [q for q in queries if q in ("BEGIN", "COMMIT")],
+            ["BEGIN", "COMMIT"], "more than one transaction: %r" % queries)
         # And the real invariant behind that number, which a bound alone
         # does not pin: the count does not GROW with the rows. Nine rows
         # and three rows must cost the same number of queries.
@@ -1563,7 +1578,23 @@ class TestOutstandingPayments(MintFixture):
         summary()["connected"].
         """
         self.assertEqual(self.ops("empty-out").outstanding_payments(),
-                         {"checked": True, "mint_id": "", "payments": []})
+                         {"checked": True, "mint_id": "",
+                          # Nothing handed over decomposes into four
+                          # zeros and no residual -- and 0 unredeemed is
+                          # the mint's word about every one of the no
+                          # strings here, so it is an int, not None.
+                          "handed_over_mc": 0, "unspent_mc": 0,
+                          "spent_mc": 0, "unstated_mc": 0,
+                          "unchecked_mc": 0, "unaccounted_mc": 0,
+                          "unredeemed_mc": 0, "payments": [],
+                          # Nothing was left out of the window and there
+                          # is no window to leave it out of: the fields
+                          # that would say so are present and say so.
+                          "payment_count": 0, "listed_mc": 0,
+                          "unlisted_mc": 0, "unlisted_outstanding_mc": 0,
+                          "truncated": False,
+                          # And no pay op handed nothing over either.
+                          "recovered_mc": 0, "recovered_ops": []})
         self.assertTrue(self.ops("empty-out").summary()["connected"])
 
     def test_nothing_to_check_is_still_nothing_when_the_mint_is_down(self):
@@ -1586,27 +1617,40 @@ class TestOutstandingPayments(MintFixture):
         self.assertFalse(w.summary()["connected"])
 
     def test_a_token_entry_has_exactly_the_documented_keys(self):
-        """The component contract is four keys, `key` included.
+        """The component contract is five keys, `key` and `store_state`.
 
         The module docstring calls these "the exact shapes a caller may
         rely on", so the key SET is pinned here rather than left to a
-        reader to discover; gui/app.py drops `key` on the wire and that is
-        stated in the same paragraph.
+        reader to discover; gui/app.py drops `key` and `store_state` on
+        the wire and that is stated in the same paragraph.
         """
         w = self.funded("shape-out")
         w.pay(1_000)
         out = w.outstanding_payments()
-        self.assertEqual(set(out), {"checked", "mint_id", "payments"})
+        self.assertEqual(set(out),
+                         {"checked", "mint_id", "handed_over_mc",
+                          "payment_count", "listed_mc", "unlisted_mc",
+                          "unlisted_outstanding_mc", "truncated",
+                          "unspent_mc", "spent_mc", "unstated_mc",
+                          "unchecked_mc", "unaccounted_mc",
+                          "unredeemed_mc", "recovered_mc", "recovered_ops",
+                          "payments"})
         for payment in out["payments"]:
             self.assertEqual(set(payment),
-                             {"op_id", "amount_mc", "live_mc", "tokens",
+                             {"op_id", "amount_mc", "outstanding_mc",
+                              "live_mc", "retired_mc",
+                              "unaccounted_mc", "tokens",
                               "recipient", "recipient_kind", "delivery",
                               "delivery_cause", "delivery_attempt"})
             self.assertIn(payment["delivery_attempt"],
                           ("", "attempted", "not_attempted"))
             for token in payment["tokens"]:
                 self.assertEqual(set(token),
-                                 {"token", "amount_mc", "key", "state"})
+                                 {"token", "amount_mc", "key", "state",
+                                  "store_state"})
+                self.assertIn(token["store_state"],
+                              ("", "handed_over", "spent_out", "confirmed",
+                               "pending", "orphan"))
 
     def test_no_second_copy_of_the_money_is_written_anywhere(self):
         """The decision: read the store back, never write the strings down.
@@ -2516,6 +2560,731 @@ class TestPaymentRecord(MintFixture):
             self.assertEqual(view["delivery"], "delivered")
             self.assertEqual(view["delivery_cause"], "")
 
+
+
+# ---------------------------------------------------------------------------
+# handed-over accounting: one payment, one amount, and a sum that closes
+# ---------------------------------------------------------------------------
+
+
+def _route_decomposition(out):
+    """The four figures ``gui/app.py``'s route sums, by ITS rule not ours.
+
+    Copied deliberately from ``route_wallet_outstanding`` rather than read
+    out of the response, so these tests pin that the totals walletops
+    reports and the totals the HTTP layer derives from the same token list
+    are the same numbers.  Two screens that decompose one report by two
+    rules is the shape of defect this round exists to remove.
+    """
+    by_state = {"unspent": 0, "spent": 0, "unknown": 0, None: 0}
+    for payment in out["payments"]:
+        for token in payment["tokens"]:
+            state = token["state"]
+            by_state[state if state in ("unspent", "spent", "unknown")
+                     else None] += (token["amount_mc"] or 0)
+    return by_state
+
+
+class TestHandedOverAccounting(MintFixture):
+    """THE ROUND-6 HEADLINE: two views of one payment, two amounts.
+
+    ``GET /api/wallet/history`` said a payment handed over 300 mc while
+    ``GET /api/wallet/outstanding`` said 100 mc for the same op_id in the
+    same instant, and the number that moved was the one gui/README.md
+    calls the permanent record of where the money went.  Nothing here is
+    mocked: every figure comes off a real mint over real HTTP.
+    """
+
+    def funded(self, name="alice", face=400_000):
+        w = self.ops(name)
+        w.receive([self.issue(face)])
+        return w
+
+    def pay_row(self, w, op_id):
+        rows = [r for r in w.history(limit=500)
+                if r["kind"] == "pay" and r["op_id"] == op_id]
+        self.assertTrue(rows, "no committed pay row for %s" % op_id)
+        return rows[0]
+
+    def entry(self, w, op_id, limit=200):
+        rows = [p for p in w.unredeemed_payments(limit=limit)["payments"]
+                if p["op_id"] == op_id]
+        self.assertTrue(rows, "payment %s is not in the report at all" % op_id)
+        return rows[0]
+
+    def assert_closes(self, out, where=""):
+        """The documented identity, in both of its steps.
+
+        Whole wallet first -- ``handed_over_mc == listed_mc +
+        unlisted_mc`` -- and only then the mint's four-way decomposition
+        of the part this report actually listed.  The first step is what
+        an earlier build did not have: it published the WINDOWED total
+        under the name ``handed_over_mc`` with nothing anywhere saying
+        the window had cut money off.
+        """
+        parts = (out["unspent_mc"] + out["spent_mc"] + out["unstated_mc"]
+                 + out["unchecked_mc"] + out["unaccounted_mc"])
+        self.assertEqual(
+            out["listed_mc"], parts,
+            "%s: %d mc listed decomposed into %d (unspent %d, spent %d,"
+            " unstated %d, unchecked %d, unaccounted %d)"
+            % (where, out["listed_mc"], parts, out["unspent_mc"],
+               out["spent_mc"], out["unstated_mc"], out["unchecked_mc"],
+               out["unaccounted_mc"]))
+        self.assertEqual(out["unaccounted_mc"], 0,
+                         "%s: value left the accounting" % where)
+        # The window, declared rather than inferred.  listed_mc is read
+        # back off the payment list itself, so the total and the rows
+        # cannot drift apart without this failing.
+        self.assertEqual(out["listed_mc"],
+                         sum(p["amount_mc"] for p in out["payments"]),
+                         "%s: listed total is not the listed rows" % where)
+        self.assertEqual(out["handed_over_mc"],
+                         out["listed_mc"] + out["unlisted_mc"],
+                         "%s: whole-wallet total does not close" % where)
+        self.assertGreaterEqual(out["unlisted_mc"], 0, where)
+        self.assertGreaterEqual(out["unlisted_outstanding_mc"], 0, where)
+        self.assertLessEqual(out["unlisted_outstanding_mc"],
+                             out["unlisted_mc"], where)
+        self.assertGreaterEqual(out["payment_count"], len(out["payments"]),
+                                where)
+        self.assertEqual(out["truncated"],
+                         len(out["payments"]) < out["payment_count"],
+                         "%s: truncation flag does not match the list"
+                         % where)
+        # A confident total is only ever published when nothing live was
+        # left out of the window.
+        if out["unredeemed_mc"] is not None:
+            self.assertEqual(out["unlisted_outstanding_mc"], 0,
+                             "%s: an int unredeemed_mc over %d mc of"
+                             " outstanding value that was not listed"
+                             % (where, out["unlisted_outstanding_mc"]))
+        for payment in out["payments"]:
+            self.assertEqual(
+                payment["amount_mc"],
+                sum(t["amount_mc"] for t in payment["tokens"])
+                + payment["unaccounted_mc"],
+                "%s: payment %s does not decompose" % (where,
+                                                       payment["op_id"]))
+            # ...and the permanent figure splits into the part the store
+            # still believes is in somebody else's hands and the part it
+            # has retired.  Nothing else is possible for a payment that
+            # handed strings over.
+            self.assertEqual(
+                payment["amount_mc"],
+                payment["outstanding_mc"] + payment["retired_mc"],
+                "%s: payment %s is neither outstanding nor retired"
+                % (where, payment["op_id"]))
+
+    # -- the headline ----------------------------------------------------
+
+    def test_a_payments_amount_survives_a_later_unrelated_operation(self):
+        """THE DEFECT, reproduced and closed.
+
+        alice pays 300 mc as three strings; bob redeems two of them; alice
+        then pastes those two back into her own wallet by mistake.  The
+        paste is refused (already spent) and, on its way through,
+        ``Wallet._mark_dead_if_ours`` retires alice's own copies from
+        ``handed_over`` to ``spent_out``.  The old report listed only
+        ``handed_over`` rows, so that third, unrelated operation made an
+        already-committed payment read 100 mc while history went on saying
+        300.  The payment handed over 300 mc; that is not a fact a later
+        paste can edit.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        paid = alice.pay(300)
+        op_id = paid["op_id"]
+        self.assertEqual(sorted(parse_token(t).amount_mc
+                                for t in paid["tokens"]), [100, 100, 100])
+
+        bob.receive(paid["tokens"][:2])         # the payee takes two
+
+        before_row = self.pay_row(alice, op_id)
+        before = self.entry(alice, op_id)
+        self.assertEqual(before_row["amount_mc"], 300)
+        self.assertEqual(before["amount_mc"], 300)
+        self.assertEqual(before["live_mc"], 100)
+        self.assertEqual(before["retired_mc"], 0)   # alice does not know yet
+        self.assertEqual(sorted(t["state"] for t in before["tokens"]),
+                         ["spent", "spent", "unspent"])
+
+        rejected = alice.receive(paid["tokens"][:2])["rejected"]
+        self.assertEqual([r["cause"] for r in rejected],
+                         ["already_spent", "already_spent"])
+
+        after_row = self.pay_row(alice, op_id)
+        after = self.entry(alice, op_id)
+        # The two views, same instant, same op_id, same number.
+        self.assertEqual((after_row["amount_mc"], after["amount_mc"]),
+                         (300, 300))
+        self.assertEqual(len(after["tokens"]), 3)
+        self.assertIn("paid out 300 mc", after_row["detail"])
+        # What DID change is the second question, and it has its own names.
+        self.assertEqual(after["live_mc"], 100)
+        self.assertEqual(after["retired_mc"], 200)
+        self.assertEqual(sorted(t["store_state"] for t in after["tokens"]),
+                         ["handed_over", "spent_out", "spent_out"])
+        # ...and the record written at payment time never moved either.
+        self.assertEqual([r[1] for r in _record_rows(self.path("alice"))],
+                         [300])
+        self.assert_closes(alice.unredeemed_payments(), "after the paste")
+
+    def test_a_payment_taken_back_by_its_payer_is_still_a_payment(self):
+        """Every string of a payment retired, and the payment stays listed.
+
+        The old report dropped a payment entirely once none of its strings
+        were ``handed_over`` any more — so a wallet that took its own
+        bearer payment back showed 200 mc in history and no such payment
+        at all next door.  Taking money back does not un-hand it over; it
+        makes all of it redeemed, which is a different field.
+        """
+        alice = self.funded("alice")
+        paid = alice.pay(200)
+        op_id = paid["op_id"]
+        credited = alice.receive(list(paid["tokens"]))
+        self.assertEqual(credited["rejected"], [])
+        self.assertGreater(credited["accepted_mc"], 0)
+
+        entry = self.entry(alice, op_id)
+        self.assertEqual(self.pay_row(alice, op_id)["amount_mc"], 200)
+        self.assertEqual(entry["amount_mc"], 200)
+        self.assertEqual(entry["retired_mc"], 200)
+        self.assertEqual(entry["live_mc"], 0)
+        self.assertEqual({t["state"] for t in entry["tokens"]}, {"spent"})
+        self.assertEqual({t["store_state"] for t in entry["tokens"]},
+                         {"spent_out"})
+        out = alice.unredeemed_payments()
+        self.assert_closes(out, "after a full take-back")
+        self.assertEqual((out["handed_over_mc"], out["spent_mc"],
+                          out["unspent_mc"], out["unredeemed_mc"]),
+                         (200, 200, 0, 0))
+
+    # -- the decomposition -----------------------------------------------
+
+    def test_the_totals_are_the_rule_the_http_route_uses(self):
+        """One report, one decomposition — not one per screen.
+
+        ``gui/app.py`` derives the four figures from the token list this
+        method returns.  If walletops totalled by a different rule the
+        page and the API would answer the same question differently, which
+        is the family of defect this round is about.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        first = alice.pay(1_000)
+        second = alice.pay(500)
+        bob.receive(first["tokens"])
+        alice.receive(second["tokens"][:1])
+        out = alice.unredeemed_payments()
+        by_state = _route_decomposition(out)
+        self.assertEqual(
+            (out["unspent_mc"], out["spent_mc"], out["unstated_mc"],
+             out["unchecked_mc"]),
+            (by_state["unspent"], by_state["spent"], by_state["unknown"],
+             by_state[None]))
+        self.assertEqual(out["handed_over_mc"], 1_500)
+        # ...and the headline number, by the route's rule for it too.
+        complete = (out["checked"] and not by_state["unknown"]
+                    and not by_state[None])
+        self.assertEqual(out["unredeemed_mc"],
+                         by_state["unspent"] if complete else None)
+        self.assertEqual(out["unredeemed_mc"], out["unspent_mc"])
+        self.assert_closes(out, "two payments, one partial take-back")
+
+    def test_with_the_mint_down_nothing_is_lost_only_unchecked(self):
+        """The gap must not open just because the mint is not answering.
+
+        Every string reads ``state: None`` and the whole handed-over value
+        lands in ``unchecked_mc`` — not in ``unaccounted_mc``, and not
+        nowhere.  ``store_state`` is the wallet's own word and survives,
+        so ``retired_mc`` still answers "how much of this do I already
+        know is dead" with the mint switched off.
+        """
+        alice = self.funded("alice")
+        paid = alice.pay(400)
+        alice.receive(paid["tokens"][:1])       # retired, locally known
+        self.stop_mint()
+        out = alice.unredeemed_payments()
+        self.assertFalse(out["checked"])
+        self.assertEqual(out["handed_over_mc"], 400)
+        self.assertEqual(out["unchecked_mc"], 400)
+        self.assertEqual((out["unspent_mc"], out["spent_mc"],
+                          out["unstated_mc"]), (0, 0, 0))
+        self.assertIsNone(out["unredeemed_mc"])
+        entry = out["payments"][0]
+        self.assertIsNone(entry["live_mc"])
+        self.assertEqual(entry["retired_mc"], 100)
+        self.assert_closes(out, "mint down")
+
+    def test_another_mints_ledger_is_unstated_not_missing(self):
+        """A payment the answering mint has no entry for is named, not lost.
+
+        This is the case ``unstated_mc`` exists for, and the one where a
+        silent decomposition would report the money as accounted-for with
+        both catch-all figures at zero.
+        """
+        alice = self.funded("alice")
+        alice.pay(400)
+        _server, base = self.replacement_mint("a-different-mint")
+        stranger = WalletOps(self.path("alice"), base)
+        out = stranger.unredeemed_payments()
+        self.assertTrue(out["checked"])
+        self.assertEqual(out["handed_over_mc"], 400)
+        self.assertEqual(out["unstated_mc"], 400)
+        self.assertIsNone(out["unredeemed_mc"])
+        self.assertIsNone(out["payments"][0]["live_mc"])
+        self.assert_closes(out, "a different mint answering")
+
+    # -- money that never left, and money the window nearly hid ----------
+
+    def strand_a_pay(self, w, amount):
+        """Strand one ``WalletOps.pay`` in flight, through the real route.
+
+        The fault is injected at the TRANSPORT, not at the module under
+        test: ``DeliverThenDropClient`` lets the exchange COMMIT on the
+        ledger and throws the answer away, which is what a killed process
+        or a dropped socket does.  Everything above it is the production
+        path -- ``WalletOps.pay`` plans, sends, re-raises, returns no
+        string and writes no payment record, and records the cause against
+        the op it left behind.  The only copies of those secrets in the
+        universe are the ones in this wallet file.
+        """
+        real = w._client
+        w.close()                       # force a rebind onto the lossy client
+        w._client = lambda: DeliverThenDropClient(self.base)
+        try:
+            with self.assertRaises(WalletOpsError):
+                w.pay(amount)
+        finally:
+            w._client = real
+            w.close()
+        return w
+
+    def stranded_pay(self, name="stranded", face=50_000, amount=5_000):
+        """A funded wallet with one pay stranded in flight and abandoned."""
+        w = self.ops(name)
+        w.receive([self.issue(face)])
+        return self.strand_a_pay(w, amount)
+
+    def test_a_recovered_payment_handed_nothing_over(self):
+        """THE SECOND VIEW MUST NOT INVENT A SECOND COPY OF THE MONEY.
+
+        ``WalletOps.pay()`` re-raises when the mint's answer is lost and
+        returns no string and writes no payment record; ``recover()`` then
+        settles the op by putting its outputs back in the SPENDABLE pool.
+        Nobody outside this wallet file has ever seen those secrets, and
+        the wallet's own balance counts them.
+
+        An earlier build listed them anyway -- "5,000 mc in 1 bearer
+        string that alice handed out has not been redeemed by anybody" --
+        so the two screens claimed 54,449 mc against a mint whose signed
+        supply snapshot said 49,449 existed, and told the operator to
+        press the Recover button they had just pressed.  Every clause was
+        false.  Measured here against the mint's own supply snapshot: the
+        balance plus what this report calls unredeemed is exactly the
+        money that exists, and the payment's value is named under
+        ``recovered_mc`` so nothing vanishes either.
+        """
+        w = self.stranded_pay()
+        before = w.summary()["balance_mc"]
+        self.assertEqual(w.unredeemed_payments()["handed_over_mc"], 0,
+                         "an op still in flight is not handed over yet")
+        self.assertEqual(w.recover()["ops_confirmed"], 1)
+
+        out = w.unredeemed_payments()
+        balance = w.summary()["balance_mc"]
+        self.assertEqual(before - balance, 51)   # the burn, and only that
+        self.assertEqual(out["handed_over_mc"], 0)
+        self.assertEqual(out["unspent_mc"], 0)
+        self.assertEqual(out["unredeemed_mc"], 0)
+        self.assertEqual(out["payments"], [])
+        self.assert_closes(out, "after recover() settled a pay op")
+        # ...and the value is not hidden: it is named, with the op_id that
+        # history() prints a 5,000 mc `pay` row for, which is how a reader
+        # matches the two views instead of adding them up.
+        self.assertEqual(out["recovered_mc"], 5_000)
+        self.assertEqual([r["amount_mc"] for r in out["recovered_ops"]],
+                         [5_000])
+        pay_rows = [r for r in w.history() if r["kind"] == "pay"]
+        self.assertEqual([r["amount_mc"] for r in pay_rows], [5_000])
+        self.assertEqual([r["op_id"] for r in out["recovered_ops"]],
+                         [r["op_id"] for r in pay_rows])
+        # THE RECONCILIATION, on the mint's own numbers rather than ours:
+        # what the operator can read off the two screens is what exists.
+        self.assertEqual(balance + (out["unredeemed_mc"] or 0),
+                         self.ledger.supply()["outstanding_mc"])
+
+    def test_a_recovered_payment_stays_out_after_it_is_spent_again(self):
+        """And it stays out once the recovered coins are spent for real.
+
+        The cheap test for "never handed over" is a payment output still
+        sitting in ``confirmed``.  That is not enough on its own: spending
+        those coins moves them to ``spent_out``, which is the same word
+        the store uses for a real payment the payee has redeemed.  The
+        durable mark is this module's own cause row, written against the
+        op at the instant ``pay()`` raised, and it is what keeps the
+        5,000 mc out of the handed-over total here while the 900 mc that
+        really was handed over stays in it.
+        """
+        w = self.stranded_pay()
+        self.assertEqual(w.recover()["ops_confirmed"], 1)
+        real = w.pay(900)               # spends the recovered coins
+        self.assertTrue(real["tokens"])
+        out = w.unredeemed_payments()
+        self.assertEqual(out["handed_over_mc"], 900)
+        self.assertEqual(out["unspent_mc"], 900)
+        self.assertEqual([p["op_id"] for p in out["payments"]],
+                         [real["op_id"]])
+        self.assertEqual(out["recovered_mc"], 5_000)
+        self.assert_closes(out, "recovered coins spent again")
+        self.assertEqual(w.summary()["balance_mc"] + out["unredeemed_mc"],
+                         self.ledger.supply()["outstanding_mc"])
+
+    def test_dead_payments_cannot_push_live_money_out_of_the_window(self):
+        """A FABRICATED ZERO THE WINDOW USED TO MANUFACTURE.
+
+        ``limit`` counts payment OPERATIONS.  When every committed payment
+        competes for that window, a wallet that has paid itself back a few
+        dozen times fills it with payments the store has already retired
+        and answers ``unredeemed_mc: 0, checked: true`` over money the
+        mint calls unspent -- an int, which is this module's word for "the
+        mint answered about every string".
+
+        Two things are pinned here.  The window is spent on money that can
+        still be live, so the one outstanding payment is listed however
+        many dead ones are in front of it; and the totals that are NOT
+        windowed (``handed_over_mc``, ``payment_count``) still describe
+        the whole wallet, with ``truncated`` saying the list does not.
+        """
+        alice = self.funded("crowded")
+        live = alice.pay(5_000)
+        for _ in range(24):             # 24 payments, paid straight back
+            paid = alice.pay(50)
+            alice.receive(paid["tokens"])
+
+        out = alice.unredeemed_payments(limit=20)
+        self.assertEqual(out["unredeemed_mc"], 5_000,
+                         "the live payment was crowded out of the window")
+        self.assertEqual(out["unspent_mc"], 5_000)
+        self.assertEqual(out["payments"][0]["op_id"], live["op_id"])
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["payment_count"], 25)
+        self.assertEqual(out["handed_over_mc"], 5_000 + 24 * 50)
+        self.assertGreater(out["unlisted_mc"], 0)
+        self.assertEqual(out["unlisted_outstanding_mc"], 0)
+        self.assert_closes(out, "one live payment behind 24 dead ones")
+        # The same instant, a window big enough for all of it: the two
+        # answers to the one question must not differ.
+        whole = alice.unredeemed_payments(limit=200)
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(whole["payment_count"], 25)
+        self.assertEqual(whole["handed_over_mc"], out["handed_over_mc"])
+        self.assertEqual(whole["unredeemed_mc"], out["unredeemed_mc"])
+        self.assertEqual(whole["unlisted_mc"], 0)
+        self.assert_closes(whole, "the whole wallet")
+        self.assertEqual(
+            alice.summary()["balance_mc"] + whole["unredeemed_mc"],
+            self.ledger.supply()["outstanding_mc"])
+
+    def test_outstanding_value_the_window_cuts_off_is_never_a_zero(self):
+        """And when live money really does not fit, the total says None.
+
+        The window is finite, so a wallet with more outstanding payments
+        than ``limit`` cannot be totalled from the rows in it.  The rule
+        is the one the rest of this module uses for an incomplete answer:
+        the parts are published, the headline is ``None``, and the field
+        that says WHY -- ``unlisted_outstanding_mc`` -- is published too,
+        so a caller states the reason instead of guessing it from
+        ``len(payments)``.
+        """
+        alice = self.funded("many-live")
+        for _ in range(4):
+            alice.pay(100)
+        out = alice.unredeemed_payments(limit=2)
+        self.assertTrue(out["checked"])
+        self.assertIsNone(out["unredeemed_mc"])
+        self.assertEqual(out["unspent_mc"], 200)     # the part it can see
+        self.assertEqual(out["unlisted_outstanding_mc"], 200)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["handed_over_mc"], 400)
+        self.assert_closes(out, "more live payments than the window")
+        whole = alice.unredeemed_payments(limit=10)
+        self.assertEqual(whole["unredeemed_mc"], 400)
+        self.assert_closes(whole, "all four listed")
+
+    def test_retired_is_the_stores_word_and_never_a_verdict_on_the_money(self):
+        """``retired_mc`` and ``unstated_mc`` answer DIFFERENT questions.
+
+        ``Wallet._mark_dead_if_ours`` retires a copy when the mint
+        consumed the string AND when the mint answered ``unknown`` -- "no
+        entry on the ledger I am keeping", which is what a replaced mint
+        database says about money that is perfectly alive on the original
+        ledger.  So a report that read ``retired_mc`` as "this wallet
+        knows this value is dead" answered one question twice, in opposite
+        directions, inside one payload: 300 mc known dead beside 300 mc
+        undetermined.
+
+        Here the store's word and the mint's word are both published and
+        neither is dressed up as the other: the strings are retired (this
+        wallet will not offer them again) and the mint's verdict on them
+        is ``unknown``, so they land in ``unstated_mc`` and the headline
+        total is ``None``.  ``retired_mc`` is deliberately outside that
+        four-way decomposition rather than a fifth box inside it.
+        """
+        alice = self.funded("retired-word")
+        paid = alice.pay(300)
+        alice.close()
+        _server, base = self.replacement_mint("a-different-mint")
+        # The operator pastes their own three strings back, against a mint
+        # whose database has been replaced. Every one is refused -- no
+        # entry on THIS ledger -- and Wallet._mark_dead_if_ours retires
+        # alice's own copies on the way through.
+        pasting = Wallet(self.path("retired-word"), MintClient(base),
+                         MINT_ID)
+        result = pasting.receive_batch(list(paid["tokens"]))
+        pasting._db.close()
+        self.assertEqual(result["credited_mc"], 0)
+        self.assertEqual(len(result["dead"]), 3)
+        stranger = WalletOps(self.path("retired-word"), base)
+        out = stranger.unredeemed_payments()
+        entry = out["payments"][0]
+        self.assertEqual(entry["retired_mc"], 300)
+        self.assertEqual(entry["outstanding_mc"], 0)
+        self.assertEqual(sorted(t["store_state"] for t in entry["tokens"]),
+                         ["spent_out"] * 3)
+        # The mint's own word about those same strings, still asked for
+        # and still reported: undetermined, not dead.
+        self.assertEqual(sorted(t["state"] for t in entry["tokens"]),
+                         ["unknown"] * 3)
+        self.assertEqual(out["unstated_mc"], 300)
+        self.assertEqual(out["spent_mc"], 0)
+        self.assertIsNone(out["unredeemed_mc"])
+        self.assertIsNone(entry["live_mc"])
+        self.assert_closes(out, "a replaced mint database")
+
+    def test_the_two_store_reads_are_one_snapshot(self):
+        """The mechanism ``unaccounted_mc`` rests on, demonstrated.
+
+        The residual is only a cross-check if the grouped total and the
+        per-string scan see the same bytes.  A plain sqlite3 connection
+        opens NO transaction for a SELECT, so "one connection" buys
+        nothing: proved here by committing between two reads on one
+        connection and watching the second answer move.  Inside
+        ``_ro_snapshot`` it cannot move, and the reason is shown rather
+        than asserted -- the read transaction holds its lock, so a writer
+        cannot land a commit in the middle of the read at all, and the
+        moment the transaction closes the same write goes through.
+        """
+        import sqlite3
+
+        walletops = sys.modules[WalletOps.__module__]
+        w = self.ops("snapshot")
+        w.summary()                     # materialise the store
+        w.close()
+        path = self.path("snapshot")
+        # A short busy timeout: this writer is EXPECTED to be turned away
+        # while the reader holds its snapshot, and the test should not
+        # spend five seconds discovering that.
+        writer = sqlite3.connect(path, isolation_level=None, timeout=0.2)
+        self.addCleanup(writer.close)
+        writer.execute("CREATE TABLE snap_probe (v INTEGER)")
+        writer.execute("INSERT INTO snap_probe VALUES (1)")
+
+        ops = WalletOps(path, self.base)
+        loose = ops._connect_ro()
+        self.addCleanup(loose.close)
+        first = loose.execute("SELECT SUM(v) FROM snap_probe").fetchone()[0]
+        writer.execute("INSERT INTO snap_probe VALUES (100)")
+        self.assertNotEqual(
+            loose.execute("SELECT SUM(v) FROM snap_probe").fetchone()[0],
+            first, "two SELECTs on one connection were somehow one snapshot"
+                   " -- if this ever passes, the reasoning in _ro_snapshot"
+                   " needs rewriting, not the code")
+
+        held = ops._connect_ro()
+        self.addCleanup(held.close)
+        with walletops._ro_snapshot(held):
+            inside = held.execute(
+                "SELECT SUM(v) FROM snap_probe").fetchone()[0]
+            self.assertTrue(held.in_transaction,
+                            "_ro_snapshot opened no transaction")
+            with self.assertRaises(sqlite3.OperationalError):
+                writer.execute("INSERT INTO snap_probe VALUES (10000)")
+            self.assertEqual(
+                held.execute("SELECT SUM(v) FROM snap_probe").fetchone()[0],
+                inside, "the read transaction did not hold a snapshot")
+        self.assertFalse(held.in_transaction,
+                         "_ro_snapshot left the transaction open")
+        # ...and it really is released: the write that was turned away
+        # goes through the moment the read is over, and the same
+        # connection sees it.
+        writer.execute("INSERT INTO snap_probe VALUES (10000)")
+        self.assertEqual(
+            held.execute("SELECT SUM(v) FROM snap_probe").fetchone()[0],
+            10101)
+
+    # -- the identity, over a long randomised run -------------------------
+
+    def _drive(self, seed, rounds=36):
+        """Payments, partial redemptions and re-pastes, in random order.
+
+        The test keeps its OWN books: what each payment handed over is
+        parsed out of the strings ``pay()`` returned (never read back from
+        the store), and which strings are still live is tracked by what
+        this test itself handed to whom.  Every round both the identity
+        and the two views of every payment are checked against those
+        independent books.
+        """
+        rng = random.Random(seed)
+        name = "alice-%d" % seed
+        alice = self.funded(name, face=400_000)
+        payees = [self.ops("bob-%d" % seed), self.ops("carol-%d" % seed)]
+        # Money the mint knows about that is NOT this run's to account
+        # for -- an earlier subTest's wallet, funded from the same mint.
+        # It cannot change while this run drives only these three wallets,
+        # so it is measured once and subtracted from every reconciliation.
+        outside = (self.ledger.supply()["outstanding_mc"]
+                   - alice.summary()["balance_mc"])
+        paid: dict = {}                 # op_id -> mc handed over (our books)
+        stranded = {"mc": 0}            # value that never left this wallet
+        strings: list = []              # (op_id, token, mc) ever handed out
+        live: list = []                 # the subset nobody has consumed yet
+
+        def check(where):
+            out = alice.unredeemed_payments(limit=200)
+            self.assert_closes(out, where)
+            self.assertTrue(out["checked"], where)
+            self.assertEqual(out["handed_over_mc"], sum(paid.values()),
+                             "%s: handed-over total" % where)
+            self.assertEqual(len(out["payments"]), len(paid), where)
+            self.assertEqual(out["unspent_mc"], sum(mc for _o, _t, mc in live),
+                             "%s: still-live total" % where)
+            self.assertEqual(out["unredeemed_mc"], out["unspent_mc"], where)
+            history = {r["op_id"]: r["amount_mc"] for r in
+                       alice.history(limit=500) if r["kind"] == "pay"}
+            record = {r[0]: r[1] for r in _record_rows(alice.store_path)}
+            for payment in out["payments"]:
+                op_id = payment["op_id"]
+                self.assertEqual(payment["amount_mc"], paid[op_id],
+                                 "%s: payment %s" % (where, op_id))
+                self.assertEqual(history[op_id], paid[op_id],
+                                 "%s: history for %s" % (where, op_id))
+                self.assertEqual(record[op_id], paid[op_id],
+                                 "%s: record for %s" % (where, op_id))
+            self.assertEqual(sum(p["live_mc"] for p in out["payments"]),
+                             out["unspent_mc"], where)
+            self.assertEqual(out["payment_count"], len(paid), where)
+            # Value that never left alice at all: pay ops the transport
+            # stranded and the Recover button settled back into her
+            # spendable pool.  Counted here against this test's own tally
+            # of them, and NOT inside the handed-over total above --
+            # those are the same coins as her balance.
+            self.assertEqual(out["recovered_mc"], stranded["mc"], where)
+            # THE MINT'S OWN BOOKS, which is the check this guard did not
+            # have.  Every mc the mint says exists is either spendable in
+            # one of these three wallets or is a string this test handed
+            # out that nobody has consumed; the report's headline is that
+            # second number.  A report that invents a second copy of
+            # anything -- the round-6 defect, where recovered coins were
+            # counted both in the balance and here -- fails on this line
+            # and on no other.
+            held = alice.summary()["balance_mc"] + sum(
+                p.summary()["balance_mc"] for p in payees)
+            supply = self.ledger.supply()["outstanding_mc"]
+            self.assertEqual(
+                held + out["unredeemed_mc"] + outside, supply,
+                "%s: %d mc in these wallets + %d mc unredeemed + %d mc in"
+                " wallets this run never touches, against a mint that says"
+                " %d exists"
+                % (where, held, out["unredeemed_mc"], outside, supply))
+            # ...and the same question asked through a window far too
+            # small for the wallet.  A truncated report may list less; it
+            # may never publish a confident total over money it did not
+            # list, and it may never disagree with the whole one about
+            # what this wallet has handed over.
+            small = alice.unredeemed_payments(limit=3)
+            self.assert_closes(small, "%s (limit=3)" % where)
+            self.assertEqual(small["handed_over_mc"], out["handed_over_mc"],
+                             "%s: the whole-life total is windowed" % where)
+            self.assertEqual(small["payment_count"], out["payment_count"],
+                             where)
+            self.assertLessEqual(small["unspent_mc"], out["unspent_mc"],
+                                 where)
+            if small["unredeemed_mc"] is None:
+                self.assertGreater(small["unlisted_outstanding_mc"], 0,
+                                   "%s: None with nothing cut off" % where)
+            else:
+                self.assertEqual(small["unredeemed_mc"], out["unredeemed_mc"],
+                                 "%s: the small window published a total"
+                                 " the whole one contradicts" % where)
+
+        check("nothing paid yet")
+        for step in range(rounds):
+            action = rng.choice(["pay", "pay", "redeem", "repaste",
+                                 "strand"])
+            if action == "pay" or not strings:
+                amount = rng.choice([55, 100, 250, 500, 1_000])
+                if alice.summary()["balance_mc"] < amount + 2_000:
+                    continue
+                out = alice.pay(amount)
+                self.assertEqual(
+                    sum(parse_token(t).amount_mc for t in out["tokens"]),
+                    amount, "pay() handed over something other than %d"
+                    % amount)
+                paid[out["op_id"]] = amount
+                for token in out["tokens"]:
+                    row = (out["op_id"], token, parse_token(token).amount_mc)
+                    strings.append(row)
+                    live.append(row)
+            elif action == "strand":
+                # A pay the transport strands, then the Recover button.
+                # pay() returns nothing, so this test's books do not
+                # change: the money never left alice, and recover() puts
+                # it back in her spendable pool.  Any report that calls
+                # it handed-over invents a second copy of it, and the
+                # reconciliation in check() is where that shows.
+                if alice.summary()["balance_mc"] < 2_500:
+                    continue
+                self.strand_a_pay(alice, 200)
+                # recover() settles exactly the op that was stranded, and
+                # says so; nothing else is in flight here.
+                if alice.recover()["ops_confirmed"]:
+                    stranded["mc"] += 200
+            elif action == "redeem" and live:
+                take = rng.sample(live, rng.randint(1, min(3, len(live))))
+                rng.choice(payees).receive([t for _o, t, _mc in take])
+                for row in take:
+                    live.remove(row)
+            else:
+                # A re-paste: whatever the operator has on the clipboard,
+                # live strings and dead ones mixed together.
+                take = rng.sample(strings,
+                                  rng.randint(1, min(4, len(strings))))
+                alice.receive([t for _o, t, _mc in take])
+                for row in take:
+                    if row in live:
+                        live.remove(row)
+            check("seed %d, step %d, %s" % (seed, step, action))
+
+    def test_the_identity_holds_across_a_long_randomised_run(self):
+        """The regression guard: it cannot drift again without failing here.
+
+        Any change that re-narrows the scan (the original defect), or that
+        lets one view of a payment be rebuilt from state that a later
+        operation can edit, breaks the handed-over total, the per-payment
+        amount, or the sum — against books this test kept itself.
+
+        Two things it now checks that it did not, and that let a
+        double-count and a fabricated zero through: every round is
+        reconciled against the MINT's signed supply figure and the three
+        wallet balances, not only against this test's own books; and every
+        round is also read back through a window of 3, so a report that
+        can only be honest when nothing is truncated fails here.
+        """
+        for seed in (1, 7):
+            with self.subTest(seed=seed):
+                self._drive(seed)
 
 
 if __name__ == "__main__":

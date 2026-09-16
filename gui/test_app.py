@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -67,7 +68,18 @@ class FakeMintControlError(Exception):
 
 
 class FakeMintControl:
-    """Enough of the pinned MintControl contract to exercise the server."""
+    """Enough of the pinned MintControl contract to exercise the server.
+
+    The identity it reports is the identity it was last told to start, and
+    it is kept in the workdir rather than in this object, because the real
+    MintControl keeps it in mint-control.json: a second controller built on
+    the same workdir (a restarted GUI) reads the same record. A fake whose
+    status() contradicts its own start() is not a model of the contract --
+    it is a component with a bug, and a test written against it pins
+    behaviour no real supervisor can produce.
+    """
+
+    RECORD = "fake-mint-control.json"
 
     def __init__(self, workdir):
         self.workdir = workdir
@@ -75,12 +87,24 @@ class FakeMintControl:
         self.started = []
         self.stopped = []
 
+    def _record(self):
+        try:
+            with open(os.path.join(self.workdir, self.RECORD)) as handle:
+                blob = json.load(handle)
+            if isinstance(blob, dict):
+                return blob
+        except (OSError, ValueError):
+            pass
+        return {"mint_id": "fake-mint", "port": 8787}
+
     def status(self):
+        record = self._record()
+        port = record["port"]
         return {"running": self.running,
                 "pid": 4242 if self.running else None,
-                "port": 8787,
-                "mint_id": "fake-mint",
-                "base_url": "http://127.0.0.1:8787",
+                "port": port,
+                "mint_id": record["mint_id"],
+                "base_url": "http://127.0.0.1:%d" % port,
                 "started_at_ms": 1700000000000 if self.running else None,
                 "last_error": None}
 
@@ -91,6 +115,11 @@ class FakeMintControl:
                                  port=port, rate_ppm=rate_ppm, cap_mc=cap_mc,
                                  exempt_below_mc=exempt_below_mc))
         self.running = True
+        try:
+            with open(os.path.join(self.workdir, self.RECORD), "w") as handle:
+                json.dump({"mint_id": mint_id, "port": port}, handle)
+        except OSError:                              # pragma: no cover
+            pass
         return self.status()
 
     def stop(self, *, drain_seconds=10):
@@ -2421,6 +2450,113 @@ class TestOutstandingRoute(ServerCase):
         self.assertEqual(status, 404, raw[:200])
         self.assert_envelope(status, obj, raw)
 
+    # -- the window's own account of itself, relayed rather than rebuilt --
+    #
+    # The component decides how much of a wallet's payments it can list
+    # and says so; this route used to throw all of that away and rebuild
+    # the headline by summing the rows it happened to receive. Measured
+    # through the real HTTP API against a wallet with 106 payments, 105 of
+    # them live: the wire answered a confident unredeemed_mc 3000 where
+    # the component, reading the same store at the same instant, answered
+    # None with unlisted_outstanding_mc 200 and a true total of 3200.
+
+    def _windowed(self, **over):
+        """A component answer that says the window cut something off."""
+        base = {
+            "checked": True, "mint_id": "fake-mint",
+            "handed_over_mc": 3200, "payment_count": 106,
+            "listed_mc": 3000, "unlisted_mc": 200,
+            "unlisted_outstanding_mc": 200, "truncated": True,
+            "unaccounted_mc": 0, "recovered_mc": 0, "recovered_ops": [],
+            "unredeemed_mc": None,
+            "payments": [{"op_id": "op-w", "amount_mc": 3000, "live_mc": 3000,
+                          "tokens": [{"token": "t", "amount_mc": 3000,
+                                      "state": "unspent"}]}]}
+        base.update(over)
+        return base
+
+    def test_a_truncated_report_gives_no_total_rather_than_a_short_one(self):
+        FakeWalletOps.outstanding = self._windowed()
+        status, obj, raw = self.call("GET",
+                                     "/api/wallet/outstanding?name=alice")
+        self.assertEqual(status, 200, raw[:200])
+        # Every string it listed carries a definite state, so the old rule
+        # would have published 3000 here. It is short by the 200 the
+        # window could not reach, and short by a figure the component
+        # handed over in as many words.
+        self.assertIsNone(
+            obj["unredeemed_mc"],
+            "a headline was published over %r of outstanding value the "
+            "window did not cover" % (obj["unlisted_outstanding_mc"],))
+        self.assertEqual(obj["unspent_mc"], 3000)
+        self.assertTrue(obj["truncated"])
+        self.assertEqual(obj["unlisted_outstanding_mc"], 200)
+        self.assertEqual(obj["payment_count"], 106)
+        self.assertEqual(obj["handed_over_mc"], 3200)
+
+    def test_the_two_identities_close_on_the_wire(self):
+        FakeWalletOps.outstanding = self._windowed()
+        _status, obj, _raw = self.call("GET",
+                                       "/api/wallet/outstanding?name=alice")
+        self.assertEqual(obj["handed_over_mc"],
+                         obj["listed_mc"] + obj["unlisted_mc"])
+        self.assertEqual(obj["listed_mc"],
+                         obj["unspent_mc"] + obj["spent_mc"] +
+                         obj["unstated_mc"] + obj["unchecked_mc"] +
+                         obj["unaccounted_mc"])
+
+    def test_an_untruncated_report_still_gives_its_total(self):
+        """The refusal is about the window, not about caution in general."""
+        FakeWalletOps.outstanding = self._windowed(
+            truncated=False, unlisted_mc=0, unlisted_outstanding_mc=0,
+            listed_mc=3000, handed_over_mc=3000, payment_count=1)
+        _status, obj, _raw = self.call("GET",
+                                       "/api/wallet/outstanding?name=alice")
+        self.assertEqual(obj["unredeemed_mc"], 3000)
+        self.assertFalse(obj["truncated"])
+
+    def test_recovered_value_is_relayed_and_added_to_nothing(self):
+        """It is already inside balance_mc. Counting it here counts it twice."""
+        FakeWalletOps.outstanding = self._windowed(
+            truncated=False, unlisted_mc=0, unlisted_outstanding_mc=0,
+            listed_mc=3000, handed_over_mc=3000, payment_count=1,
+            recovered_mc=5000,
+            recovered_ops=[{"op_id": "op-r", "amount_mc": 5000}])
+        _status, obj, _raw = self.call("GET",
+                                       "/api/wallet/outstanding?name=alice")
+        self.assertEqual(obj["recovered_mc"], 5000)
+        self.assertEqual(obj["recovered_ops"],
+                         [{"op_id": "op-r", "amount_mc": 5000}])
+        self.assertEqual(obj["unredeemed_mc"], 3000)
+        self.assertEqual(obj["handed_over_mc"], 3000)
+
+    def test_a_component_that_says_nothing_about_its_window_is_not_trusted(self):
+        """No flag and a full page: the answer must get LESS confident.
+
+        A build of walletops that publishes none of these leaves the route
+        with one piece of evidence -- a page as long as the limit -- and
+        the fallback has to read that as "maybe not all of it", never as
+        "all of it".
+        """
+        rows = [{"op_id": "op-%d" % i, "amount_mc": 1, "live_mc": 1,
+                 "tokens": [{"token": "t%d" % i, "amount_mc": 1,
+                             "state": "unspent"}]} for i in range(20)]
+        FakeWalletOps.outstanding = {"checked": True, "mint_id": "fake-mint",
+                                     "payments": rows}
+        _status, obj, _raw = self.call("GET",
+                                       "/api/wallet/outstanding?name=alice")
+        self.assertTrue(obj["truncated"])
+        self.assertIsNone(obj["unredeemed_mc"])
+        self.assertEqual(obj["unspent_mc"], 20)
+        self.assertIsNone(obj["unlisted_outstanding_mc"])
+
+    def test_the_scope_sentence_states_the_rule_for_the_next_caller(self):
+        FakeWalletOps.outstanding = self._windowed()
+        _status, obj, _raw = self.call("GET",
+                                       "/api/wallet/outstanding?name=alice")
+        self.assertIn("truncated", obj["scope"])
+        self.assertIn("unlisted_outstanding_mc", obj["scope"])
+
 
 class TestNoFabricatedZero(ServerCase):
     """A number this server did not learn must not be printed as 0.
@@ -4317,6 +4453,220 @@ const flat = s => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").
 '''
 
 
+# The third page harness, and the smallest: it plants ONE server answer
+# and reads back the three pure functions the reconciliation panel is
+# built out of. No fake session, no clicks -- the whole point is that
+# these are pure, so the rule they encode can be pinned without a page
+# lifecycle around it.
+PAGE_WINDOW_HARNESS = r'''/* usage: node window.js <page.html> <answer.json> */
+"use strict";
+const fs = require("fs");
+const ANSWER = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+function el(id) {
+  return {id: id, textContent: "", innerHTML: "", value: "", disabled: false,
+    hidden: false, className: "", open: false, dataset: {}, style: {},
+    listeners: {}, addEventListener() {}, querySelectorAll() { return []; }};
+}
+const nodes = new Map();
+globalThis.document = {getElementById(id) {
+  if (!nodes.has(id)) nodes.set(id, el(id));
+  return nodes.get(id); }};
+globalThis.window = {}; globalThis.navigator = {};
+globalThis.localStorage = {getItem: () => null, setItem() {}};
+globalThis.setInterval = () => 0;
+globalThis.fetch = async () => ({ok: false, status: 599,
+  json: async () => ({error: {reason: "not_found", detail: "x"}})});
+const html = fs.readFileSync(process.argv[2], "utf8");
+new Function(html.match(/<script>\n([\s\S]*)<\/script>/)[1])();
+const flat = s => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+const rec = window.summariseUnredeemed(ANSWER.wire);
+const r = window.reconcileSupply(ANSWER.supply, ANSWER.wallets,
+                                 {alice: rec}, ANSWER.supply.mint_id, true);
+const now = 1700000000000;
+const lines = window.supplyLines(r, now, now, "", {canRecover: true, mintLive: true});
+console.log(JSON.stringify({
+  rec: {truncated: rec.truncated, payment_count: rec.payment_count,
+        unlisted_outstanding_mc: rec.unlisted_outstanding_mc,
+        unspent_mc: rec.unspent_mc},
+  reconciled: {unredeemed_mc: r.unredeemed_mc, accounted: r.accounted,
+               residual: r.residual, floor: r.floor,
+               unredeemed_capped: r.unredeemed_capped,
+               unredeemed_unlisted_mc: r.unredeemed_unlisted_mc},
+  panel: lines.map(l => flat(l[1])).join(" || "),
+  tag: window.unredeemedTag(rec),
+  ceiling: flat(window.unredeemedSentence
+    ? window.unredeemedSentence(rec, "alice").text : "")}));
+process.exit(0);
+'''
+
+
+class TestTheBurnNoteAndTheMintAgree(unittest.TestCase):
+    """The Mint-settings note must name what §7.3 actually charges on.
+
+    MEASURED DEFECT: the note read "The burn is min(cap, amount x rate /
+    1,000,000)". §7.3 charges on sum(inputs) of the /v3/exchange call, and
+    a wallet almost never holds exact change. Against a live mint under
+    rate_ppm 10000 / cap_mc 1000 / exempt_below_mc 10, POST
+    /api/wallet/quote for 7,000 mc answered burn_mc 71 out of inputs_mc
+    7,100. The note's formula predicts 70. It was the note that was wrong;
+    page.html's own burnFor(sum, p) helper always took the sum, and so
+    does the cost line the operator actually commits to.
+    """
+
+    NOTE = None
+
+    @classmethod
+    def setUpClass(cls):
+        page = os.path.join(REPO, "gui", "page.html")
+        with io.open(page, encoding="utf-8") as handle:
+            text = handle.read()
+        start = text.index("The burn is")
+        cls.NOTE = text[start:start + 1200]
+
+    def test_the_note_names_the_sum_of_the_inputs_not_the_amount(self):
+        self.assertIn("sum", self.NOTE)
+        self.assertNotIn("min(cap, amount", self.NOTE.replace("&nbsp;", " "))
+
+    def test_the_example_in_the_note_is_what_burncalc_computes(self):
+        """The worked figure on screen, checked against the implementation."""
+        sys.path.insert(0, os.path.join(REPO, "impl"))
+        try:
+            from aicash.burncalc import BurnPolicy, compute_burn
+        finally:
+            sys.path.pop(0)
+        policy = BurnPolicy(rate_ppm=10000, cap_mc=1000, exempt_below_mc=10)
+        # The note says: paying 7,000 out of coins worth 7,100 burns 71,
+        # not 70. Both halves of that sentence, checked.
+        self.assertEqual(compute_burn(7100, policy), 71)
+        self.assertNotEqual(compute_burn(7100, policy),
+                            min(1000, 7000 * 10000 // 1000000))
+        self.assertIn("7,100", self.NOTE.replace("&nbsp;", " "))
+        self.assertIn("71", self.NOTE)
+
+
+class TestTheWindowIsSaidOutLoud(unittest.TestCase):
+    """A read-back that did not cover the wallet must say so, by value.
+
+    THE DEFECT THIS PINS, measured through the real HTTP API before it was
+    fixed: a wallet with 106 payments, 105 of them live 30 mc bearer
+    payments nobody had redeemed, answered GET /api/wallet/outstanding
+    ?limit=100 with a confident ``unredeemed_mc: 3000``. The component
+    behind it, reading the same store at the same instant, answered
+    ``None`` with ``truncated: true`` and ``unlisted_outstanding_mc: 200``.
+    The true total was 3,200. The route rebuilt the headline from the rows
+    it happened to receive and dropped every field that described the
+    window, and the page then inferred truncation from a full page of rows
+    and told the operator the read "covered only the 100 most recent
+    payments" -- which is not how the window is spent either: live money
+    is taken first, so the payments that fall off the end are the ones the
+    wallet has already retired.
+
+    AND THE SECOND HALF, which is the one that reads as an arithmetic
+    contradiction on screen: the figure named in the gaps clause must not
+    be presented as value to ADD. Handed-out value a wallet here has since
+    redeemed sits in the balances AND in that figure, because the paying
+    wallet's file never learned what became of its strings. On the wallet
+    measured while this was written the gaps came to 15,380 mc beside a
+    residual of 12,200 mc -- adding them exceeds the mint's whole supply.
+    """
+
+    out = None
+
+    @classmethod
+    def setUpClass(cls):
+        if not NODE:
+            raise unittest.SkipTest(
+                "node is not installed; page.html's JavaScript cannot be "
+                "executed here. The server tests still run.")
+        cls.tmp = tempfile.mkdtemp(prefix="guiwindow-")
+        harness = os.path.join(cls.tmp, "window.js")
+        with io.open(harness, "w", encoding="utf-8") as handle:
+            handle.write(PAGE_WINDOW_HARNESS)
+        answer = {
+            # The wire, in the shape route_wallet_outstanding now sends:
+            # the window's own account of itself, and no headline over the
+            # value it could not reach.
+            "wire": {
+                "name": "alice", "checked": True, "mint_id": "t-mint",
+                "unredeemed_mc": None, "unspent_mc": 3000, "spent_mc": 0,
+                "unstated_mc": 0, "unchecked_mc": 0, "unaccounted_mc": 0,
+                "handed_over_mc": 3200, "payment_count": 106,
+                "listed_mc": 3000, "unlisted_mc": 200,
+                "unlisted_outstanding_mc": 200, "truncated": True,
+                "recovered_mc": 0, "recovered_ops": [], "scope": "s",
+                "payments": [{"op_id": "op-w", "amount_mc": 3000,
+                              "live_mc": 3000, "recipient": "",
+                              "recipient_kind": "", "delivery": "unknown",
+                              "delivery_cause": "",
+                              "delivery_attempt": "not_attempted",
+                              "tokens": [{"token": "t", "amount_mc": 3000,
+                                          "state": "unspent"}]}]},
+            "supply": {"mint_id": "t-mint", "outstanding_mc": 20000,
+                       "cumulative_issued_mc": 21000,
+                       "cumulative_burned_mc": 1000},
+            "wallets": [{"name": "alice", "balance_mc": 10000,
+                         "mint_id": "t-mint", "coin_count": 3,
+                         "connected": True, "error": None}]}
+        path = os.path.join(cls.tmp, "answer.json")
+        with io.open(path, "w", encoding="utf-8") as handle:
+            json.dump(answer, handle)
+        page = os.path.join(REPO, "gui", "page.html")
+        proc = subprocess.run([NODE, harness, page, path],
+                              capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            raise AssertionError("page.html would not run:\n" + proc.stderr)
+        cls.out = json.loads(proc.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(getattr(cls, "tmp", ""), ignore_errors=True)
+
+    def test_truncation_comes_off_the_wire_not_off_the_row_count(self):
+        """One row, and the record still knows the read was short.
+
+        The row-count rule would have said "not truncated" here: the
+        answer carries a single payment, nothing like the 100-row page it
+        was watching for. The server said so instead.
+        """
+        self.assertTrue(self.out["rec"]["truncated"])
+        self.assertEqual(self.out["rec"]["payment_count"], 106)
+        self.assertEqual(self.out["rec"]["unlisted_outstanding_mc"], 200)
+
+    def test_the_panel_names_the_value_the_read_missed(self):
+        panel = self.out["panel"]
+        self.assertIn("200 mc", panel)
+        self.assertIn("floor", panel)
+        self.assertIn("ceiling", panel)
+
+    def test_the_panel_never_calls_the_window_the_newest_payments(self):
+        """It is not. Live money is taken first; retired payments fall off.
+
+        Saying "only the 100 most recent were checked" pointed the reader
+        at old payments, which is exactly where the gap is NOT.
+        """
+        for text in (self.out["panel"], self.out["tag"], self.out["ceiling"]):
+            self.assertNotIn("most recent", text)
+            self.assertNotIn("newest", text)
+
+    def test_the_gap_figure_is_not_offered_as_value_to_add(self):
+        panel = self.out["panel"]
+        self.assertIn("NOT VALUE TO ADD", panel)
+        # ...and the arithmetic it is protecting: accounted + the gap
+        # figure exceeds what the mint says exists, so a reader who added
+        # them would get a number the signed snapshot contradicts.
+        rec = self.out["reconciled"]
+        self.assertEqual(rec["accounted"], 13000)
+        self.assertEqual(rec["residual"], 7000)
+        self.assertEqual(rec["unredeemed_unlisted_mc"], 200)
+        self.assertTrue(rec["floor"])
+
+    def test_the_missed_value_is_not_counted_as_money_the_page_can_point_to(self):
+        """A ceiling stays a ceiling: nothing unverified joins `accounted`."""
+        rec = self.out["reconciled"]
+        self.assertEqual(rec["unredeemed_mc"], 3000)
+        self.assertEqual(rec["accounted"], 10000 + 3000)
+
+
 class TestTheStatesNextDoor(unittest.TestCase):
     """The two neighbours round 5 found, driven through the real page.
 
@@ -4430,3 +4780,877 @@ class TestTheStatesNextDoor(unittest.TestCase):
         self.assertTrue(deaf["stoppedBanner"])          # banner stays hidden
         self.assertNotIn("The mint is stopped", deaf["quote"])
         self.assertIn("running but is not answering", deaf["quote"])
+
+
+# ======================================================================
+# TWO VIEWS OF ONE MINT MUST NOT DISAGREE
+#
+# Everything below runs against a real run_mint.py, the real gui/mintctl.py
+# and the real gui/walletops.py, driven through app.py's own HTTP API. The
+# conditions are caused, not simulated: a mint really SIGSTOPped at the OS
+# level, a workdir that really has never been touched, a supervision file
+# really left behind by a mint this GUI never started.
+# ======================================================================
+def page_abort_ms() -> int:
+    """page.html's OWN default fetch deadline, read out of page.html.
+
+    Not a constant repeated here: the number that matters is the one the
+    shipped page actually aborts on, and a copy of it in this file would
+    keep agreeing with itself after the page changed.
+    """
+    with open(os.path.join(REPO, "gui", "page.html")) as handle:
+        source = handle.read()
+    match = re.search(r"TIMEOUTS\s*=\s*\{[^}]*?default\s*:\s*(\d+)", source)
+    assert match, "page.html no longer declares TIMEOUTS.default"
+    return int(match.group(1))
+
+
+class RealMintCase(unittest.TestCase):
+    """A GUI server, a real mint, and a cookie -- per test CLASS."""
+
+    policy = {"rate_ppm": 10000, "cap_mc": 1000, "exempt_below_mc": 10}
+    mint_id = "adjacency-mint"
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        try:
+            cls.real = (importlib.import_module("gui.mintctl"),
+                        importlib.import_module("gui.walletops"))
+        except Exception as exc:       # a sibling component is mid-rewrite
+            raise unittest.SkipTest("gui components not importable: %s" % exc)
+        try:
+            import cryptography  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("the mint needs the cryptography package")
+        sys.modules["mintctl"], sys.modules["walletops"] = cls.real
+        cls.workdir = tempfile.mkdtemp(prefix="guiadj-")
+        cls.httpd = gui_app.serve(0, cls.workdir, "127.0.0.1")
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      kwargs={"poll_interval": 0.05},
+                                      daemon=True)
+        cls.thread.start()
+        cls.cookie = exchange_cookie(cls.httpd)
+        cls.mint_port = free_port()
+        status, obj = cls.post("/api/mint/start",
+                               dict(mint_id=cls.mint_id,
+                                    baseline_model_class="baseline-v1",
+                                    port=cls.mint_port, **cls.policy))
+        if status != 200:
+            cls.tearDownClass()
+            raise unittest.SkipTest("could not start a real mint: %s" % obj)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.post("/api/mint/stop", {"drain_seconds": 2})
+        except Exception:
+            pass
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=10)
+        install_fakes()
+        shutil.rmtree(cls.workdir, ignore_errors=True)
+
+    @classmethod
+    def _call(cls, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=120)
+        payload = None if body is None else json.dumps(body)
+        head = {"Cookie": cls.cookie}
+        if payload:
+            head["Content-Type"] = "application/json"
+        conn.request(method, path, payload, head)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        return response.status, json.loads(raw or b"{}")
+
+    @classmethod
+    def post(cls, path, body):
+        return cls._call("POST", path, body)
+
+    @classmethod
+    def get(cls, path):
+        return cls._call("GET", path)
+
+    def ok(self, result, what):
+        status, obj = result
+        self.assertEqual(status, 200, "%s -> %s" % (what, obj))
+        return obj
+
+    def lookup(self, token):
+        return self.get("/api/token/status?token="
+                        + urllib.parse.quote(token, safe=""))
+
+
+class TestTokenLookupIsAReading(RealMintCase):
+    """A lookup is a photograph of a ledger key, and says so.
+
+    The defect: the panel printed ``state: unspent, spent_at: null`` and
+    went on printing it while the page re-rendered around it, with nothing
+    on screen saying when that was read. Another wallet redeemed the same
+    string; the wallet's own figures moved; the lookup did not, and the
+    mint asked in the same second disagreed with it.
+    """
+
+    def issued_token(self, amount_mc=5000):
+        issued = self.ok(self.post("/api/mint/issue",
+                                   {"amount_mc": amount_mc, "count": 1}),
+                         "issue")
+        return issued["tokens"][0]
+
+    def wallet(self, name):
+        status, obj = self.post("/api/wallet/create", {"name": name})
+        self.assertIn(status, (200, 409), obj)
+        return name
+
+    def test_a_reading_carries_the_moment_it_was_taken(self):
+        token = self.issued_token()
+        before = int(time.time() * 1000)
+        body = self.ok(self.lookup(token), "lookup")
+        after = int(time.time() * 1000)
+        self.assertEqual(body["result"]["state"], "unspent")
+        # in the object the panel actually prints, not only beside it
+        stamp = body["result"]["observed_at_ms"]
+        self.assertIsInstance(stamp, int)
+        self.assertTrue(before <= stamp <= after,
+                        "%r is not when this reading was taken" % stamp)
+        self.assertEqual(body["observed_at_ms"], stamp)
+        self.assertIn("reading", body["result"]["as_of"].lower())
+        self.assertIn("not a live view", body["result"]["as_of"].lower())
+        self.assertEqual(body["result"]["mint_id"], self.mint_id)
+        self.assertIsInstance(body["result"]["mint_time"], int)
+
+    def test_the_stamp_is_on_the_same_clock_as_the_rest_of_the_page(self):
+        """ONE CLOCK. The stamp is the whole remedy; it has to be readable.
+
+        page.html prints every other moment on the screen -- history rows,
+        the supply read time, the wallets read time -- through when(), which
+        is toLocaleString() on the viewer's own clock, and prefers this
+        server's ``as_of`` words over its own when they are there. A UTC
+        stamp therefore put 14:01:55Z on the same screen as 7:01:55 AM for
+        the same instant, and the age of the reading -- the one thing the
+        stamp exists to let an operator see -- could not be read off it.
+
+        Pinned against a machine deliberately NOT on UTC, so a UTC stamp
+        cannot pass by coincidence.
+        """
+        token = self.issued_token()
+        was = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        try:
+            body = self.ok(self.lookup(token), "lookup")
+            observed = body["result"]["observed_at_ms"] / 1000.0
+            local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(observed))
+            utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(observed))
+            self.assertNotEqual(local, utc, "this test needs a non-UTC zone")
+            for where in (body["result"]["as_of"], body["as_of"]):
+                self.assertIn(local, where)
+                self.assertNotIn(utc, where)
+                self.assertNotIn("Z -", where)
+        finally:
+            if was is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = was
+            time.tzset()
+
+    def test_the_reading_moves_when_the_money_does(self):
+        """The reviewer's sequence, run for real."""
+        token = self.issued_token()
+        self.wallet("taker")
+        first = self.ok(self.lookup(token), "lookup before")
+        self.assertEqual(first["result"]["state"], "unspent")
+        self.assertIsNone(first["result"]["spent_at"])
+        self.ok(self.post("/api/wallet/receive",
+                          {"name": "taker", "tokens": [token]}), "redeem")
+        second = self.ok(self.lookup(token), "lookup after")
+        self.assertEqual(second["result"]["state"], "spent")
+        self.assertIsInstance(second["result"]["spent_at"], int)
+        # ...and the mint, asked directly in the same breath, agrees
+        conn = http.client.HTTPConnection("127.0.0.1", self.mint_port,
+                                          timeout=10)
+        conn.request("POST", "/v3/status",
+                     json.dumps({"hashes": [second["ledger_key"]]}),
+                     {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        direct = json.loads(response.read())
+        conn.close()
+        self.assertEqual(direct["results"][0]["state"],
+                         second["result"]["state"])
+        # the stale reading is still identifiable AS stale: it is dated,
+        # and its date is older than the one that replaced it
+        self.assertLess(first["observed_at_ms"], second["observed_at_ms"] + 1)
+        self.assertNotEqual(first["result"]["state"], second["result"]["state"])
+
+    def test_two_readings_are_two_moments(self):
+        token = self.issued_token()
+        one = self.ok(self.lookup(token), "first")
+        time.sleep(1.1)
+        two = self.ok(self.lookup(token), "second")
+        self.assertEqual(one["result"]["state"], two["result"]["state"])
+        self.assertLess(one["observed_at_ms"], two["observed_at_ms"])
+        self.assertNotEqual(one["result"]["as_of"], two["result"]["as_of"])
+
+    def test_another_mints_silence_is_not_this_tokens_state(self):
+        """A token from a mint this GUI does not supervise.
+
+        This mint answers ``unknown`` for the key, truthfully -- it has
+        never seen it. Printing that as the token's state tells the
+        operator the token does not exist, when what happened is that the
+        question went to a ledger that was never asked to hold it.
+        """
+        from aicash.tokencodec import format_token, new_secret
+        foreign = format_token("some-other-mint", 5000, new_secret())
+        status, obj = self.lookup(foreign)
+        self.assertEqual(status, 409, obj)
+        self.assertEqual(obj["error"]["cause"], "wrong_mint")
+        self.assertIn("some-other-mint", obj["error"]["detail"])
+        self.assertIn(self.mint_id, obj["error"]["detail"])
+        self.assertIn("undetermined", obj["error"]["detail"])
+        # and a bare ledger key, which names no mint, is still answerable
+        token = self.issued_token()
+        key = self.ok(self.lookup(token), "lookup")["ledger_key"]
+        again = self.ok(self.get("/api/token/status?token="
+                                 + urllib.parse.quote(key, safe="")), "by key")
+        self.assertIsNone(again["token_mint_id"])
+        self.assertEqual(again["result"]["state"], "unspent")
+
+
+class TestEveryAnswerALookupCanGive(RealMintCase):
+    """The neighbours of the token panel, enumerated and checked.
+
+    A stamped ``unspent`` next to an unstamped ``unknown`` would put the
+    defect back one state to the left, so every answer that IS a reading
+    carries its moment, and every answer that is NOT a reading says why in
+    the closed cause vocabulary instead.
+    """
+
+    def test_a_live_key_a_spent_key_and_a_key_nobody_issued(self):
+        from aicash.tokencodec import ledger_key, new_secret
+        issued = self.ok(self.post("/api/mint/issue",
+                                   {"amount_mc": 3000, "count": 2}), "issue")
+        live, doomed = issued["tokens"]
+        self.post("/api/wallet/create", {"name": "sink"})
+        self.ok(self.post("/api/wallet/receive",
+                          {"name": "sink", "tokens": [doomed]}), "redeem")
+        never = ledger_key(new_secret())
+        expected = {"unspent": live, "spent": doomed, "unknown": never}
+        for state, query in expected.items():
+            with self.subTest(state=state):
+                body = self.ok(self.lookup(query), state)
+                self.assertEqual(body["result"]["state"], state)
+                # every one of them is a reading, and says so
+                self.assertIsInstance(body["result"]["observed_at_ms"], int)
+                self.assertIn("not a live view",
+                              body["result"]["as_of"].lower())
+                self.assertEqual(body["result"]["mint_id"], self.mint_id)
+                self.assertEqual(body["observed_at_ms"],
+                                 body["result"]["observed_at_ms"])
+
+    def test_the_answers_that_are_not_readings_say_why_instead(self):
+        from aicash.tokencodec import format_token, new_secret
+        cases = [
+            ("", 400, None),
+            ("aicash:v3:" + self.mint_id + ":5000", 400, None),
+            ("aicash:v3:" + self.mint_id + ":5000:not-base64url!!", 400, None),
+            (format_token("elsewhere-mint", 10, new_secret()), 409,
+             "wrong_mint"),
+        ]
+        for query, expect, cause in cases:
+            with self.subTest(query=query[:40]):
+                code, obj = self.get("/api/token/status?token="
+                                     + urllib.parse.quote(query, safe=""))
+                self.assertEqual(code, expect, obj)
+                self.assertIn("error", obj)
+                self.assertNotIn("result", obj)
+                self.assertIn(obj["error"]["cause"], walletops.CAUSES)
+                if cause:
+                    self.assertEqual(obj["error"]["cause"], cause)
+
+
+class TestAWedgedMintAgreesWithItself(RealMintCase):
+    """The mint is SIGSTOPped: alive, holding the port, answering nothing.
+
+    Two adjacent answers to "is the mint working" used to disagree for
+    about a second -- ``responding: true`` from the status route while a
+    request in the same second failed with ``mint_unreachable`` -- and the
+    optimistic one was the one the panel drew.
+
+    It is also the state every deadline in this server is sized for: a
+    socket that connects and then never answers is what makes a route
+    spend its whole timeout instead of failing at once.
+    """
+
+    #: EVERY route this server has, and which side of the page's abort it
+    #: is on. The two lists together have to be the whole routing table --
+    #: a route in neither is a route nobody measured, which is how
+    #: /api/wallet/list (64s) and /api/wallet/outstanding (62s), the two
+    #: slowest in the product, were left out of a "budget" the summary
+    #: called universal.
+    BOUND = (
+        ("GET", "/api/mint/status", None, 200),
+        ("GET", "/api/mint/logs", None, 200),
+        ("GET", "/api/mint/descriptor", None, 502),
+        ("POST", "/api/mint/issue", {"amount_mc": 10, "count": 1}, 502),
+        ("GET", "/api/token/status?token=" + "A" * 43, None, 502),
+        ("GET", "/api/wallet/list", None, 200),
+        ("GET", "/api/wallet/summary?name=alice", None, 504),
+        ("GET", "/api/wallet/history?name=alice", None, 200),
+        ("GET", "/api/wallet/outstanding?name=alice", None, 504),
+    )
+    #: Outside it, each for a reason app.py states: they move money (so
+    #: they cannot be answered by abandoning the worker that is moving it),
+    #: they create a file, or they are a supervised start/stop that
+    #: legitimately takes as long as the mint takes.
+    UNBOUND = {"/api/wallet/quote", "/api/wallet/pay", "/api/wallet/receive",
+               "/api/wallet/recover", "/api/wallet/create",
+               "/api/mint/start", "/api/mint/stop"}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # TWO wallets, with money, created while the mint still answers.
+        # /api/wallet/list costs one mint timeout PER WALLET, so measuring
+        # it against one wallet would not show the shape of the defect;
+        # and a quote needs a wallet that can actually fund it, or it is
+        # refused locally and the slow path is never entered.
+        for name in ("alice", "bob"):
+            status, obj = cls.post("/api/wallet/create", {"name": name})
+            assert status == 200, obj
+        status, issued = cls.post("/api/mint/issue",
+                                  {"amount_mc": 1000, "count": 1})
+        assert status == 200, issued
+        status, obj = cls.post("/api/wallet/receive",
+                               {"name": "alice", "tokens": issued["tokens"]})
+        assert status == 200, obj
+        # ...and a real payment handed out as bearer strings, so that
+        # /api/wallet/outstanding has strings it must ASK THE MINT about.
+        # With nothing handed over that route answers out of the wallet
+        # file alone and never touches the mint, which would have measured
+        # the deadline of a route that does not need one.
+        status, obj = cls.post("/api/wallet/pay",
+                               {"name": "alice", "amount_mc": 100})
+        assert status == 200, obj
+
+    def setUp(self):
+        status = self.ok(self.get("/api/mint/status"), "status")
+        self.assertTrue(status["running"])
+        self.pid = status["pid"]
+        os.kill(self.pid, signal.SIGSTOP)
+        self.addCleanup(self._resume)
+
+    def _resume(self):
+        try:
+            os.kill(self.pid, signal.SIGCONT)
+        except OSError:                              # pragma: no cover
+            pass
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status, obj = self.get("/api/mint/status")
+            if status == 200 and obj.get("responding") is True:
+                return
+            time.sleep(0.1)
+
+    def test_the_status_route_and_a_real_request_agree(self):
+        status = self.ok(self.get("/api/mint/status"), "status")
+        self.assertTrue(status["running"], "wedged is not stopped")
+        self.assertIs(status["responding"], False,
+                      "the panel would draw this mint healthy")
+        code, obj = self.get("/api/mint/descriptor")
+        self.assertEqual(code, 502, obj)
+        self.assertEqual(obj["error"]["cause"], "mint_unreachable")
+        # ...and the status route still says the same thing afterwards
+        again = self.ok(self.get("/api/mint/status"), "status again")
+        self.assertIs(again["responding"], False)
+
+    def test_no_reading_in_the_first_second_says_healthy(self):
+        started = time.monotonic()
+        seen = []
+        while time.monotonic() - started < 3.0:
+            status = self.ok(self.get("/api/mint/status"), "status")
+            seen.append(status["responding"])
+            self.assertIs(status["responding"], False,
+                          "responding=%r at t=%.2fs; readings: %r"
+                          % (status["responding"],
+                             time.monotonic() - started, seen))
+        self.assertTrue(seen)
+
+    def test_every_route_is_on_one_of_the_two_lists(self):
+        """A route in neither list is a route nobody measured.
+
+        This is the check the old sweep did not have: its name claimed
+        every cause this server determines, its body iterated three
+        hand-picked routes, and the two slowest routes in the product --
+        the one every balance on the screen comes from and the one the
+        handed-over figure comes from -- were in neither the test, the
+        README's timing table nor the limitations list.
+        """
+        measured = {path.split("?")[0] for _m, path, _b, _e in self.BOUND}
+        table = {path for _method, path in gui_app.ROUTES}
+        self.assertEqual(measured | self.UNBOUND, table,
+                         "a route on neither list: %r"
+                         % sorted(table - (measured | self.UNBOUND)))
+        self.assertEqual(measured & self.UNBOUND, set())
+
+    def test_every_bound_route_answers_inside_the_pages_abort(self):
+        """gui/README tells the operator to read ``cause``. It has to arrive.
+
+        page.html aborts a fetch at TIMEOUTS.default and shows its own
+        message instead; a cause computed after that is a documented
+        answer nobody can reach. Measured against a really wedged mint,
+        for every route this server claims to bind -- not a sample of
+        them.
+        """
+        budget = page_abort_ms() / 1000.0
+        for method, path, body, expect in self.BOUND:
+            with self.subTest(path=path):
+                started = time.monotonic()
+                code, obj = self._call(method, path, body)
+                elapsed = time.monotonic() - started
+                self.assertEqual(code, expect, obj)
+                self.assertLess(
+                    elapsed, budget,
+                    "%s %s took %.1fs; the page stops listening at %.1fs"
+                    % (method, path, elapsed, budget))
+                if code >= 400:
+                    self.assertIn(obj["error"]["cause"],
+                                  ("mint_unreachable", "unknown"), obj)
+                    self.assertTrue(obj["error"]["detail"])
+
+    def test_the_balances_on_the_screen_are_marked_incomplete_not_padded(self):
+        """What the bound wallet list actually says when it gives up.
+
+        The deadline is only worth having if the answer under it is
+        honest: a wallet that was not read may not come back as a zero,
+        and the list may not present itself as the whole list. page.html's
+        reconcileSupply() counts a wallet whose balance is not a number as
+        unread and turns every total it feeds into a floor -- which is
+        the rendering this shape is chosen to get.
+        """
+        code, obj = self.get("/api/wallet/list")
+        self.assertEqual(code, 200, obj)
+        self.assertFalse(obj["complete"],
+                         "a partial list presented as the whole list")
+        self.assertEqual(sorted(obj["unread"]), ["alice", "bob"])
+        for row in obj["wallets"]:
+            self.assertIsNone(row["balance_mc"], row)
+            self.assertIsNone(row["coin_count"], row)
+            self.assertFalse(row["connected"], row)
+            self.assertTrue(row["error"], row)
+            self.assertIn("not read", row["error"].lower())
+
+    def test_the_money_routes_are_still_outside_the_budget_and_say_so(self):
+        """The disclosure, measured rather than asserted.
+
+        /api/wallet/quote goes through walletops.py into
+        aicash.wallet.MintClient, whose 30s deadline this server does not
+        set; it cannot be bound the way a read is, because answering by
+        abandoning the worker would mean reporting an outcome for an
+        operation still in flight. So it really does finish after the page
+        has stopped listening, and that is stated in app.py rather than
+        left for an operator to discover. Measured here so the statement
+        cannot rot in either direction: if someone shortens it, this fails
+        and the route moves onto the bound list with the comment.
+        """
+        budget = page_abort_ms() / 1000.0
+        started = time.monotonic()
+        code, obj = self.post("/api/wallet/quote",
+                              {"name": "alice", "amount_mc": 10})
+        elapsed = time.monotonic() - started
+        self.assertIn("/api/wallet/quote", self.UNBOUND)
+        self.assertGreater(
+            elapsed, budget,
+            "quote answered in %.1fs, inside the page's %.1fs abort: it is "
+            "bound after all, and app.py still says it is not" % (elapsed, budget))
+        self.assertGreaterEqual(code, 400, obj)
+        # ...and it is named in the source as unbound, with the reason
+        with open(os.path.join(REPO, "gui", "app.py")) as handle:
+            source = handle.read()
+        head = source[:source.index("PAGE_ABORT_S = ")]
+        self.assertIn("NOT BOUND", head)
+        for path in sorted(self.UNBOUND):
+            self.assertIn(path, head, "%s is unbound and unnamed" % path)
+
+    def test_the_budget_is_arithmetic_not_a_hope(self):
+        """Probe + request has to fit, with the probe now uncached."""
+        control = self.real[0]
+        probe = control.MintControl.probe_timeout_s
+        abort = page_abort_ms() / 1000.0
+        self.assertLess(probe + gui_app.MINT_HTTP_TIMEOUT_S, abort,
+                        "one probe plus one mint request does not fit inside "
+                        "the page's own abort")
+        # ...and the same arithmetic for the routes that do not go through
+        # _mint_http at all, which is where the 64s and 62s reads were.
+        self.assertLess(probe + gui_app.READ_DEADLINE_S, abort,
+                        "one probe plus one whole wallet read does not fit "
+                        "inside the page's own abort")
+
+    def test_this_server_and_the_page_mean_the_same_deadline(self):
+        """app.py sizes its budget from a number page.html owns. It has to
+        be the number page.html actually uses, not a remembered one."""
+        self.assertEqual(gui_app.PAGE_ABORT_S, page_abort_ms() / 1000.0)
+
+
+class TestALiveMintWithNoRecordedPortSaysOneThing(RealMintCase):
+    """The state the last fix opened: alive, and nobody knows where.
+
+    Caused for real, through this server's own HTTP API, against a real
+    mint that was answering normally a second earlier: the supervision
+    record loses its port -- a hand-edited file, a partial restore, a
+    record written by an older release.
+
+    Two defects lived here at once and they pointed in opposite
+    directions. GET /api/mint/status answered {running: true, port: null,
+    responding: null} and page.html draws exactly that as the FULLY
+    HEALTHY mint (its `deaf` test is `responding === false`), green dot,
+    climbing uptime, every money button live, and `last_error` -- the one
+    sentence saying the health is undetermined -- rendered only when the
+    mint is down or deaf, so it never reached the screen. And the very
+    next request, POST /api/wallet/quote, answered 409 mint_stopped, "The
+    mint is not running, so nothing was sent to it": the closed
+    vocabulary's promise about a PROCESS, made about a process this
+    server had just called running, because base_url() tested
+    `running AND base_url` and then reported the failure in the words of
+    `running` alone.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        status, obj = cls.post("/api/wallet/create", {"name": "alice"})
+        assert status == 200, obj
+
+    def setUp(self):
+        self.state_path = os.path.join(self.workdir, "mint-control.json")
+        with open(self.state_path) as handle:
+            self.intact = json.load(handle)
+        self.assertTrue(self.intact.get("port"))
+        self.addCleanup(self._put_the_port_back)
+        damaged = dict(self.intact)
+        damaged.pop("port", None)
+        with open(self.state_path, "w") as handle:
+            json.dump(damaged, handle)
+
+    def _put_the_port_back(self):
+        with open(self.state_path, "w") as handle:
+            json.dump(self.intact, handle)
+
+    def test_the_status_route_and_the_next_request_agree(self):
+        status = self.ok(self.get("/api/mint/status"), "status")
+        self.assertTrue(status["running"], "the process really is alive")
+        self.assertIsNone(status["port"])
+        self.assertIsNone(status["base_url"])
+        code, obj = self.post("/api/wallet/quote",
+                              {"name": "alice", "amount_mc": 10})
+        self.assertGreaterEqual(code, 400, obj)
+        error = obj["error"]
+        # mint_stopped is the claim "the mint is down, so nothing was sent
+        # and nothing can be half-done". Not available about a live pid.
+        self.assertNotEqual(error["cause"], "mint_stopped",
+                            "said the mint is not running about a mint this "
+                            "server had just reported running")
+        self.assertEqual(error["cause"], "mint_unreachable", error)
+        self.assertNotIn("the mint is not running", error["detail"].lower())
+        # ...and it says what is actually wrong, which is more than the
+        # cause promises: nothing was sent at all.
+        self.assertIn("nothing was sent", error["detail"].lower())
+        self.assertIn("port", error["detail"].lower())
+        # the status route has not changed its mind either
+        again = self.ok(self.get("/api/mint/status"), "status again")
+        self.assertTrue(again["running"])
+
+    def test_the_page_cannot_draw_this_mint_healthy(self):
+        """page.html's own predicate, computed off the shipped response."""
+        status = self.ok(self.get("/api/mint/status"), "status")
+        running = bool(status["running"])
+        deaf = running and status["responding"] is False
+        self.assertTrue(deaf,
+                        "page.html would draw the healthy state: %r" % status)
+        # the amber state is the one in which the page prints last_error,
+        # so there has to be something to print
+        self.assertTrue(status["last_error"])
+        self.assertIn("port", status["last_error"].lower())
+        self.assertIn("nothing was sent", status["last_error"].lower())
+
+    def test_every_route_that_needs_the_mint_says_the_same_thing(self):
+        """One state, one story, across the whole panel."""
+        for method, path, body in (
+                ("GET", "/api/mint/descriptor", None),
+                ("POST", "/api/mint/issue", {"amount_mc": 10, "count": 1}),
+                ("GET", "/api/token/status?token=" + "A" * 43, None),
+                ("POST", "/api/wallet/quote",
+                 {"name": "alice", "amount_mc": 10})):
+            with self.subTest(path=path):
+                code, obj = self._call(method, path, body)
+                self.assertGreaterEqual(code, 400, obj)
+                self.assertEqual(obj["error"]["cause"], "mint_unreachable",
+                                 obj)
+
+
+class TestTheFormAndTheSupervisorAgree(unittest.TestCase):
+    """Booting against a workdir some other run left behind.
+
+    mint-control.json is the supervisor's record and is what /api/mint/status
+    is derived from. gui-state.json is this server's own note and only
+    exists if a start went through this server. A workdir can hold the
+    first without the second -- and then the status line named one mint
+    while the Start form beside it defaulted to another.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        try:
+            cls.mintctl = importlib.import_module("gui.mintctl")
+            cls.walletops = importlib.import_module("gui.walletops")
+        except Exception as exc:
+            raise unittest.SkipTest("gui components not importable: %s" % exc)
+        try:
+            import cryptography  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("the mint needs the cryptography package")
+
+    @classmethod
+    def tearDownClass(cls):
+        install_fakes()
+
+    def setUp(self):
+        sys.modules["mintctl"] = self.mintctl
+        sys.modules["walletops"] = self.walletops
+        self.addCleanup(install_fakes)
+        self.workdir = tempfile.mkdtemp(prefix="guileftover-")
+        self.addCleanup(shutil.rmtree, self.workdir, True)
+
+    def _leave_state_behind(self, **settings):
+        """Really run a mint here, really stop it, leave its record.
+
+        Started through MintControl directly, exactly as a mint started
+        from a terminal would be: the supervision file is written, and no
+        gui-state.json is ever created because no request came through
+        app.py.
+        """
+        control = self.mintctl.MintControl(self.workdir)
+        control.start_timeout_s = 20.0
+        self.addCleanup(self._make_sure_it_is_stopped, control)
+        control.start(**settings)
+        control.stop(drain_seconds=3)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.workdir, "mint-control.json")))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.workdir, "gui-state.json")),
+            "this test is only meaningful without this server's own note")
+
+    @staticmethod
+    def _make_sure_it_is_stopped(control):
+        try:
+            control.stop(drain_seconds=2)
+        except Exception:
+            pass
+
+    def test_the_form_shows_the_mint_the_workdir_actually_holds(self):
+        settings = dict(mint_id="leftover-mint",
+                        baseline_model_class="baseline-v1",
+                        port=free_port(), rate_ppm=4200, cap_mc=777,
+                        exempt_below_mc=11)
+        self._leave_state_behind(**settings)
+        api = gui_app.Api(self.workdir)
+        status = api.mint_status()
+        self.assertFalse(status["running"])
+        self.assertEqual(status["mint_id"], "leftover-mint")
+        last = status["last_start"]
+        self.assertIsNotNone(
+            last, "the form was left to fall back on its own defaults")
+        # page.html fills the Start form from last_start when the mint is
+        # not running. It must not name a different mint than the line
+        # above it, and it must not name the page's built-in defaults.
+        self.assertEqual(last["mint_id"], status["mint_id"])
+        self.assertEqual(last["port"], status["port"])
+        self.assertNotEqual(last["mint_id"], "local-test-mint")
+        self.assertNotEqual(last["port"], 8787)
+        # and the economics are the mint's own, not the form's defaults
+        self.assertEqual(last["rate_ppm"], 4200)
+        self.assertEqual(last["cap_mc"], 777)
+        self.assertEqual(last["exempt_below_mc"], 11)
+        self.assertEqual(last["baseline_model_class"], "baseline-v1")
+
+    def test_a_virgin_workdir_still_says_it_knows_nothing(self):
+        """No record is not a licence to invent one."""
+        api = gui_app.Api(self.workdir)
+        status = api.mint_status()
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["mint_id"])
+        self.assertIsNone(status["last_start"])
+        self.assertIsNone(status["responding"])
+        # ...and nothing invented beside it either
+        self.assertIsNone(status["last_start_sources"])
+        self.assertIsNone(status["last_start_ignored_note"])
+
+    def _a_real_note_from_a_real_start(self, **settings):
+        """A gui-state.json written the only way one is ever written.
+
+        A real mint, started through THIS server's own start route in a
+        workdir of its own, then stopped. Returns the path of the note.
+        Nothing here is hand-written: the note is whatever route_mint_start
+        actually records.
+        """
+        other = tempfile.mkdtemp(prefix="guinote-")
+        self.addCleanup(shutil.rmtree, other, True)
+        api = gui_app.Api(other)
+        control = self.mintctl.MintControl(other)
+        control.start_timeout_s = 20.0
+        self.addCleanup(self._make_sure_it_is_stopped, control)
+        api.route_mint_start(None, dict(settings))
+        api.route_mint_stop(None, {"drain_seconds": 3})
+        path = os.path.join(other, "gui-state.json")
+        self.assertTrue(os.path.exists(path), "no note was written")
+        with open(path) as handle:
+            self.assertEqual(json.load(handle)["last_start"]["mint_id"],
+                             settings["mint_id"])
+        return path
+
+    def test_a_note_about_another_mint_does_not_fill_this_ones_form(self):
+        """The composite that named two mints at once, caused for real.
+
+        Both records here are produced by real runs. A real mint is started
+        through this server in ANOTHER workdir, which is what writes a real
+        gui-state.json note; a real, different mint is started and stopped
+        in THIS one, which is what writes mint-control.json. The note is
+        then copied across -- a gui-state.json carried along without the
+        ledger beside it, which is one of the two ways this file's own
+        docstring says the records come apart.
+
+        The form may not be completed out of the other mint's note. Its
+        rate_ppm/cap_mc/exempt_below_mc are that mint's economics, the page
+        prints them as the burn policy "this GUI last started it with" and
+        fills the Start form from them, so pressing Start would create THIS
+        mint with THAT mint's burn policy.
+        """
+        note_settings = dict(mint_id="note-mint",
+                             baseline_model_class="baseline-v1",
+                             port=free_port(), rate_ppm=3300, cap_mc=21,
+                             exempt_below_mc=12)
+        note_path = self._a_real_note_from_a_real_start(**note_settings)
+        held = dict(mint_id="legacy-mint", baseline_model_class="baseline-v1",
+                    port=free_port(), rate_ppm=4200, cap_mc=777,
+                    exempt_below_mc=11)
+        self._leave_state_behind(**held)
+        shutil.copyfile(note_path,
+                        os.path.join(self.workdir, "gui-state.json"))
+
+        api = gui_app.Api(self.workdir)
+        status = api.mint_status()
+        last = status["last_start"]
+        self.assertEqual(last["mint_id"], "legacy-mint")
+        self.assertEqual(last["mint_id"], status["mint_id"])
+        self.assertEqual(last["port"], held["port"])
+        self.assertEqual(last["port"], status["port"])
+        # THIS mint's economics, out of its own record -- never the note's.
+        self.assertEqual(last["rate_ppm"], 4200)
+        self.assertEqual(last["cap_mc"], 777)
+        self.assertEqual(last["exempt_below_mc"], 11)
+        for field in ("rate_ppm", "cap_mc", "exempt_below_mc"):
+            self.assertNotEqual(last[field], note_settings[field], field)
+        # ...and the note that was dropped is reported, not silently gone
+        dropped = status["last_start_ignored_note"]
+        self.assertIsNotNone(dropped, "the note vanished without a word")
+        self.assertEqual(dropped["mint_id"], "note-mint")
+        self.assertIn("legacy-mint", dropped["why"])
+        self.assertIn("note-mint", dropped["why"])
+        # every field says which record it came out of
+        sources = status["last_start_sources"]
+        self.assertEqual(sorted(sources), sorted(last))
+        for field, where in sources.items():
+            self.assertNotIn("note", where.lower(), (field, where))
+
+    def test_this_servers_own_note_still_fills_a_gap(self):
+        """A record that predates the economics is completed, not replaced.
+
+        The supervisor's record here is the shape an OLDER release of
+        mintctl wrote: identity, no argv, so no economics. There is no way
+        to produce a file written by code that no longer exists except to
+        write one, and that is all this test writes -- the note beside it
+        is a real note from a real start, and it is about the SAME mint, so
+        it is the one thing that can honestly complete the form.
+        """
+        port = free_port()
+        note_path = self._a_real_note_from_a_real_start(
+            mint_id="gap-mint", baseline_model_class="baseline-v1",
+            port=port, rate_ppm=3300, cap_mc=21, exempt_below_mc=12)
+        control = self.mintctl.MintControl(self.workdir)
+        with open(control.state_path, "w") as handle:
+            json.dump({"pid": None, "port": port, "mint_id": "gap-mint",
+                       "baseline_model_class": "baseline-v1",
+                       "proc_start_ticks": None, "started_at_ms": 1,
+                       "last_error": None}, handle)
+        shutil.copyfile(note_path,
+                        os.path.join(self.workdir, "gui-state.json"))
+        api = gui_app.Api(self.workdir)
+        status = api.mint_status()
+        last = status["last_start"]
+        # the supervisor knows the identity; the note only fills the rest
+        self.assertEqual(last["mint_id"], "gap-mint")
+        self.assertEqual(last["port"], port)
+        self.assertEqual(last["rate_ppm"], 3300)
+        self.assertEqual(last["cap_mc"], 21)
+        self.assertEqual(last["exempt_below_mc"], 12)
+        self.assertEqual(last["mint_id"], status["mint_id"])
+        self.assertIsNone(status["last_start_ignored_note"])
+        # ...and the object says which half came from where, which is what
+        # makes "the note filled a gap" checkable instead of asserted.
+        sources = status["last_start_sources"]
+        self.assertEqual(sorted(sources), sorted(last))
+        for field in ("mint_id", "port", "baseline_model_class"):
+            self.assertNotIn("note", sources[field].lower(), field)
+        for field in ("rate_ppm", "cap_mc", "exempt_below_mc"):
+            self.assertIn("note", sources[field].lower(), field)
+
+    def test_the_form_and_the_stats_block_cannot_name_two_mints(self):
+        """The guarantee gui/README.md makes, asserted where it is made.
+
+        page.html prints ``mint.mint_id``/``mint.port`` from status() in the
+        stats block and fills the Start form from ``last_start`` -- both are
+        on the screen together, so if the two records ever disagree the
+        operator is looking at two mints. A component whose two answers
+        disagree is not papered over: the status line wins, because that is
+        the one the stats block shows, and ``last_start_sources`` says so
+        in words for that field.
+        """
+        held = dict(mint_id="pinned-mint", baseline_model_class="baseline-v1",
+                    port=free_port(), rate_ppm=4200, cap_mc=777,
+                    exempt_below_mc=11)
+        self._leave_state_behind(**held)
+
+        class TwoAnswers:
+            """A supervisor that contradicts itself, which is the only way
+            these two fields can differ for a real MintControl -- it derives
+            both from mint-control.json under one lock."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def recorded_start(self):
+                out = dict(self._inner.recorded_start())
+                out["mint_id"] = "some-other-mint"
+                out["port"] = 65001
+                return out
+
+        api = gui_app.Api(self.workdir)
+        api.components._mint = TwoAnswers(
+            self.mintctl.MintControl(self.workdir))
+        status = api.mint_status()
+        last = status["last_start"]
+        self.assertEqual(status["mint_id"], "pinned-mint")
+        self.assertEqual(last["mint_id"], status["mint_id"])
+        self.assertEqual(last["port"], status["port"])
+        for field in ("mint_id", "port"):
+            self.assertIn("status line", status["last_start_sources"][field])
+            self.assertIn("disagreement",
+                          status["last_start_sources"][field])
+        self.assertIn("some-other-mint",
+                      status["last_start_sources"]["mint_id"])

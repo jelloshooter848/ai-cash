@@ -179,12 +179,24 @@ other IN THE SAME INSTANT without either being wrong::
 
     THE HANDED-OVER QUESTION — unredeemed_payments()
         "Of the value this wallet has already paid out, what has nobody
-        redeemed yet?"  Looks at COMMITTED payments (wallet_tokens in
-        state handed_over) and asks the mint which strings are still
-        unspent.  It does NOT look at operations that never finished, and
-        finding value here is NOT a sign that anything is broken: a
-        payment that was made ten seconds ago and not yet redeemed is
-        listed, and so is one that was delivered and simply not spent.
+        redeemed yet?"  Looks at COMMITTED payments (every output in role
+        ``payment`` of a ``wallet_ops`` row in state ``done``, whatever
+        the output's own state is now) and asks the mint which strings
+        are still unspent.  It does NOT look at operations that never
+        finished, and finding value here is NOT a sign that anything is
+        broken: a payment that was made ten seconds ago and not yet
+        redeemed is listed, and so is one that was delivered and simply
+        not spent.
+
+        IT REPORTS TWO NUMBERS, NOT ONE, and the distinction is the whole
+        point: ``amount_mc`` is what the payment handed over and is fixed
+        for good at the instant it committed; ``live_mc`` / ``retired_mc``
+        / the per-string states are how much of that is still unredeemed,
+        and those move.  Reporting the second under the first's name made
+        an old payment's amount shrink whenever a later operation touched
+        one of its strings, while ``history()`` went on printing the
+        original figure — one payment, two amounts, and the moving one
+        wearing the permanent one's name.
 
     THE IN-FLIGHT QUESTION — recover()
         "Did this wallet start an operation that never got an answer?"
@@ -369,9 +381,15 @@ The wallet store has exactly two tables and neither has a clock column::
   the per-recipient split is not recoverable.
 * There is **no counterparty information anywhere** — not who paid us, not
   who we paid.  ``detail`` can only describe amounts.
-* A payment that was handed over is terminal in the store.  Whether the
-  payee actually redeemed it is not knowable locally; a refusal appears
-  only as a separate later ``refused`` op.
+* Whether the payee actually redeemed a payment is not knowable locally;
+  a refusal appears only as a separate later ``refused`` op.  Nor is a
+  payment output's store row terminal: ``handed_over`` becomes
+  ``spent_out`` the moment this wallet pastes a copy back and the mint
+  declines to credit it, and ``Wallet.recover()`` settles a pay op the
+  transport stranded by putting its outputs in the SPENDABLE pool
+  (``confirmed``) -- strings ``pay()`` never returned to anybody.
+  ``unredeemed_payments()`` is where those two are untangled; a state
+  filter over these rows is not, and was the round-6 defect.
 * Operator issuance (``/admin/issue``) is not a wallet operation, so money
   arriving from the mint operator shows up only as the ``receive`` that
   redeemed it.
@@ -420,23 +438,53 @@ are the exact shapes a caller may rely on)
                   Answers THE IN-FLIGHT QUESTION and not the other one —
                   see "two questions" above.
 ``unredeemed_payments()`` (``outstanding_payments()`` is the old name)
-               -> ``{"checked": bool, "mint_id": str, "payments":
+               -> ``{"checked": bool, "mint_id": str,
+                  "handed_over_mc": int, "unspent_mc": int,
+                  "spent_mc": int, "unstated_mc": int,
+                  "unchecked_mc": int, "unaccounted_mc": int,
+                  "unredeemed_mc": int|None, "payments":
                   [{"op_id": str, "amount_mc": int, "live_mc": int|None,
+                  "retired_mc": int, "unaccounted_mc": int,
                   "recipient": str, "recipient_kind": str,
                   "delivery": str, "delivery_cause": str,
                   "delivery_attempt": str,
                   "tokens": [{"token": str, "amount_mc": int, "key": str,
-                  "state": "unspent"|"spent"|"unknown"|None}]}]}``,
-                  newest first.  The five record fields are read from the
+                  "state": "unspent"|"spent"|"unknown"|None,
+                  "store_state": str}]}]}``,
+                  newest first.  ``amount_mc`` is what that payment handed
+                  over — fixed when it committed, identical to the figure
+                  ``history()`` prints for the same op_id, and it never
+                  moves again.  The TOTALS are over the payments listed
+                  and they add up::
+
+                      handed_over_mc == unspent_mc + spent_mc
+                                        + unstated_mc + unchecked_mc
+                                        + unaccounted_mc
+
+                  ``unaccounted_mc`` is the named residual — handed-over
+                  value this module could put in none of the four boxes.
+                  It is 0 on every path; it is a field rather than an
+                  assumption so that a scan which ever drops value shows a
+                  gap instead of a smaller total.  ``unredeemed_mc`` is
+                  ``unspent_mc`` when every string in the report carries
+                  the mint's own word and ``None`` otherwise.  The five
+                  record fields are read from the
                   payment record beside the store and are ``""`` /
                   ``"unknown"`` for a payment nothing was recorded for.
-                  FOUR keys per token, ``key`` included:
+                  FIVE keys per token, ``key`` and ``store_state``
+                  included.  ``store_state`` is from STORE_STATES and is
+                  THIS WALLET's word about the string (``handed_over`` /
+                  ``spent_out`` / ``confirmed``), never the mint's;
+                  ``retired_mc`` sums the ``spent_out`` ones, which is the
+                  part of a payment this wallet knows is dead WITHOUT
+                  asking the mint.  ``key``:
                   it is the ledger key (a hash, not a secret), it is what
                   identifies a row whose ``token`` could not be rendered,
                   and it is what was sent to ``/v3/status``.  The HTTP
-                  route in ``gui/app.py`` drops it — a browser has no use
-                  for it — so the wire shape there is the three-key one;
-                  a Python caller gets four.  ``state`` is ``None`` when
+                  route in ``gui/app.py`` drops it, and ``store_state``
+                  with it — a browser has no use for either — so the wire
+                  shape there is the three-key one; a Python caller gets
+                  five.  ``state`` is ``None`` when
                   the mint could not be asked.  ``live_mc`` is an int only
                   when EVERY string in that payment carries ``unspent`` or
                   ``spent``; it is ``None`` whenever any is ``unknown``
@@ -1043,6 +1091,28 @@ def _outcome_for(cause: str) -> str:
     """
     return "unknown" if _clean_cause(cause) in _UNDETERMINED_DELIVERY \
         else "undelivered"
+
+
+#: What a payment output's own row in the wallet store may say about it.
+#: The STORE's word, never the mint's -- see ``unredeemed_payments()``.
+#: ``handed_over`` it left and nothing local contradicts that;
+#: ``spent_out`` this wallet has RETIRED its copy -- ``_mark_dead_if_ours``
+#: fires when the mint consumed the string AND when the mint answered
+#: ``unknown`` ("no entry on the ledger I am keeping"), so it means "this
+#: wallet will not offer this again", never "this value is dead";
+#: ``confirmed`` ``Wallet.recover()`` settled a stranded pay op and put
+#: the output back in the spendable pool -- strings ``pay()`` never
+#: returned, so that payment handed nothing over and is reported under
+#: ``recovered_mc`` rather than as money somebody else is holding.  A
+#: state this build does not know reads ``""`` -- unrecognised, not
+#: reinterpreted.
+STORE_STATES = ("handed_over", "spent_out", "confirmed", "pending", "orphan")
+
+
+def _clean_store_state(value) -> str:
+    """Coerce into STORE_STATES.  Anything else is ``""`` (unrecognised)."""
+    text = str(value or "").strip()
+    return text if text in STORE_STATES else ""
 
 
 def _clean_attempt(value) -> str:
@@ -2458,23 +2528,140 @@ class WalletOps:
     def unredeemed_payments(self, *, limit: int = 20) -> dict:
         """THE HANDED-OVER QUESTION: what has nobody redeemed yet?
 
-        Of the value this wallet has ALREADY PAID OUT, which strings does
-        the mint still call unspent — and, from the payment record beside
-        the store, who was each payment meant for and what became of the
-        delivery.  Listed newest first, whether or not anything went
-        wrong: value appearing here is not a sign of a failure, it is the
-        ordinary state of a payment between being handed over and being
-        redeemed.
+        TWO DIFFERENT QUESTIONS, AND THE ONE THAT USED TO OVERWRITE THE
+        OTHER.  "How much did this payment hand over" is a fact fixed at
+        the instant the exchange committed and it never changes again.
+        "How much of that is still unredeemed" changes every time somebody
+        redeems a string.  This report answers BOTH, in separate fields,
+        because a build that answered the second under the first's name
+        made an earlier payment's amount shrink when a LATER, unrelated
+        operation touched one of its strings::
 
-        WHAT "LISTED" MEANS, precisely -- the loose version of this
-        sentence said "every payment this wallet committed", and the query
-        below does not say that.  The rows come from outputs still in
-        state ``handed_over``, which IS every committed payment in
-        ordinary use: a paid-out token stays ``handed_over`` for good,
-        whether the recipient redeems it or not.  The exception is an
-        output this same wallet later took back in through ``receive()``,
-        which is no longer handed over and so is not reported here.
-        ``history()`` lists the payment either way.
+            alice.pay(300)                     # three 100 mc strings
+            bob.receive(two of them)           # the payee redeems two
+            alice.receive(those same two)      # pasted back by mistake
+
+        The last line rejects both strings (already spent) and, on the way
+        through, ``Wallet._mark_dead_if_ours`` retires this wallet's own
+        copies from ``handed_over`` to ``spent_out``.  A report that
+        listed only ``handed_over`` rows then said this payment was 100 mc
+        while ``history()`` -- reading the same table without the state
+        filter -- still said 300 mc.  Same payment, same op_id, same
+        instant, two amounts, and the one that moved was the one
+        ``gui/README.md`` calls the permanent record of where the money
+        went.  ``amount_mc`` here is that permanent figure, read the way
+        ``history()`` reads it, so the two views cannot disagree.
+
+        WHAT IS LISTED: payments that ACTUALLY HANDED STRINGS OVER --
+        every ``wallet_ops`` row in state ``done`` whose role ``payment``
+        outputs were returned by ``pay()`` -- with EVERY string that
+        payment produced whatever the store now says about each one.
+        Order is the ones the store still calls outstanding and then the
+        ones it has retired in full, each half newest first; that is the
+        window rule below, and it is reading order too.  Not only the unredeemed ones: a payment whose every
+        string the mint calls ``spent`` is still here with ``live_mc: 0``,
+        and so is one this wallet took back in through ``receive()``.
+
+        AND WHAT IS DELIBERATELY NOT LISTED, because it is not handed-over
+        money at all: a pay op the transport stranded and ``recover()``
+        later settled.  ``WalletOps.pay()`` re-raises in that case without
+        returning a single string and without writing a payment record --
+        nobody outside this wallet file ever saw those secrets -- and
+        ``Wallet.recover()`` then puts the outputs back in the SPENDABLE
+        pool (``state='confirmed'``, impl/aicash/wallet.py).  They are in
+        ``summary()["balance_mc"]``, and counting them here as well told
+        an operator that 5,000 mc was in somebody else's hands AND in
+        their own balance, against a mint whose signed supply snapshot
+        only ever knew about one of them.  Their value is reported under
+        its own name instead -- ``recovered_mc``, with ``recovered_ops``
+        naming the op_ids, which is what lets a reader match the ``pay``
+        rows ``history()`` prints for them against a report that hands
+        over nothing.  TWO independent marks identify such an op and
+        either is enough: this module's own cause row, written against the
+        op at the instant ``pay()`` raised (``walletops_op_causes``), and
+        a role ``payment`` output sitting in ``confirmed``, a state
+        ``_resolve_success`` can never produce for a payment output.
+
+        WHERE THAT IS IMPRECISE, stated rather than left to be found: the
+        cause row is written by THIS module, so a pay stranded by some
+        other tool driving the same wallet file leaves none.  While such
+        an op's recovered coins are still in the pool the ``confirmed``
+        mark still catches it; once they have been spent again every trace
+        is gone and this reports the op as a payment that handed its value
+        over.  The error is bounded to that: those outputs are then
+        ``spent_out``, the mint calls them ``spent``, so they inflate the
+        historical ``handed_over_mc`` and can never inflate
+        ``unspent_mc``, ``unredeemed_mc`` or the reconciliation against
+        the mint's supply.  The direction is deliberate -- exclusion
+        requires positive evidence, because a total that hides money the
+        wallet really did hand over is the worse failure and was the
+        round-5 defect.
+
+        THE DECOMPOSITION ADDS UP, AND SAYS SO, IN TWO STEPS.  Over the
+        WHOLE wallet::
+
+            handed_over_mc == listed_mc + unlisted_mc
+
+        and over the payments actually LISTED::
+
+            listed_mc == unspent_mc + spent_mc + unstated_mc
+                         + unchecked_mc + unaccounted_mc
+
+        ``handed_over_mc`` is the whole-life total: it is the value this
+        wallet handed to other people, it is not windowed by ``limit``,
+        and it never shrinks.  ``unaccounted_mc`` is the residual: value
+        this module knows was handed over and could not put in any of the
+        four boxes.  It is 0 in every path here, and it exists NAMED so
+        that a future change which drops strings from the per-string scan
+        shows up as a gap an operator can see rather than as a smaller
+        total they cannot.  The same identity holds per payment, where the
+        residual is that payment's ``unaccounted_mc``.
+
+        ``limit`` WINDOWS THE LIST AND THE WINDOW IS DECLARED.  ``limit``
+        is a number of PAYMENT OPERATIONS; ``payment_count`` is how many
+        this wallet has, ``truncated`` says the list is short of that, and
+        ``unlisted_mc`` is the handed-over value that did not fit.  An
+        earlier build published the windowed total under the name
+        ``handed_over_mc`` with no truncation marker at all, so a wallet
+        that had paid 101 times answered "nothing unredeemed" over money
+        the mint called unspent.  Two things stop that here.  First, the
+        window is spent on money that can still be live: payments with at
+        least one string still in ``handed_over`` are taken FIRST, newest
+        first, and only then is the rest of the window filled with the
+        newest payments the store has already retired in full -- a
+        hundred dead payments can no longer push a live one out.  Second,
+        ``unredeemed_mc`` is ``None`` -- never a confident 0 -- whenever
+        outstanding value did not fit (``unlisted_outstanding_mc``).
+
+        Retired value that did not fit cannot be unredeemed, and that is
+        an argument rather than an assumption: every path that writes
+        ``spent_out`` (``Wallet._mark_dead_if_ours``, and ``recover()``'s
+        settlement) runs only after THIS mint has consumed the string or
+        refused it, and no path anywhere returns a string from
+        ``spent_out`` to ``handed_over``.
+
+        PER-TOKEN THERE ARE TWO WORDS FOR TWO WITNESSES.  ``state`` is the
+        MINT's, from §3.4 ``/v3/status``, and is ``None`` when the mint
+        could not be asked.  ``store_state`` is THIS WALLET's own row --
+        ``handed_over`` (it left, nothing local says otherwise) or
+        ``spent_out`` (this wallet has RETIRED its copy).  They are kept
+        apart because they fail differently: the mint's word is
+        authoritative and unavailable when it is down, the store's word is
+        always readable and only ever second-hand.
+
+        ``retired_mc`` sums the ``spent_out`` ones, and it is a fact about
+        THIS STORE, not a verdict on the money.  ``Wallet``'s retirement
+        rule is "the mint would not credit this wallet with the string" --
+        it fires when the mint consumed it AND when the mint answered
+        ``unknown``, which means "no entry on the ledger I am keeping",
+        not "consumed".  Point a wallet at a mint whose database has been
+        replaced and its own strings are retired while remaining perfectly
+        alive on the original ledger; the report says so in the same
+        breath, because those strings then read ``state: "unknown"`` and
+        land in ``unstated_mc`` with ``unredeemed_mc`` ``None``.  So:
+        ``retired_mc`` is "this wallet will not offer these again", it is
+        NOT "this value is dead", and it is deliberately outside the
+        mint's four-way decomposition rather than a fifth box in it.
 
         WHAT IT DOES NOT ANSWER: whether any operation is in flight.  An
         op the mint never answered about is ``recover()``'s business, is
@@ -2486,31 +2673,35 @@ class WalletOps:
 
         THE ANSWER TO "the only copy is in a DOM node".  It is not: every
         payment output was written to this wallet file, secret included,
-        before the exchange was sent (§5.1), and is still there in state
-        ``handed_over``.  This rebuilds the exact strings ``pay()``
-        returned, so a reload, a closed tab or a delivery that failed
-        halfway does not destroy money — see the module docstring for why
-        no new file is written to achieve that.
-
-        ``handed_over`` means "this left the wallet", NOT "nobody redeemed
-        it".  Only the mint knows which, so when it answers, every string
-        is checked against §3.4 ``/v3/status`` and reported ``unspent``
-        (still live), ``spent`` (the payee took it) or ``unknown`` (no
-        ledger entry — a different mint's database).  With the mint down
-        the strings still come back with ``checked: False`` and ``state:
-        None``: an unchecked string is not claimed to be money, and it is
-        not claimed to be dead either.
+        before the exchange was sent (§5.1), and is still there.  This
+        rebuilds the exact strings ``pay()`` returned, so a reload, a
+        closed tab or a delivery that failed halfway does not destroy
+        money -- see the module docstring for why no new file is written
+        to achieve that.
 
         AND ``checked`` IS NOT "every state is known": it says the mint
         ANSWERED.  A payment read while a DIFFERENT mint answers on that
         address comes back checked with every string ``unknown``, so
-        ``live_mc`` is ``None`` there rather than ``0`` — 0 would be a
+        ``live_mc`` is ``None`` there rather than ``0`` -- 0 would be a
         confident claim about money this same report calls undetermined
-        one field away.
+        one field away.  ``unredeemed_mc`` obeys the same rule one level
+        up: an int only when every string in the whole report carries the
+        mint's own word AND no outstanding payment was left out of the
+        window, ``None`` otherwise, with ``unspent_mc`` and the other
+        three always present so a report that cannot give the total still
+        says exactly what it does know.
 
-        ``limit`` is a number of PAYMENT OPERATIONS, newest first.
+        WHAT A RE-SERIALISING CALLER MUST CARRY.  ``gui/app.py`` rebuilds
+        the four mint figures by summing the per-token states of the
+        payments it forwards, which is the right rule for the payments it
+        can see and is NOT the rule for a windowed report: a caller that
+        totals the rows must publish ``truncated`` and
+        ``unlisted_outstanding_mc`` beside them, or drop its own headline
+        to ``None`` when they are set, exactly as this does.  The window
+        is only ever short of the whole wallet when more payments than
+        ``limit`` still have strings in ``handed_over``.
 
-        It hands out live secrets — the only method here that does — so a
+        It hands out live secrets -- the only method here that does -- so a
         caller must treat the result as money, not as a report.  What that
         widens is stated in ``gui/app.py``'s route: a payment already
         delivered but not yet redeemed can be read back and re-spent by
@@ -2522,46 +2713,64 @@ class WalletOps:
                 "bad request", f"limit must be a positive int, got {limit!r}",
                 "unknown")
         with self._entered():
-            rows = self._read(
-                "SELECT t.op_id, t.secret, t.amount_mc, t.key, o.request_json"
-                " FROM wallet_tokens t JOIN wallet_ops o ON o.op_id = t.op_id"
-                " WHERE t.state = 'handed_over' AND t.role = 'payment'"
-                " ORDER BY o.rowid DESC, t.key",
-                (),
-                "outstanding",
-            )
+            scan = self._payment_rows(limit)
             payments: list[dict] = []
-            by_op: dict = {}
             fallback_mint_id = None     # read from the store at most once
-            for op_id, secret, amount_mc, key, request_json in rows or ():
-                if op_id not in by_op:
-                    if len(by_op) >= limit:
-                        continue
-                    by_op[op_id] = {"op_id": op_id, "amount_mc": 0,
-                                    "live_mc": None, "tokens": [],
-                                    "_mint_id": _plan_mint_id(request_json)}
-                    payments.append(by_op[op_id])
-                entry = by_op[op_id]
-                if not entry["_mint_id"] and fallback_mint_id is None:
+            for op_id in scan["order"]:
+                plan_mint_id = _plan_mint_id(scan["plan_by_op"].get(op_id))
+                if not plan_mint_id and fallback_mint_id is None:
                     fallback_mint_id = self._known_mint_id()
-                mint_id = entry["_mint_id"] or fallback_mint_id
-                try:
-                    token = format_token(
-                        mint_id, int(amount_mc),
-                        b64u_decode(str(secret), expect_len=32))
-                except (TokenError, ValueError, TypeError):
-                    # A row this build cannot render is reported as a row it
-                    # cannot render, not silently dropped: money the operator
-                    # cannot see is worse than a gap they can.
+                mint_id = plan_mint_id or fallback_mint_id
+                entry = {"op_id": op_id,
+                         # THE PERMANENT FIGURE: what this payment handed
+                         # over, summed over every output it created
+                         # whatever became of it since.  Exactly what
+                         # history() prints for the same op_id.
+                         "amount_mc": scan["paid_by_op"].get(op_id, 0),
+                         # ...and how much of it the store still believes
+                         # is in somebody else's hands.  This one moves.
+                         "outstanding_mc": scan["out_by_op"].get(op_id, 0),
+                         "live_mc": None, "retired_mc": 0,
+                         "unaccounted_mc": 0, "tokens": []}
+                for secret, amount_mc, key, store_state in scan[
+                        "rows_by_op"].get(op_id, ()):
+                    amount = int(amount_mc or 0)
+                    store_state = _clean_store_state(store_state)
+                    try:
+                        token = format_token(
+                            mint_id, amount,
+                            b64u_decode(str(secret), expect_len=32))
+                    except (TokenError, ValueError, TypeError):
+                        # A row this build cannot render is reported as a
+                        # row it cannot render, not silently dropped: money
+                        # the operator cannot see is worse than a gap they
+                        # can.  Its VALUE still counts, so the
+                        # decomposition below stays whole.
+                        token = ""
                     entry["tokens"].append(
-                        {"token": "", "amount_mc": int(amount_mc or 0),
-                         "key": str(key), "state": None})
-                    entry["amount_mc"] += int(amount_mc or 0)
-                    continue
-                entry["tokens"].append(
-                    {"token": token, "amount_mc": int(amount_mc or 0),
-                     "key": str(key), "state": None})
-                entry["amount_mc"] += int(amount_mc or 0)
+                        {"token": token, "amount_mc": amount,
+                         "key": str(key), "state": None,
+                         "store_state": store_state})
+                    if store_state == "spent_out":
+                        entry["retired_mc"] += amount
+                # The residual, per payment: value the grouped sum says
+                # this payment handed over that the per-string scan did
+                # not produce a row for.  Structurally 0 -- both come off
+                # ONE read transaction over the same table (see
+                # _payment_rows) -- and named anyway, because the defect
+                # this method was rewritten for was exactly a total that
+                # shrank without a field to say so.  What it can really
+                # catch is this module dropping rows, which is how the
+                # defect happened; it is not a guard against a concurrent
+                # writer, because the snapshot already excludes one.
+                # NOT clamped at 0: a scan that produced MORE than the
+                # grouped sum is as much a defect as one that produced
+                # less, and folding either direction away is the move
+                # this method was rewritten to stop.
+                entry["unaccounted_mc"] = (
+                    entry["amount_mc"]
+                    - sum(t["amount_mc"] for t in entry["tokens"]))
+                payments.append(entry)
             checked = self._check_spent(payments)
             # WHO each payment was for and what became of the delivery,
             # from the record beside the store and keyed by the same op_id
@@ -2569,8 +2778,11 @@ class WalletOps:
             # the same words history() uses for it: the two views of one
             # payment must not be able to say different things.
             records = self._journal.records([p["op_id"] for p in payments])
+            by_state = {"unspent": 0, "spent": 0, "unknown": 0, None: 0}
+            listed_mc = 0
+            listed_outstanding_mc = 0
+            unaccounted_mc = 0
             for entry in payments:
-                entry.pop("_mint_id", None)
                 record = records.get(entry["op_id"]) or _NO_RECORD
                 entry["recipient"] = record["recipient"]
                 entry["recipient_kind"] = record["recipient_kind"]
@@ -2591,11 +2803,172 @@ class WalletOps:
                     entry["live_mc"] = sum(
                         t["amount_mc"] for t in entry["tokens"]
                         if t["state"] == "unspent")
+                listed_mc += entry["amount_mc"]
+                listed_outstanding_mc += entry["outstanding_mc"]
+                unaccounted_mc += entry["unaccounted_mc"]
+                for token in entry["tokens"]:
+                    by_state[token["state"]] += token["amount_mc"]
+            # ``complete`` is the same rule ``live_mc`` uses, one level up:
+            # every string in the whole report carries the mint's own word.
+            complete = (checked and not by_state["unknown"]
+                        and not by_state[None])
+            # Value the window left out, split so that the half which
+            # could still be live is visible on its own.  A non-zero
+            # ``unlisted_outstanding_mc`` is the only thing that can turn
+            # a complete report's ``unredeemed_mc`` into None, and it is
+            # published so a caller can say WHY rather than guess from
+            # len(payments).
+            unlisted_mc = scan["handed_over_mc"] - listed_mc
+            unlisted_outstanding_mc = (scan["outstanding_mc"]
+                                       - listed_outstanding_mc)
             return {
                 "checked": checked,
                 "mint_id": self._known_mint_id(),
+                # The identity, and it is asserted by test_walletops.py
+                # over a randomised sequence of payments, redemptions and
+                # re-pastes:
+                #   handed_over_mc == listed_mc + unlisted_mc
+                #   listed_mc      == unspent + spent + unstated
+                #                     + unchecked + unaccounted
+                # WHOLE-LIFE, never windowed: what this wallet has handed
+                # to other people, all of it.
+                "handed_over_mc": scan["handed_over_mc"],
+                # How many payments that is, and how much of it this
+                # report actually lists.
+                "payment_count": scan["payment_count"],
+                "listed_mc": listed_mc,
+                "unlisted_mc": unlisted_mc,
+                "unlisted_outstanding_mc": unlisted_outstanding_mc,
+                "truncated": len(payments) < scan["payment_count"],
+                "unspent_mc": by_state["unspent"],
+                "spent_mc": by_state["spent"],
+                # The mint answered and has NO LEDGER ENTRY for these --
+                # a different mint's database, most often.
+                "unstated_mc": by_state["unknown"],
+                # The mint was not asked, or answered about only some.
+                "unchecked_mc": by_state[None],
+                # Handed over and in none of the four boxes above.  0
+                # everywhere this module can reach; a non-zero here is a
+                # bug in this method, said out loud rather than absorbed.
+                "unaccounted_mc": unaccounted_mc,
+                # The one number that answers "how much of what this
+                # wallet paid out is still unredeemed", and None unless
+                # every string carries a definite state AND every
+                # outstanding payment fitted in the window.
+                "unredeemed_mc": (by_state["unspent"]
+                                  if complete and not unlisted_outstanding_mc
+                                  else None),
+                # NOT handed over and NOT in the four boxes: pay ops that
+                # returned no string to anybody and that recover() put
+                # back in the spendable pool.  This value is inside
+                # summary()["balance_mc"]; adding it to the figures above
+                # would count the same coins twice, which is precisely
+                # what an operator reading both screens must not be made
+                # to do.
+                "recovered_mc": scan["recovered_mc"],
+                "recovered_ops": scan["recovered_ops"],
                 "payments": payments,
             }
+
+    def _payment_rows(self, limit: int) -> dict:
+        """What the STORE says about this wallet's payments, in one read.
+
+        TWO queries inside ONE explicit read transaction (``BEGIN`` ...
+        ``COMMIT`` around both, see ``_ro_snapshot``), and deliberately
+        two rather than one: the first is the GROUPED sum per payment op
+        -- the identical arithmetic ``history()`` runs through
+        ``_outputs_by_op`` -- and the second is the per-string scan the
+        report's token list is built from.  The transaction is what makes
+        that "one snapshot" rather than two: a plain sqlite3 connection
+        opens NO transaction for a SELECT, so without the ``BEGIN`` each
+        statement reads whatever is committed at the moment it runs and a
+        writer between them would shift the parts out from under the
+        total.  Reading the total and the parts from one snapshot by two
+        different routes is what makes ``unaccounted_mc`` a cross-check on
+        this module's own scan instead of noise.
+
+        Selection is ``wallet_ops.state = 'done'`` and role ``payment``,
+        with NO filter on the token's own state -- that filter was the
+        original defect -- MINUS the ops that handed nothing over (see
+        ``unredeemed_payments``).  The whole-wallet totals are computed
+        over every such op; ``limit`` windows only the list, and spends
+        the window on payments that still have a string in
+        ``handed_over`` before it spends it on payments the store has
+        already retired in full.  A store that does not exist yields the
+        empty scan, which is "this wallet has never paid anybody" and not
+        an error.
+        """
+        scan = {"order": [], "paid_by_op": {}, "plan_by_op": {},
+                "out_by_op": {}, "rows_by_op": {},
+                "handed_over_mc": 0, "outstanding_mc": 0,
+                "payment_count": 0, "recovered_mc": 0, "recovered_ops": []}
+        with self._store_errors("outstanding"):
+            conn = self._connect_ro()
+            if conn is None:
+                return scan
+            try:
+                with _ro_snapshot(conn):
+                    # Ops this module recorded a failure against: pay()
+                    # raised, so no string was returned to any caller.
+                    # Read first, inside the same snapshot as the sums.
+                    stranded = _stranded_ops(conn)
+                    handed: list = []
+                    for (op_id, paid, outstanding, any_confirmed,
+                         request_json) in conn.execute(
+                        "SELECT t.op_id, COALESCE(SUM(t.amount_mc), 0),"
+                        " COALESCE(SUM(CASE WHEN t.state = 'handed_over'"
+                        "  THEN t.amount_mc END), 0),"
+                        " MAX(CASE WHEN t.state = 'confirmed'"
+                        "  THEN 1 ELSE 0 END),"
+                        " o.request_json FROM wallet_tokens t"
+                        " JOIN wallet_ops o ON o.op_id = t.op_id"
+                        " WHERE t.role = 'payment' AND o.state = 'done'"
+                        " GROUP BY t.op_id ORDER BY o.rowid DESC",
+                    ).fetchall():
+                        op_id = str(op_id)
+                        paid = int(paid or 0)
+                        if any_confirmed or op_id in stranded:
+                            # Never handed over: recover() settled a pay
+                            # op whose strings pay() never returned.  Its
+                            # value is in the balance, so it is reported
+                            # under its own name and nowhere else.
+                            scan["recovered_mc"] += paid
+                            scan["recovered_ops"].append(
+                                {"op_id": op_id, "amount_mc": paid})
+                            continue
+                        handed.append((op_id, paid, int(outstanding or 0),
+                                       request_json))
+                    scan["payment_count"] = len(handed)
+                    scan["handed_over_mc"] = sum(h[1] for h in handed)
+                    scan["outstanding_mc"] = sum(h[2] for h in handed)
+                    # The window, live money first.  Both halves stay
+                    # newest-first; what changes is that a payment the
+                    # store has fully retired can no longer displace one
+                    # the mint may still call unspent.
+                    chosen = ([h for h in handed if h[2] > 0]
+                              + [h for h in handed if h[2] == 0])[:limit]
+                    for op_id, paid, outstanding, request_json in chosen:
+                        scan["order"].append(op_id)
+                        scan["paid_by_op"][op_id] = paid
+                        scan["out_by_op"][op_id] = outstanding
+                        scan["plan_by_op"][op_id] = request_json
+                    order = scan["order"]
+                    for start in range(0, len(order), _SQL_CHUNK):
+                        chunk = order[start:start + _SQL_CHUNK]
+                        marks = ",".join("?" * len(chunk))
+                        for (op_id, secret, amount_mc, key,
+                             state) in conn.execute(
+                            "SELECT op_id, secret, amount_mc, key, state FROM"
+                            f" wallet_tokens WHERE role = 'payment' AND op_id"
+                            f" IN ({marks}) ORDER BY key",
+                            tuple(chunk),
+                        ).fetchall():
+                            scan["rows_by_op"].setdefault(
+                                str(op_id), []).append(
+                                    (secret, amount_mc, key, state))
+            finally:
+                conn.close()
+        return scan
 
     def outstanding_payments(self, *, limit: int = 20) -> dict:
         """The OLD NAME for ``unredeemed_payments()``.  Same answer.
@@ -2695,9 +3068,12 @@ class WalletOps:
         the closed set listed in the module docstring; ``amount_mc`` is
         always a non-negative magnitude, direction lives in ``kind``.
 
-        Reads the store READ-ONLY over ONE connection, so the page a
-        caller gets is one consistent snapshot even if the wallet is being
-        written to at the same time.  Raises rather than returning ``[]``
+        Reads the store READ-ONLY inside ONE explicit read transaction
+        (``_ro_snapshot``), so the page a caller gets is one consistent
+        snapshot even if the wallet is being written to at the same time.
+        The transaction is what buys that: a plain sqlite3 connection
+        opens none of its own for a SELECT, so "one connection" alone
+        would be several snapshots.  Raises rather than returning ``[]``
         when the store cannot be read: "no activity" and "unreadable" are
         not the same answer.
         """
@@ -2713,16 +3089,20 @@ class WalletOps:
                 if conn is None:
                     return []
                 try:
-                    ops = conn.execute(
-                        "SELECT op_id, kind, state, request_json FROM"
-                        " wallet_ops ORDER BY rowid DESC LIMIT ?",
-                        (limit,),
-                    ).fetchall()
-                    if not ops:
-                        return []
-                    op_ids = [o[0] for o in ops]
-                    out_by_op = _outputs_by_op(conn, op_ids)
-                    causes = _causes_by_op(conn, op_ids)
+                    # THREE queries, ONE read transaction -- see
+                    # _ro_snapshot for why the transaction is what makes
+                    # "one snapshot" true of a sqlite3 connection.
+                    with _ro_snapshot(conn):
+                        ops = conn.execute(
+                            "SELECT op_id, kind, state, request_json FROM"
+                            " wallet_ops ORDER BY rowid DESC LIMIT ?",
+                            (limit,),
+                        ).fetchall()
+                        if not ops:
+                            return []
+                        op_ids = [o[0] for o in ops]
+                        out_by_op = _outputs_by_op(conn, op_ids)
+                        causes = _causes_by_op(conn, op_ids)
                 finally:
                     conn.close()
             # A second file, so a second read — deliberately AFTER the
@@ -2763,6 +3143,61 @@ def _outputs_by_op(conn, op_ids: list) -> dict:
         for op_id, role, total in rows:
             out.setdefault(op_id, {})[str(role)] = int(total or 0)
     return out
+
+
+@contextlib.contextmanager
+def _ro_snapshot(conn):
+    """Hold ONE read transaction across several statements on ``conn``.
+
+    A plain ``sqlite3.Connection`` opens NO transaction for a SELECT, so
+    two SELECTs on one connection are two independent reads: demonstrated
+    by committing from another connection between them and watching the
+    second answer change.  Every method here that reads a total by one
+    route and its parts by another depends on both seeing the same bytes,
+    so the transaction is opened explicitly and closed again immediately.
+
+    ``BEGIN`` is DEFERRED: it takes no lock until the first read and holds
+    a SHARED lock only until ``COMMIT``.  THE COST, stated because it is
+    real: this store is in rollback-journal mode, where a held read lock
+    turns a concurrent writer away (``database is locked``) rather than
+    letting it commit underneath -- which is exactly what makes the reads
+    one snapshot.  So the transaction spans two or three quick queries on
+    a local file and NEVER an HTTP call: every mint request in this module
+    is made after the connection is closed.  The connection is read-only,
+    so there is nothing to roll back and the close is best effort.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        try:
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            pass
+
+
+def _stranded_ops(conn) -> set:
+    """op_ids this module recorded a FAILURE cause against.
+
+    A cause row exists only for an op that was NOT ``done`` when the call
+    that planned it raised (``_settle_cause`` skips ``done`` ops), and
+    ``WalletOps.pay`` raises without returning a single string.  So for a
+    pay op the row means, permanently: nothing from this payment was ever
+    handed to anybody, whatever ``recover()`` did to the op afterwards.
+
+    A store that has never recorded a cause has no table, which is not an
+    error -- it is the answer "nothing was recorded".  Only that one
+    sqlite complaint is absorbed; any other failure is a real store
+    failure and propagates to the caller's ``_store_errors`` guard.
+    """
+    try:
+        rows = conn.execute(
+            f"SELECT op_id FROM {_CAUSES_TABLE}").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return set()
+    return {str(r[0]) for r in rows}
 
 
 def _causes_by_op(conn, op_ids: list) -> dict:

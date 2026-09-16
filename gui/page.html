@@ -130,14 +130,20 @@ text-align:center;margin-right:8px;font-weight:700}
       <div><label>Exempt below (mc)</label>
         <input id="m-exempt" value="10" inputmode="numeric"></div>
     </div>
-    <div class="note">The burn is <b>min(cap, amount &times; rate &divide; 1,000,000)</b>,
-      and it is charged on top of what the recipient gets. A cap of 0 therefore
+    <div class="note">The burn is <b>min(cap, sum &times; rate &divide; 1,000,000)</b>,
+      where <b>sum is the face value of the coins the exchange spends</b> &mdash;
+      not the amount asked for. &sect;7.3 charges it on the inputs, and a wallet
+      almost never holds exact change: paying 7,000&nbsp;mc out of coins worth
+      7,100&nbsp;mc burns 71&nbsp;mc, not 70. The exact figure for a payment
+      comes back from the mint in the cost line before you pay; the formula here
+      is what it is computed from. A cap of 0
       means <b>no burn at all</b>, whatever the rate says &mdash; leave both at 0
       for a mint where a payment moves the whole amount. For a 1% burn capped at
-      1,000 mc, set rate 10000 and cap 1000. Amounts at or below the exempt
-      figure never burn. A payment is burned <b>twice</b>: once when the paying
-      wallet splits its coins, and again when the recipient redeems the tokens
-      &mdash; both are shown in the cost line before you pay. The mint id and baseline are written into the mint's
+      1,000 mc, set rate 10000 and cap 1000. An exchange whose inputs come to the
+      exempt figure or less never burns. A payment is burned <b>twice</b>: once
+      when the paying wallet splits its coins, and again when the recipient
+      redeems the tokens &mdash; both are shown in the cost line before you pay.
+      The mint id and baseline are written into the mint's
       identity file the first time it runs and cannot be changed afterwards;
       the burn policy can.</div>
   </details>
@@ -189,6 +195,7 @@ text-align:center;margin-right:8px;font-weight:700}
   </div>
   <div id="w-msg"></div>
   <div id="w-list"></div>
+  <div id="w-supply"></div>
   <div class="note">Click a wallet to make it the <b>active</b> one — that is the
     wallet that gets funded in section 1 and that pays and receives in
     section 3. Creating a wallet makes the new one active straight away, so
@@ -368,9 +375,9 @@ const UNREDEEMED_SWEEP_MS = 20000;
 let unredeemedSweptAt = 0;
 /* HOW MANY PAYMENTS THE READ-BACK COVERS, and why that number is on
    screen rather than only in this file.
-   GET /api/wallet/outstanding counts PAYMENT OPERATIONS, newest first,
-   and app.py clamps `limit` to at most 100 -- there is no offset, so 100
-   is the whole of what this page can reach in one read. It used to send
+   GET /api/wallet/outstanding counts PAYMENT OPERATIONS and app.py clamps
+   `limit` to at most 100 -- there is no offset, so 100 is the whole of
+   what this page can reach in one read. It used to send
    no limit at all, which took app.py's default of 20: a wallet with more
    than twenty payments had its older ones silently dropped, and the page
    printed the remainder as a TOTAL. That is the same defect in a smaller
@@ -378,20 +385,107 @@ let unredeemedSweptAt = 0;
    excludes real money the operator is still answerable for, asserted as
    complete -- and the oldest payments are exactly the forgotten
    interrupted deliveries this read-back exists to surface.
-   So: ask for the most this API can give, and when the answer comes back
-   FULL, say in words on every surface that the figure covers the 100 most
-   recent payments and is a floor, not a total. `truncated` on the record
+   So: ask for the most this API can give, and when the answer says it did
+   not cover the whole wallet, say so in words on every surface and treat
+   the figure as a floor rather than a total. `truncated` on the record
    below is that flag, and unredeemedTag/unredeemedSentence/
    unredeemedRecoverLines/showUnredeemedStrings all carry it. The history
-   table asks limit=50, so this window is strictly wider than the rows
-   beside it: a payment visible in the table can no longer be missing from
-   the unredeemed list above it. */
+   table asks limit=50, so in the ordinary case this window reaches
+   further back than the rows beside it -- but "wider" is not "strictly
+   contains", and the edge is stated at the end of this note.
+   WHAT THE WINDOW ACTUALLY DROPS, and the sentences here used to get
+   wrong: it is NOT "the oldest payments". gui/walletops.py spends the
+   window on payments that still have a string the wallet's own file
+   calls handed over, newest first, and only then on payments it has
+   already retired in full -- so a dead payment can no longer push live
+   money off the end. Saying "only the 100 most recent were checked" was
+   therefore false in both directions: it claimed the read had missed
+   live money it had in fact listed first, and it invited the reader to
+   look for the gap among old payments rather than in
+   `unlisted_outstanding_mc`, which is the figure that actually names it.
+   `truncated`, `payment_count` and `unlisted_outstanding_mc` all come off
+   the wire now; none of them is inferred here from the number of rows.
+   THE EDGE, said rather than assumed: the two windows are chosen on
+   different rules -- history takes the newest 50, this one takes up to
+   100 live-first -- so a wallet with 100 or more live payments and a
+   handful of newer, fully-retired ones can show a row in the table that
+   is not in the read-back above it. That is exactly why stillMoneyHtml()
+   answers "" for a payment it cannot find rather than a zero: silence is
+   right for a payment this read did not reach, and "nobody has redeemed
+   it" would be the one wrong answer. */
 const UNREDEEMED_LIMIT = 100;
 const UNREDEEMED_QUERY = "/api/wallet/outstanding?limit=" + UNREDEEMED_LIMIT +
                          "&name=";
 /* The mint state the sentence currently in #p-quote was computed under.
    See syncQuoteToMint() for why a quote has to remember this. */
 let quoteMintKey = null;
+/* THE MINT'S OWN ACCOUNT OF HOW MUCH MONEY EXISTS, and the moment this
+   page read it. The mint signs a supply snapshot into every descriptor
+   and refreshDescriptor already fetches it; nothing here is a second
+   read, and nothing here is computed. `supplyReadAt` is half the answer
+   whenever this figure is printed: a supply total with no read time is a
+   number that cannot say whether it is current, which is the defect this
+   round is about. `supplyError` is why the LAST attempt failed, kept
+   beside the last figures rather than wiping them -- the same treatment
+   every balance on this page gets. */
+let mintSupply = null;
+let supplyReadAt = 0;
+// How many snapshot reads have LANDED. A millisecond clock cannot tell a
+// second read from no second read when both fall in the same millisecond,
+// and refreshMoney's confirmation below has to know which it got.
+let supplyReads = 0;
+let supplyError = "";
+/* ...and the moment the balances beside it were read, because they are a
+   different read at a different instant and the subtraction below is only
+   as good as the gap between them. */
+let walletsReadAt = 0;
+/* THE TWO HALVES OF THE SUBTRACTION HAVE TO COME FROM ONE PASS, and this
+   is how the page proves that they did. A residual is the mint's
+   outstanding total MINUS what the wallets here hold, and those are two
+   separate reads: anything that moves money between them comes out of the
+   subtraction looking exactly like money nobody can point to. It did.
+   Every money-moving click ended in a balance refresh and left the supply
+   snapshot from BEFORE the click standing beside the balances from after
+   it, so the panel accused a wallet of counting already-spent coins --
+   with a Recover instruction -- directly under its own success message.
+   So refreshMoney() reads the mint's total and then the balances back to
+   back and stamps both with one pass number: `currentPass` is that number
+   while a pass is running and 0 outside one, which is a stamp no pair can
+   match, so a half read on its own can never pair with anything.
+   renderSupply subtracts only when the two stamps are equal AND the two
+   clocks are within PAIR_GAP_MS of each other; otherwise it prints no
+   residual at all and says why. The bound is SHORTER than the four-second
+   poll on purpose: a bound longer than the poll period is a bound nothing
+   can cross, and the 10 s one this replaces never fired once while the
+   figure underneath it was wrong.
+   A narrow window is still a window, though -- money moved from another
+   surface can land inside it -- so the pass ASKS THE MINT AGAIN after the
+   balances and keeps the pair only when the mint's total is unchanged
+   across the read. That turns "the two reads were close together" into
+   "nothing the mint knows about moved between them", which is the claim
+   the panel actually makes. (A total that fell and rose by the same
+   amount inside one pass would pass this check; nothing cheaper than the
+   mint's own ledger can see that, and this page does not claim to.) */
+let passCounter = 0;
+let currentPass = 0;
+let passInFlight = false;
+/* WHY the last pass could not pair its two halves, so the panel can say
+   which of the three it was rather than one sentence for all of them:
+   "moved" (the mint's total changed across the balances read -- money
+   moved while this page was looking), "unconfirmed" (the second read did
+   not come back, so the total was never seen to hold still), and "" (no
+   pass has read the mint's total at all, which is the stopped-mint and
+   fresh-load case). */
+let pairNote = "";
+let supplyPass = 0;
+let walletsPass = 0;
+/* The backstop, in milliseconds, on how far apart the two stamps may be.
+   It is SHORTER than the four-second poll on purpose -- a bound longer
+   than the poll period is a bound nothing can cross -- and it sits on top
+   of the before/after confirmation below, which is the stronger of the
+   two checks: this one only says the pair describes a short interval, the
+   confirmation says the mint's total did not move across it. */
+const PAIR_GAP_MS = 3000;
 
 /* ---------- fetch with a deadline, so nothing can spin forever ---------- */
 async function api(path, body, ms) {
@@ -1019,8 +1113,9 @@ async function savedCopyNote(name, tokens, cause) {
    out of it, joined by the op id the server returned, and says what the
    mint said. "" when there is nothing read to say it from: no record, no
    op id, or the payment not in the window -- silence, never a zero.
-   (The window is the newest UNREDEEMED_LIMIT payments and this payment is
-   the newest there is, so it is in it whenever the read succeeded.) */
+   (The window takes payments still holding an unretired string first, so
+   a payment just made -- which is both the newest and, until somebody
+   redeems it, the most live -- is in it whenever the read succeeded.) */
 function stillMoneyHtml(name, opId) {
   const rec = unredeemedOf(name);
   if (!rec || rec.state === "unread" || !opId) return "";
@@ -1087,6 +1182,17 @@ window.deliveryOf = deliveryOf;
 window.deliveryCell = deliveryCell;
 window.deliveryMissing = deliveryMissing;
 window.UNREDEEMED_LIMIT = UNREDEEMED_LIMIT;
+window.reconcileSupply = reconcileSupply;
+window.supplyLines = supplyLines;
+window.renderSupply = renderSupply;
+window.noteSupply = noteSupply;
+window.renderIssueCost = renderIssueCost;
+window.issueCostPending = issueCostPending;
+window.pendingPolicyState = pendingPolicyState;
+window.formPolicy = formPolicy;
+window.payFailureHtml = payFailureHtml;
+window.requestSettled = requestSettled;
+window.refreshMoney = refreshMoney;
 
 /* ---------- value handed out that nobody has redeemed ---------- */
 /* One read, turned into the counts every surface below shares. Pure: no
@@ -1098,20 +1204,38 @@ window.UNREDEEMED_LIMIT = UNREDEEMED_LIMIT;
    checked === false is every string there is. */
 function summariseUnredeemed(data) {
   const rec = {state: (data && data.checked) ? "known" : "unchecked",
-               // A FULL page of payments means there may be more this
-               // page cannot reach: the API counts payment operations,
-               // newest first, and offers no offset past its ceiling. So
-               // this is set from the shape of the answer, never from a
-               // flag the server does not send, and everything below that
-               // prints a figure has to say so.
+               // WHETHER THE READ COVERED THE WHOLE WALLET, taken from the
+               // server's own flag. It used to be inferred here from a
+               // full page of rows, because the route did not send one;
+               // that inference is still the fallback for a server build
+               // that says nothing, but it is a worse answer and it is no
+               // longer the first one. Everything below that prints a
+               // figure has to carry this.
                truncated: false,
+               // How many payments the wallet has made in all, and how
+               // much of the value it handed out the window could not
+               // list. `unlisted_outstanding_mc` is the part of that
+               // which the wallet's own file still shows as handed over
+               // rather than retired -- the money a truncated read is
+               // actually missing, and the only honest thing to print in
+               // place of the total it cannot give. null means the
+               // server did not say.
+               payment_count: null, handed_over_mc: null,
+               unlisted_outstanding_mc: null, recovered_mc: null,
                ops: [], count: 0, total_mc: 0,
                unspent_mc: 0, unspent_count: 0,
                spent_mc: 0, spent_count: 0,
                unstated_mc: 0, unstated_count: 0,
                detail: "", reason: ""};
   const payments = (data && data.payments) || [];
-  rec.truncated = payments.length >= UNREDEEMED_LIMIT;
+  rec.truncated = (data && typeof data.truncated === "boolean")
+                  ? data.truncated
+                  : payments.length >= UNREDEEMED_LIMIT;
+  const num = k => (data && typeof data[k] === "number") ? data[k] : null;
+  rec.payment_count = num("payment_count");
+  rec.handed_over_mc = num("handed_over_mc");
+  rec.unlisted_outstanding_mc = num("unlisted_outstanding_mc");
+  rec.recovered_mc = num("recovered_mc");
   for (const p of payments) {
     const toks = p.tokens || [];
     let live = 0, liveN = 0;
@@ -1141,7 +1265,9 @@ function summariseUnredeemed(data) {
   return rec;
 }
 function unreadRecord(detail, reason) {
-  return {state: "unread", truncated: false, ops: [], count: 0, total_mc: 0,
+  return {state: "unread", truncated: false, payment_count: null,
+          handed_over_mc: null, unlisted_outstanding_mc: null,
+          recovered_mc: null, ops: [], count: 0, total_mc: 0,
           unspent_mc: 0, unspent_count: 0, spent_mc: 0, spent_count: 0,
           unstated_mc: 0, unstated_count: 0,
           detail: detail || "", reason: reason || ""};
@@ -1220,8 +1346,9 @@ function unredeemedTag(rec) {
   // A FULL page that happens to contain nothing live still says nothing
   // about the payments past it, so "" -- which means "read, and there is
   // nothing unredeemed" -- would be a claim this read cannot support.
-  if (rec.truncated) return "unredeemed: only the newest " +
-    UNREDEEMED_LIMIT + " payments checked";
+  if (rec.truncated) return "unredeemed: " +
+    (rec.payment_count ? rec.ops.length + " of " + rec.payment_count : "not all") +
+    " payments checked, live money first";
   return "";
 }
 /* The ceiling, in a sentence, for the panels with room for one. "" when
@@ -1229,12 +1356,28 @@ function unredeemedTag(rec) {
    case and needs no words. */
 function unredeemedCeiling(rec, name) {
   if (!rec || !rec.truncated) return "";
-  return " This figure covers only the " + UNREDEEMED_LIMIT + " most recent " +
-    "payments " + (name || "this wallet") + " made \u2014 that is the most " +
-    "this page can read in one go \u2014 so it is a floor, not a total: " +
-    "anything older was not read and was not asked about. Older unredeemed " +
-    "value is NOT being reported as zero here; it is not being reported at " +
-    "all.";
+  const who = name || "this wallet";
+  return " This read did not cover every payment " + who + " has made" +
+    (rec.payment_count ? " \u2014 " + rec.ops.length + " of " +
+      rec.payment_count + ", and the ones still holding a string the " +
+      "wallet has not retired are taken first, so it is live money that " +
+      "gets listed and retired payments that fall off the end" :
+      " \u2014 the ones still holding a string the wallet has not retired " +
+      "are taken first, so it is live money that gets listed and retired " +
+      "payments that fall off the end") + ". " +
+    (rec.unlisted_outstanding_mc
+       ? "Even so, " + mc(rec.unlisted_outstanding_mc) + " that " + who +
+         " handed out did not fit and was not asked about, so this figure " +
+         "is a floor and that value is NOT being reported as zero \u2014 it " +
+         "is not being reported at all."
+       : rec.unlisted_outstanding_mc === 0
+       ? "Nothing that " + who + " handed out was left out of the read on " +
+         "that account: every payment the window dropped is one this " +
+         "wallet has already retired in full. That is the store\u2019s word " +
+         "about its own copy, not the mint\u2019s verdict on the money, so " +
+         "this is still a floor rather than a total."
+       : "How much handed-out value the read missed is not known, so this " +
+         "is a floor rather than a total.");
 }
 /* Warn colour only for value the mint says is still live; grey for the
    states that are ignorance rather than exposure. */
@@ -1283,14 +1426,20 @@ function unredeemedSentence(rec, name) {
   }
   // NOTHING FOUND is the one answer a capped read must not give plainly:
   // "all of them have been redeemed" is a statement about every payment
-  // the wallet ever made, and this read saw the newest hundred.
+  // the wallet ever made, and this read saw at most a hundred of them --
+  // the live ones first, not simply the newest.
   if (rec.truncated) {
     return {cls: "note bad", text: "Nothing unredeemed in the " +
-      UNREDEEMED_LIMIT + " most recent payments " + who + " made \u2014 every " +
-      "string in them has been redeemed. That is not a statement about " +
-      "older payments: this page cannot read past " + UNREDEEMED_LIMIT +
-      " payments in one go, so whether anything older is still unredeemed " +
-      "is undetermined here."};
+      n(rec.ops.length, "payment", "payments") + " of " + who + "\u2019s that " +
+      "this read covered \u2014 every string in them has been redeemed. That " +
+      "is not a statement about the rest" +
+      (rec.payment_count ? " of the " + rec.payment_count + " it has made" : "") +
+      ": this read takes the payments still holding an unretired string " +
+      "first and then stops, so whether anything it did not reach is " +
+      "still unredeemed is undetermined here." +
+      (rec.unlisted_outstanding_mc
+         ? " " + mc(rec.unlisted_outstanding_mc) + " of handed-out value " +
+           "was not reached." : "")};
   }
   if (rec.count) {
     return {cls: "note ok", text: "Nothing unredeemed: all " +
@@ -1419,19 +1568,36 @@ async function showUnredeemedStrings() {
   // The ceiling, said BEFORE the lists, because the panel gives a reason
   // for the strings it withholds as already redeemed and a silent drop
   // beside a stated one reads as "there are no others".
-  const capped = payments.length >= UNREDEEMED_LIMIT;
+  // From the SERVER's own flag, the same one summariseUnredeemed reads,
+  // so this panel and the figures beside it cannot disagree about whether
+  // the read covered the wallet. The row count is the fallback for a
+  // build that sends no flag, and nothing more.
+  const rec0 = unredeemed[name];
+  const capped = rec0 ? rec0.truncated : payments.length >= UNREDEEMED_LIMIT;
+  const missed = rec0 ? rec0.unlisted_outstanding_mc : null;
   if (capped) {
-    html += '<div class="warn bad">These lists cover only the ' +
-      UNREDEEMED_LIMIT + ' most recent payments ' + esc(name) + ' made \u2014 ' +
-      'that is the most this page can read in one go. Strings from older ' +
-      'payments are NOT below and were not asked about; they are not being ' +
-      'reported as redeemed, they were not read. The op ids in History are ' +
-      'the handle for those.</div>';
+    html += '<div class="warn bad">These lists do not cover every payment ' +
+      esc(name) + ' has made' +
+      ((rec0 && rec0.payment_count)
+         ? ' \u2014 ' + payments.length + ' of ' + rec0.payment_count : '') +
+      '. The read takes the payments still holding a string this wallet ' +
+      'has not retired first, so it is live money that gets listed and ' +
+      'payments the wallet has already retired in full that fall off the ' +
+      'end. ' +
+      (missed
+         ? mc(missed) + ' that ' + esc(name) + ' handed out did not fit and ' +
+           'was not asked about: those strings are NOT below and are not ' +
+           'being reported as redeemed, they were not read. '
+         : missed === 0
+         ? 'Nothing this wallet still shows as handed over was left out on ' +
+           'that account. '
+         : 'How much handed-out value that leaves out was not said. ') +
+      'The op ids in History are the handle for whatever is missing.</div>';
   }
   if (live.length) {
     html += tokenBlock(live, "These " + live.length + " string(s) are money " +
       name + " has handed out that the mint says nobody has redeemed" +
-      (capped ? ", out of the " + UNREDEEMED_LIMIT + " most recent payments" : "") +
+      (capped ? ", out of the payments this read covered" : "") +
       ". Anyone holding one can spend it.", "warn bad");
   }
   if (unstated.length) {
@@ -1444,10 +1610,10 @@ async function showUnredeemedStrings() {
   }
   if (!live.length && !unstated.length) {
     html += capped
-      ? '<div class="note bad">Nothing to show from the ' + UNREDEEMED_LIMIT +
-        ' most recent payments: every string in them has been redeemed. ' +
-        'Whether anything older is still unredeemed was not read and is ' +
-        'not answered here.</div>'
+      ? '<div class="note bad">Nothing to show from the payments this read ' +
+        'covered: every string in them has been redeemed. Whether anything ' +
+        'it did not reach is still unredeemed was not read and is not ' +
+        'answered here.</div>'
       : '<div class="note ok">Nothing to show: every string ' +
         esc(name) + ' has handed out has been redeemed.</div>';
   }
@@ -1618,10 +1784,7 @@ function renderLockedOut() {
   $("m-policy").className = "note bad";
   $("m-policy").textContent =
     "Burn policy: cannot be read while " + failureBecause() + ".";
-  $("f-cost").className = "note bad";
-  $("f-cost").textContent =
-    "What issuing would cost cannot be worked out while " +
-    failureBecause() + ", and nothing here can issue anything.";
+  renderIssueCost();     // it owns that element in every state, this one too
   for (const id of ["m-start", "m-stop", "f-go", "w-create", "r-go",
                     "h-recover", "h-show-strings", "t-go", "p-requote", "p-go"]) {
     $(id).disabled = true;
@@ -1629,6 +1792,7 @@ function renderLockedOut() {
   // The unredeemed panels are figures read from app.py like any other, so
   // they carry the same caveat rather than sitting there looking current.
   renderUnredeemed();
+  renderSupply();
 }
 
 /* app.py is answering, but it could not say what the mint is doing. That
@@ -1650,9 +1814,8 @@ function renderMintUnknown() {
     "say whether a mint is running, so this page is not guessing at one. " +
     "A mint started from here runs in its own process and is unaffected by " +
     "this; press Refresh once app.py is answering again.";
-  $("f-cost").className = "note bad";
-  $("f-cost").textContent = "What issuing would cost cannot be worked out " +
-    "while the mint state is unknown.";
+  renderIssueCost();     // as above: every sentence #f-cost holds is its own
+  renderSupply();
   for (const id of ["m-start", "m-stop", "f-go", "w-create", "r-go",
                     "h-recover", "t-go", "p-requote", "p-go"]) {
     $(id).disabled = true;
@@ -1673,6 +1836,18 @@ function renderPolicy(running) {
     return;
   }
   const burns = !!(policy.rate_ppm && policy.cap_mc);
+  // The settings above this line and this line are two elements answering
+  // one question, and while the mint is stopped they can answer it
+  // differently. Said here, where both are on screen together.
+  const pend = pendingPolicyState();
+  const edited = pend === "edited"
+    ? " The burn policy boxes above have been EDITED and no longer say " +
+      "this: what a payment costs changes to match them the next time a " +
+      "mint is started from here."
+    : pend === "unreadable"
+      ? " The burn policy boxes above do not hold three whole numbers, so " +
+        "what the next Start would use cannot be read from them."
+      : "";
   el.className = burns ? "note bad" : "note";
   el.textContent = (running ? "Burn policy in force" : "Burn policy last used") +
     " (" + policySource + "): " + policyWords(policy) +
@@ -1682,7 +1857,8 @@ function renderPolicy(running) {
     (running ? " To change it: Stop mint, edit the burn policy under Mint " +
                "settings, then Start mint again — the mint reads it once, at " +
                "startup, so the fields are locked while it runs."
-             : " Edit it under Mint settings before pressing Start mint.");
+             : " Edit it under Mint settings before pressing Start mint.") +
+    edited;
 }
 
 /* What pressing "Issue into wallet" will really do, before it is pressed.
@@ -1720,19 +1896,549 @@ function issueCostSentence(amount, count, name, p) {
     who + " is credited " + mc(created - burn) + " — not " + mc(created) +
     ". That burn is charged once on the whole batch, not once per token.";
 }
+/* ---------- a cost line is only as current as the policy under it -------
+   THE SAME RULE AS THE QUOTE, one panel up. The block above mintKey()
+   states it for the sentence in #p-quote; this is the other figure on
+   this page derived from the burn policy, and it outlives its source in a
+   way the quote cannot, because the burn policy is edited in a form that
+   sits DIRECTLY ABOVE IT. Stop the mint, type rate 0 and cap 0 into Mint
+   settings, and the funding cost line a few pixels below went on saying
+   that crediting 1,000 mc would burn 10 and credit 990: two elements of
+   one screen answering "what will this burn" with 0 and with 10. The
+   button is disabled in that state, so nothing could be pressed -- but
+   the screen was teaching a number that will not be true.
+   So the figure is VOIDED rather than recomputed from the boxes: what the
+   boxes hold is what a mint STARTED with them would be asked to use, and
+   this page has never read it back from a mint. What is said instead is
+   the policy those settings describe, in words, with no arithmetic
+   standing on it, and the promise that this line will speak again once a
+   mint has read them.
+   `policy` itself is the last policy a mint reported (or, stopped, the
+   one this GUI last started one with); the form is what the next Start
+   would send. When they agree the figure still stands. */
+function policyKey(p) {
+  return p ? [p.rate_ppm, p.cap_mc, p.exempt_below_mc].join("/") : "no-policy";
+}
+/* The burn policy the FORM holds, or null when the three boxes do not
+   hold three whole numbers -- which is not a policy that reads low, it is
+   no policy at all, and app.py refuses a Start built from it. */
+function formPolicy() {
+  const out = {};
+  const fields = [["m-rate", "rate_ppm"], ["m-cap", "cap_mc"],
+                  ["m-exempt", "exempt_below_mc"]];
+  for (const f of fields) {
+    const raw = String($(f[0]).value).trim();
+    if (!/^[0-9]+$/.test(raw)) return null;
+    const v = parseInt(raw, 10);
+    if (!isFinite(v)) return null;
+    out[f[1]] = v;
+  }
+  return out;
+}
+/* Four answers, and only the first one lets a derived figure stand:
+     same        the boxes and the policy the figure came from agree, or
+                 the mint is running and the boxes are locked mirroring it
+     edited      the boxes hold a DIFFERENT policy than the figure's source
+     unreadable  the boxes hold no policy at all
+     unread      no policy has ever been read back from a mint here, so
+                 there is nothing for a figure to stand on               */
+function pendingPolicyState() {
+  if (mint.running) return "same";   // locked while it runs; applyDescriptor
+  const f = formPolicy();            // writes the mint's own policy into them
+  if (!f) return "unreadable";
+  if (!policy) return "unread";
+  return policyKey(f) === policyKey(policy) ? "same" : "edited";
+}
+/* What #f-cost says when no figure may stand. Pure: no DOM, no fetch. */
+function issueCostPending(state, pending) {
+  if (state === "unreadable") {
+    return "What issuing would cost is NOT shown: the burn policy boxes " +
+      "under Mint settings do not hold three whole numbers, so there is no " +
+      "policy to work it out from. A figure worked out from the policy the " +
+      "last mint ran with would not be the one this one charges.";
+  }
+  // policyWords() writes a clause for a policy that burns and a whole
+  // sentence for one that does not, so the lead-in is chosen to fit both
+  // rather than bolting one onto the other.
+  const words = (pending && pending.rate_ppm && pending.cap_mc)
+    ? "would burn " + policyWords(pending)
+    : "would burn nothing at all: a cap of 0 means no burn whatever the " +
+      "rate says";
+  if (state === "unread") {
+    return "What issuing would cost is NOT shown: no mint has run here, so " +
+      "no burn policy has ever been read back from one and there is nothing " +
+      "to work the figure out from. Started with the settings above, a mint " +
+      words + ". Press Start mint, and this line will say what crediting a " +
+      "wallet really burns, from the mint's own descriptor.";
+  }
+  return "What issuing would cost is NOT shown: the burn policy under Mint " +
+    "settings has been edited and no mint has read it. Any figure here " +
+    "would come from the policy the last mint ran with, which is not the " +
+    "one the next one will charge. Started with the settings above, a mint " +
+    words + ". Press Start mint, and this line will say what crediting a " +
+    "wallet really burns, from the mint's own descriptor.";
+}
+/* ONE WRITER for #f-cost. renderLockedOut() and renderMintUnknown() used
+   to write their own sentences into it and then leave it to this function
+   on the next keystroke, so typing in the amount box under a lockout
+   replaced "this cannot be worked out" with a figure computed from a
+   policy nobody could check. Every sentence that element can hold is
+   decided here. */
 function renderIssueCost() {
   const el = $("f-cost");
   const amount = parseInt($("f-amount").value, 10);
   const count = parseInt($("f-count").value, 10);
+  if (linkFailure) {
+    el.className = "note bad";
+    el.textContent = "What issuing would cost cannot be worked out while " +
+      failureBecause() + ", and nothing here can issue anything.";
+    return;
+  }
+  if (mint.unknown) {
+    el.className = "note bad";
+    el.textContent = "What issuing would cost cannot be worked out while " +
+      "the mint state is unknown.";
+    return;
+  }
+  const state = pendingPolicyState();
+  if (state !== "same") {
+    el.className = "note bad";
+    el.textContent = issueCostPending(state, formPolicy());
+    return;
+  }
   const text = issueCostSentence(amount, count, active, policy);
   el.className = "note" + (policy === null || burnFor(amount * count, policy)
                            ? " bad" : "");
   el.textContent = text;
 }
 
+/* ---------- does the money on this page add up? ------------------------
+   THE MINT IS THE ONLY THING THAT KNOWS HOW MUCH MONEY EXISTS. Every
+   other figure here is a piece of it: what each wallet in this workdir
+   can spend, and what those wallets handed out that nobody has redeemed.
+   Value in NEITHER -- tokens issued from section 1 and never credited to
+   a wallet, above all -- appeared on no screen at all once the issue
+   result panel was gone, and a reload was enough to lose it. The money is
+   live in the mint's supply, the operator is answerable for it, and
+   nothing on this page said so.
+   That is the undelivered-bearer-strings defect one step earlier in the
+   flow, so it gets the same answer rather than a new one: ASK THE
+   AUTHORITY AND SUBTRACT. The mint signs a supply snapshot into every
+   descriptor -- outstanding_mc is the summed amount of every unspent
+   entry in its ledger, not a counter -- this page already reads that
+   descriptor, and the balances and the unredeemed read-backs are already
+   here. outstanding MINUS what this page can account for is value it
+   cannot point to, printed as exactly that and never as a claim about
+   where the remainder is.
+   Issued strings cannot be read back the way payment strings can: the
+   mint stores ledger-key hashes and never secrets, and /api/mint/issue
+   persists nothing -- so for those the result panel really is the only
+   copy. The VALUE is still visible here, which is the difference between
+   an operator who knows 500 mc is unaccounted for and one who does not.
+   GIVEN A PAIR OF READS FROM ONE PASS -- and only then; see PAIR_GAP_MS
+   above, because two reads that straddle a payment break this in either
+   direction and the residual is then not computed at all -- every way
+   this arithmetic can be less than exact is held in ONE direction, so the
+   accounted side is a floor and the residual a ceiling:
+     - a wallet whose balance could not be read is left out;
+     - an unredeemed read that was capped, unverified or never made
+       contributes nothing;
+     - a wallet bound to a DIFFERENT mint holds none of this mint's money
+       and is excluded outright, because counting it would inflate the
+       accounted side with another currency.
+   Pure: no DOM, no fetch. */
+function reconcileSupply(sup, list, recs, mintId, paired) {
+  const r = {outstanding: null, issued: null, burned: null, adds_up: true,
+             wallets_mc: 0, wallets_counted: 0, balances_unread: 0,
+             foreign: 0, mint_unstated: 0, unredeemed_mc: 0,
+             unredeemed_unread: 0, unredeemed_unverified: 0,
+             unredeemed_unverified_mc: 0,
+             unredeemed_capped: 0, unredeemed_unstated_mc: 0,
+             // Handed-out value a truncated read-back could not cover,
+             // summed over the wallets whose server said how much it was.
+             // It is NOT added to `accounted`: nothing established that
+             // it is still live, and a figure the mint was never asked
+             // about must not be counted as money the page can point to.
+             // It is named in the gaps instead, which is what keeps the
+             // residual a ceiling rather than a mystery.
+             unredeemed_unlisted_mc: 0, unredeemed_unlisted_unknown: 0,
+             floor: false, accounted: 0, residual: null,
+             // `paired`: were the two figures this subtracts read in one
+             // pass? Absent, the answer is yes -- the only caller always
+             // says, and a caller that does not is asking for the plain
+             // arithmetic.
+             paired: paired !== false};
+  if (sup && typeof sup.outstanding_mc === "number") {
+    r.outstanding = sup.outstanding_mc;
+    if (typeof sup.cumulative_issued_mc === "number")
+      r.issued = sup.cumulative_issued_mc;
+    if (typeof sup.cumulative_burned_mc === "number")
+      r.burned = sup.cumulative_burned_mc;
+    // The mint's own invariant, CHECKED rather than assumed: it states all
+    // three figures and signs them together. A snapshot whose own numbers
+    // disagree is a fact about the mint that belongs on the screen, not
+    // one for this page to smooth over -- and the subtraction below
+    // stands on the same document.
+    r.adds_up = (r.issued === null || r.burned === null) ||
+                (r.issued - r.burned === r.outstanding);
+  }
+  for (const w of (list || [])) {
+    const rec = (recs && recs[w.name]) || null;
+    if (mintId && w.mint_id && w.mint_id !== mintId) { r.foreign++; continue; }
+    if (typeof w.balance_mc !== "number") { r.balances_unread++; r.floor = true; continue; }
+    if (!w.mint_id) r.mint_unstated++;
+    r.wallets_counted++;
+    r.wallets_mc += w.balance_mc;
+    if (!rec || rec.state === "unread") { r.unredeemed_unread++; r.floor = true; continue; }
+    if (rec.state === "unchecked") {
+      // Strings that left the wallet and that the mint could not be asked
+      // about. Nothing established that they are still money, so they are
+      // not counted as accounted-for value -- which leaves them inside the
+      // residual and keeps the residual a ceiling.
+      r.unredeemed_unverified++; r.floor = true;
+      // ...and how MUCH left the wallet unverified, because a panel that
+      // prints "0 mc" for this is printing the mint's silence as the
+      // mint's answer. The wallet's own file knows the figure; the mint is
+      // what could not be asked about it.
+      if (typeof rec.total_mc === "number")
+        r.unredeemed_unverified_mc += rec.total_mc;
+      continue;
+    }
+    r.unredeemed_mc += rec.unspent_mc;
+    if (rec.unstated_mc > 0) { r.unredeemed_unstated_mc += rec.unstated_mc; r.floor = true; }
+    if (rec.truncated) {
+      r.unredeemed_capped++; r.floor = true;
+      if (typeof rec.unlisted_outstanding_mc === "number")
+        r.unredeemed_unlisted_mc += rec.unlisted_outstanding_mc;
+      else r.unredeemed_unlisted_unknown++;
+    }
+  }
+  r.accounted = r.wallets_mc + r.unredeemed_mc;
+  // A DIFFERENCE IS ONLY AN ACCOUNT OF MONEY WHEN BOTH SIDES DESCRIBE ONE
+  // INSTANT. Not paired: no residual, and the caller says that instead of
+  // printing a difference that is really the gap between two clocks.
+  if (r.outstanding !== null && r.paired)
+    r.residual = r.outstanding - r.accounted;
+  return r;
+}
+/* The same account in sentences. `when` is the moment the SUPPLY was read
+   and `walletsWhen` the moment the balances were: two reads at two
+   instants, and a payment made between them shows up in the subtraction
+   as a discrepancy that is really a clock, so both times are printed and
+   a pair that did not come from one pass is not subtracted at all --
+   `r.paired` is that verdict, reached in renderSupply(). `why` is why the
+   supply is not known, when it is not. `opts.canRecover` and
+   `opts.mintLive` are the two facts about the page's own controls that
+   this text has to stop guessing at: it was telling the operator to press
+   a button the page had greyed out. Pure: no DOM, no fetch. */
+function supplyLines(r, when, walletsWhen, why, opts) {
+  const at = ms => ms ? new Date(ms).toLocaleTimeString() : "";
+  const canRecover = !opts || opts.canRecover !== false;
+  const mintLive = !opts || opts.mintLive !== false;
+  // The instruction is hedged on whether the control it names is live.
+  // With the mint stopped this panel is exactly what an operator reads,
+  // and Recover is disabled in that state by this page's own rule.
+  const recoverIt = canRecover
+    ? "press Recover interrupted payments to rule the last one out."
+    : "Recover interrupted payments, under History, is what rules the " +
+      "last one out, and this page has that button disabled in this " +
+      "state — it needs a mint that is answering and a wallet selected.";
+  const lines = [];
+  if (r.outstanding === null) {
+    lines.push(["note bad", "How much money this mint says is live is NOT " +
+      "known" + (why ? ": " + why : ", because no supply snapshot has been " +
+      "read from it yet") + ". Until one has been read, this page cannot " +
+      "tell you whether there is value here that is in no wallet below " +
+      "— it is " +
+      "not telling you there is none, and money issued and never credited " +
+      "to a wallet is exactly what would be hiding in it."]);
+    return lines;
+  }
+  lines.push([r.adds_up ? "note" : "warn bad",
+    "The mint's signed supply snapshot, read at " + at(when) + ": " +
+    (r.issued === null ? "" : mc(r.issued) + " ever issued, ") +
+    (r.burned === null ? "" : mc(r.burned) + " ever burned, ") +
+    mc(r.outstanding) + " outstanding — that last figure is the money " +
+    "this mint says is live right now, wherever it is." +
+    (r.adds_up ? "" : " THE MINT'S OWN FIGURES DO NOT ADD UP: issued minus " +
+      "burned is " + mc(r.issued - r.burned) + " and the same signed " +
+      "snapshot calls the outstanding total " + mc(r.outstanding) + ". " +
+      "Everything below stands on that document.")]);
+  if (!walletsWhen) {
+    // The wallets have never been read. Subtracting an empty list from the
+    // mint's total would print the whole supply as unaccounted for, which
+    // is a claim about wallets nobody has looked at -- the first render
+    // after a page load is exactly that moment.
+    lines.push(["note bad", "The wallets in this workdir have not been read " +
+      "yet, so nothing can be subtracted from that figure and how much of " +
+      "it is in a wallet here is not yet known."]);
+    return lines;
+  }
+  const gaps = [];
+  // Two of the clauses below name a figure in millicredits, and a reader
+  // who meets a number under "what is not in that figure" will try to add
+  // it. They must not: both are handed-out value nobody asked the mint
+  // about, and handed-out value that a wallet on this very page has since
+  // redeemed is already inside the balances. On the wallet measured while
+  // this was written the two came to 15,380 mc beside a residual of
+  // 12,200 mc -- adding them would have exceeded the mint's entire
+  // outstanding supply. So when either figure is printed, the sentence
+  // that says what it is gets printed with it.
+  const gapsCarryValue = !!(r.unredeemed_unverified_mc ||
+                            r.unredeemed_unlisted_mc);
+  if (r.foreign)
+    gaps.push(n(r.foreign, "wallet", "wallets") + " here " +
+      (r.foreign === 1 ? "is" : "are") + " bound to a different mint and " +
+      (r.foreign === 1 ? "holds" : "hold") + " none of this mint's money, " +
+      "so " + (r.foreign === 1 ? "it is" : "they are") + " left out of this " +
+      "arithmetic altogether");
+  if (r.balances_unread)
+    gaps.push(n(r.balances_unread, "wallet", "wallets") + " could not be " +
+      "read, so whatever " + (r.balances_unread === 1 ? "it holds is" : "they hold is") +
+      " missing from the figure above");
+  if (r.unredeemed_unread)
+    gaps.push("what " + n(r.unredeemed_unread, "wallet", "wallets") +
+      " handed out has not been read back at all");
+  if (r.unredeemed_unverified)
+    gaps.push("the mint could not be asked about " +
+      (r.unredeemed_unverified_mc
+         ? mc(r.unredeemed_unverified_mc) + " in strings "
+         : "the strings ") +
+      n(r.unredeemed_unverified, "wallet", "wallets") + " handed out");
+  if (r.unredeemed_capped)
+    gaps.push("the read-back did not cover every payment " +
+      n(r.unredeemed_capped, "wallet", "wallets") + " here " +
+      (r.unredeemed_capped === 1 ? "has" : "have") + " made" +
+      (r.unredeemed_unlisted_mc
+         ? ", leaving " + mc(r.unredeemed_unlisted_mc) + " of handed-out " +
+           "value unasked about"
+         : r.unredeemed_unlisted_unknown
+         ? ", and how much handed-out value that leaves out was not said"
+         : ", though every payment it left out is one the wallet has " +
+           "already retired in full"));
+  if (r.unredeemed_unstated_mc)
+    gaps.push(mc(r.unredeemed_unstated_mc) + " in handed-out strings has no " +
+      "state the mint could name");
+  if (r.mint_unstated)
+    gaps.push(n(r.mint_unstated, "wallet", "wallets") + " did not say which " +
+      "mint " + (r.mint_unstated === 1 ? "it is" : "they are") + " bound to " +
+      "and " + (r.mint_unstated === 1 ? "is" : "are") + " counted here anyway");
+  // A ZERO HERE IS A CLAIM ABOUT THE MINT, and when the only reason it is
+  // zero is that the mint could not be asked, it is a false one: the
+  // wallet rows a few pixels above were reading "+ 49,500 mc handed out,
+  // unverified" while this clause said "0 mc more is in bearer strings
+  // they handed out that the mint says nobody has redeemed". The mint
+  // said no such thing -- it was never asked. So the figure is printed
+  // only when it is a figure, and the unchecked value is named in the
+  // gaps clause instead of being rounded to nothing.
+  const handed = r.unredeemed_mc > 0
+    ? mc(r.unredeemed_mc) + " more is in bearer strings they handed out " +
+      "that the mint says nobody has redeemed"
+    : (r.unredeemed_unverified || r.unredeemed_unread ||
+       r.unredeemed_unstated_mc
+        ? "nothing can be added for the bearer strings they handed out"
+        : "no bearer string they handed out is still unredeemed");
+  lines.push(["note", "Against that, what this page can point to: " +
+    n(r.wallets_counted, "wallet", "wallets") + " here can spend " +
+    mc(r.wallets_mc) + (walletsWhen ? " (read at " + at(walletsWhen) + ")" : "") +
+    ", and " + handed + " — " +
+    (r.floor ? "at least " : "") + mc(r.accounted) + " in all" +
+    (r.floor ? ", which is a floor rather than a total" : "") + "." +
+    (gaps.length ? " Why that is a floor: " + gaps.join("; ") + "." +
+      (gapsCarryValue
+         ? " THOSE AMOUNTS ARE THE SIZE OF WHAT WAS NOT ESTABLISHED, NOT " +
+           "VALUE TO ADD to the figure above \u2014 and they are not a " +
+           "separate pile of money either. A string one wallet here handed " +
+           "out and another wallet here has already redeemed is counted in " +
+           "the balances above AND sits in one of these amounts, because " +
+           "the paying wallet\u2019s own file never learned what became of " +
+           "it. Adding them together would count that money twice and can " +
+           "come out larger than the mint\u2019s whole supply. Each one is " +
+           "a ceiling on what this page failed to check, which is why the " +
+           "line below is a ceiling too."
+         : "")
+      : "")]);
+  if (r.residual > 0) {
+    lines.push(["warn bad", (r.floor ? "At most " : "") + mc(r.residual) +
+      " of live money is in no wallet on this page and in no string this " +
+      "page can see" + (r.floor ? " — a ceiling, because what is " +
+      "accounted for above is a floor" : "") + ". Tokens issued in section " +
+      "1 and never credited to a wallet land in exactly this figure and on " +
+      "no other surface on this page: their strings existed only in the " +
+      "issue result panel, and the mint keeps hashes, never secrets, so " +
+      "nothing can read them back. Three other things land here and are not " +
+      "that: money in a wallet outside this workdir, strings somebody else " +
+      "is holding, and coins a payment made here created that its wallet " +
+      "has not settled yet — " + recoverIt + " This page is not telling " +
+      "you which of them it is; " +
+      "it is telling you the mint says the value exists."]);
+  } else if (r.residual === 0 && !r.floor) {
+    lines.push(["note ok", "That is all of it: every millicredit this mint " +
+      "says is live is either spendable in a wallet above or in a string one " +
+      "of them handed out. Nothing was issued and left uncredited, and " +
+      "nothing is unaccounted for."]);
+  } else if (r.residual === 0) {
+    lines.push(["note bad", "What this page could account for comes to the " +
+      "whole of what the mint says is live. That is NOT a statement that " +
+      "nothing is unaccounted for: the figure above is a floor, so the two " +
+      "meeting exactly is as consistent with a gap that was not read as " +
+      "with no gap at all."]);
+  } else if (r.residual !== null) {
+    lines.push(["warn bad", "The wallets on this page claim " +
+      mc(-r.residual) + " MORE than the mint says is live in total. Both " +
+      "cannot be right, and the mint is the authority on what exists: at " +
+      "least one wallet here is counting coins the mint has already marked " +
+      "spent — the usual reason is a payment that went out and was " +
+      "never settled back into the wallet file. " + (canRecover
+        ? "Press Recover interrupted payments for each wallet."
+        : "Recover interrupted payments, under History, is what settles " +
+          "that, and this page has that button disabled in this state — " +
+          "it needs a mint that is answering and a wallet selected.") +
+      " Until that is done it is the balances above to doubt, not this " +
+      "line."]);
+  }
+  // WHY THE SUBTRACTION IS ALLOWED TO STAND, said once, under it. An
+  // operator reading this panel is being asked to believe a difference
+  // between two numbers read from two different places; this is the
+  // sentence that tells them what was done to make that difference mean
+  // something.
+  if (r.paired && r.residual !== null) {
+    lines.push(["note", "Both figures above come from one read pass, and " +
+      "the mint's total was the same immediately before and immediately " +
+      "after the balances were read — so the difference between them is " +
+      "an account of money and not the gap between two clocks."]);
+  }
+  // THE ONE CASE THE BRANCHES ABOVE DO NOT COVER: r.residual is null
+  // because the two figures did not come from one pass, so none of them
+  // fired. Saying nothing here would leave the mint's total and the
+  // wallets' total sitting one above the other with no word on whether
+  // they can be compared, which is an invitation to do the subtraction by
+  // eye -- the very subtraction this page just refused to do.
+  if (!r.paired && r.residual === null) {
+    const fail = opts && opts.pairFail;
+    const gapMs = (when && walletsWhen) ? Math.abs(when - walletsWhen) : null;
+    const head = fail === "moved"
+      ? "THE MINT'S TOTAL CHANGED WHILE THIS PAGE WAS READING THE WALLETS. " +
+        "Money moved during the read — from this page or from anywhere " +
+        "else — and the figure above and the figures beside it describe " +
+        "two different moments"
+      : fail === "unconfirmed"
+      ? "The mint did not answer when this page asked it a second time, " +
+        "after reading the balances, so nothing established that its total " +
+        "held still across the read"
+      : "Those two figures were NOT read in one pass" +
+        (gapMs === null ? "" : " — the mint's total at " + at(when) + ", the " +
+         "balances at " + at(walletsWhen) +
+         (gapMs >= 1000 ? ", " + (gapMs / 1000).toFixed(1) + " seconds apart"
+                        : ""));
+    lines.push(["note bad", head + ", so this page will not subtract one " +
+      "from the other and shows no unaccounted-for figure at all. Money " +
+      "that moved between two reads comes out of that subtraction looking " +
+      "exactly like money nobody can point to, and this page cannot tell " +
+      "the two apart. This is not a statement that nothing is unaccounted " +
+      "for. " +
+      (mintLive ? "Press Refresh to read both in one pass."
+                : "Both halves can only be read in one pass while the mint " +
+                  "is answering this page.")]);
+  }
+  return lines;
+}
+/* Which read the snapshot came from, and whether that read is still about
+   the mint that is answering now. The same rule the quote follows: a
+   figure is voided when the thing it describes has been replaced, and a
+   restart onto a different mint id replaces the whole ledger this
+   snapshot counted. */
+function supplyStale() {
+  if (linkFailure) return unredeemedStale();
+  if (mint.unknown) return "Mint state unknown — last read, not current: ";
+  if (!mint.running) return "The mint is stopped — last read, not current: ";
+  if (mint.responding === false)
+    return "The mint is running but not answering — last read, not current: ";
+  return "";
+}
+function renderSupply() {
+  // NEVER PAINT FROM INSIDE A PASS. refreshMoney() updates the mint's
+  // total and then the balances; a render between the two would show one
+  // half updated and the other not, which is the exact pairing this panel
+  // exists to guarantee. The pass paints once, at its end.
+  if (currentPass) return;
+  const el = $("w-supply");
+  let sup = mintSupply;
+  let why = supplyError;
+  if (sup && mint.mint_id && sup.mint_id && sup.mint_id !== mint.mint_id) {
+    // A different mint is answering on this workdir than the one that
+    // signed what is held here. Its ledger is not this one's, so the
+    // figure is not stale, it is about something else.
+    why = "the snapshot this page holds was signed by " + plain(sup.mint_id) +
+          " and the mint answering now calls itself " + plain(mint.mint_id) +
+          ", so it is not an account of this mint's money";
+    sup = null;
+  }
+  if (!sup && !why) {
+    why = mint.running ? "" : "no mint is running here, so none can be asked";
+  }
+  // ONE PASS, OR NO SUBTRACTION: the same pass number on both halves, and
+  // two clocks no further apart than PAIR_GAP_MS. The second test is not
+  // redundant -- a pass whose two reads were themselves slow is a pass
+  // with room for a payment in it.
+  const paired = !!(sup && supplyPass && supplyPass === walletsPass &&
+                    supplyReadAt && walletsReadAt &&
+                    Math.abs(supplyReadAt - walletsReadAt) <= PAIR_GAP_MS);
+  const r = reconcileSupply(sup, wallets, unredeemed,
+                            (sup && sup.mint_id) || mint.mint_id || "", paired);
+  // The two facts about this page's own controls that the sentences are
+  // not allowed to guess at: whether Recover can be pressed at all, and
+  // whether anything can be read from the mint right now.
+  const lines = supplyLines(r, supplyReadAt, walletsReadAt, why,
+    {pairFail: pairNote,
+     canRecover: !$("h-recover").disabled,
+     mintLive: !!(mint.running && !mint.unknown && mint.responding !== false &&
+                  !linkFailure)});
+  // A figure kept from an earlier read while the NEWEST read failed is the
+  // shape this whole round is about: the read time alone says how old it
+  // is, and not that the page has since asked and been refused. Said here,
+  // under the figure it is about, and only when there is a figure.
+  if (sup && supplyError) {
+    lines.push(["note bad", "The newest attempt to read that snapshot did " +
+      "not come back: " + supplyError + " The figure above is the last one " +
+      "that did, at the moment printed beside it."]);
+  }
+  // The "last read, not current" kicker belongs to a FIGURE. The line that
+  // says the figure is not known has nothing to be stale about, and
+  // stamping it there would read as though something had been read.
+  const pre = r.outstanding === null ? "" : supplyStale();
+  el.innerHTML = lines.map((l, i) => '<div class="' + l[0] + '">' +
+    esc((i === 0 ? pre : "") + l[1]) + '</div>').join("");
+}
+/* The supply snapshot out of a descriptor, with the moment it was read.
+   A descriptor that carries no snapshot is not a mint with no money: this
+   build of the mint did not say, and a zero here would be an invention. */
+function noteSupply(d) {
+  const sup = d && d.supply;
+  if (!sup || typeof sup.outstanding_mc !== "number") {
+    supplyError = "the mint's descriptor carried no supply snapshot, so " +
+      "this build of the mint does not say what it holds";
+    return;
+  }
+  mintSupply = sup;
+  supplyReadAt = Date.now();
+  // WHICH PASS this half was read in. 0 means "not read inside a pass at
+  // all", and 0 never matches the other half, so a snapshot picked up
+  // outside a pass is never subtracted from anything.
+  supplyPass = currentPass;
+  supplyReads++;
+  supplyError = "";
+}
+
 /* The running mint's own settings, written back into the form, so that a
    Stop followed by a Start cannot quietly change the mint's economics. */
 function applyDescriptor(d) {
+  // FIRST, and outside the burn-policy early return below: the supply
+  // snapshot is a different figure on a different panel, and a descriptor
+  // that carries no burn policy is no reason to drop the mint's own
+  // account of how much money exists.
+  noteSupply(d);
+  renderSupply();
   const p = policyFromDescriptor(d);
   if (!p) return;
   policy = p;
@@ -1751,7 +2457,7 @@ function applyDescriptor(d) {
   syncQuoteToMint();
 }
 
-async function refreshMint() {
+async function refreshMint(opts) {
   const r = await api("/api/mint/status");
   if (!r.ok) {
     // `unknown`, not `running: false`. The mint is a separate process; a
@@ -1770,7 +2476,15 @@ async function refreshMint() {
   $("fatal-banner").hidden = true;
   mint = r.data;
   renderMint();
-  if (mint.running) { refreshDescriptor(); if ($("m-logbox").open) refreshLogs(); }
+  if (mint.running) {
+    // Inside a money pass the descriptor is read by refreshMoney itself,
+    // awaited, immediately before the balances. A second read fired from
+    // here and never awaited lands whenever it lands, and that is exactly
+    // how the supply snapshot came to be older than the balances printed
+    // beside it.
+    if (!(opts && opts.deferDescriptor)) refreshDescriptor();
+    if ($("m-logbox").open) refreshLogs();
+  }
   else { $("m-desc").textContent = "not running"; }
 }
 
@@ -1778,7 +2492,71 @@ async function refreshDescriptor() {
   const r = await api("/api/mint/descriptor");
   $("m-desc").textContent = r.ok ? JSON.stringify(r.data, null, 2)
                                  : plain(r.detail) + "  [" + r.reason + "]";
-  if (r.ok) applyDescriptor(r.data);
+  if (r.ok) { applyDescriptor(r.data); return; }
+  // The last snapshot is KEPT, with its read time, the same way the last
+  // balances are -- and why the newest read failed is said beside it
+  // rather than left to look like the figure is current.
+  supplyError = whyText(failCode(r), r.detail);
+  renderSupply();
+}
+
+/* ONE PASS OVER THE MONEY: the mint's own total, then the balances that
+   are subtracted from it, back to back, stamped with one pass number and
+   painted once at the end. EVERY money-moving action on this page ends
+   here and not at refreshWallets(), because refreshing only the balances
+   leaves the supply snapshot from before the click standing beside the
+   balances from after it -- and their difference is then the money the
+   click just moved, printed as money nobody can account for. */
+async function refreshMoney(opts) {
+  // PASSES ARE SERIAL. Two overlapping passes share one `currentPass`,
+  // and the inner one clearing it would leave the outer one's reads
+  // stamped 0 -- unpaired, which is the safe direction but would quietly
+  // stop this panel reconciling at all on a slow machine. The idle poll
+  // drops its turn; a pass an operator caused waits for the one in flight
+  // and then runs, because it is about a click that has already happened.
+  if (passInFlight && opts && opts.polled) return;
+  while (passInFlight) await new Promise(go => setTimeout(go, 50));
+  passInFlight = true;
+  try {
+    // Status first and OUTSIDE the pass proper: it is not one of the two
+    // figures being subtracted, and it decides whether there is a mint to
+    // ask at all.
+    await refreshMint({deferDescriptor: true});
+    currentPass = ++passCounter;
+    const live = !!(mint.running && !mint.unknown && !linkFailure);
+    // A descriptor read that fails leaves supplyPass on an older pass,
+    // which is precisely what stops a stale snapshot pairing with fresh
+    // balances.
+    if (live) await refreshDescriptor();
+    await refreshWallets(opts);
+    // AND THEN ASK THE MINT AGAIN. Reading the two halves back to back
+    // shrinks the window between them; it does not close it, and money
+    // moved by another surface -- a second GUI, an agent, a script --
+    // lands in that window exactly as it landed in the four-second one.
+    // So the pass is only allowed to subtract when the mint's total is
+    // the SAME immediately before and immediately after the balances
+    // were read: that is a check on the window itself rather than a hope
+    // about its width. Anything else -- a changed total, a read that did
+    // not land -- un-stamps this half, and the panel says the two figures
+    // were not read in one pass instead of printing their difference.
+    let confirmed = false;
+    pairNote = "";
+    if (live && mintSupply && supplyPass === currentPass) {
+      const was = mintSupply.outstanding_mc, reads = supplyReads;
+      await refreshDescriptor();
+      const landed = supplyReads === reads + 1 && supplyPass === currentPass &&
+                     !!mintSupply;
+      confirmed = landed && mintSupply.outstanding_mc === was;
+      pairNote = confirmed ? "" : (landed ? "moved" : "unconfirmed");
+    }
+    if (!confirmed) supplyPass = 0;
+  } finally {
+    // Whatever happened above, the panel is painted exactly once, from
+    // outside the pass, with both stamps final.
+    currentPass = 0;
+    passInFlight = false;
+    renderSupply();
+  }
 }
 
 async function refreshLogs() {
@@ -1826,7 +2604,22 @@ async function issueInto() {
       "issued money has to land in one."); return; }
   busy = true; working($("f-go"), "issuing...");
   const r = await api("/api/mint/issue", {amount_mc: amount, count: count});
-  if (!r.ok) { busy = false; done($("f-go")); fail($("f-out"), r); return; }
+  if (!r.ok) {
+    busy = false; done($("f-go"));
+    fail($("f-out"), r);
+    // An issue nothing answered may have reached the ledger: app.py says
+    // so, and this is where the operator can go and look. The supply line
+    // is read from the mint, so it answers this after a reload, which no
+    // panel on this page does.
+    if (!requestSettled(failCode(r))) {
+      $("f-out").innerHTML += '<div class="warn bad">If it did happen, ' +
+        'that money is live in the mint and in no wallet, and its strings ' +
+        'are gone: they existed only in this request. The mint\'s supply ' +
+        'under <b>Wallets</b> is where it shows up — read that line ' +
+        'before issuing again, so the same money is not created twice.</div>';
+    }
+    return;
+  }
   const tokens = r.data.tokens || [];
   working($("f-go"), "crediting " + name + "...");
   const got = await api("/api/wallet/receive", {name: name, tokens: tokens});
@@ -1837,8 +2630,15 @@ async function issueInto() {
     $("f-out").innerHTML = '<div class="warn bad">The money was created but ' +
       esc(name) + ' did not take it. ' +
       esc(whyText(failCode(got), got.detail)) +
-      ' These token strings are the ONLY copy. Save them, then paste them into ' +
-      'Receive below.</div>' +
+      ' These token strings are the ONLY copy: /api/mint/issue persists ' +
+      'nothing and the mint keeps hashes, never secrets, so nothing can ' +
+      'read them back and a reload destroys them. Save them, then paste ' +
+      'them into Receive below.</div>' +
+      '<div class="warn bad">Until ' + esc(name) + ' takes it, that money ' +
+      'is live in the mint and in no wallet on this page. The mint\'s ' +
+      'supply line under <b>Wallets</b> counts it as exactly that, and ' +
+      'after a reload it is the only place on this page that still knows ' +
+      'the value exists.</div>' +
       '<div class="note">[' + esc(reasonKey(failCode(got))) + ']</div>' +
       tokenBlock(tokens, "", "warn bad");
     return;
@@ -1857,7 +2657,7 @@ async function issueInto() {
     (rej.length ? '<div class="warn bad">' + rej.length +
       ' token(s) rejected: ' + esc(rejectedInEnglish(rej)) + '</div>' +
       tokenBlock(rej.map(x => x.token), "Rejected tokens:", "note") : "");
-  await refreshWallets();
+  await refreshMoney();
 }
 
 /* ---------- wallets ---------- */
@@ -1939,6 +2739,10 @@ function renderWallets() {
   // wallet's unredeemed value, and they are redrawn together so none of
   // them can be a version behind the other two.
   renderUnredeemed();
+  // ...and the line that subtracts both of those from the mint's own
+  // total, for the same reason: it is built out of these two figures and
+  // must never be a poll behind either.
+  renderSupply();
   renderMint();
 }
 /* Follows `chosen` unconditionally: this select mirrors one piece of state
@@ -1990,6 +2794,11 @@ async function refreshWallets(opts) {
     return;
   }
   wallets = r.data.wallets || [];
+  // The moment THESE balances were read, and the pass they were read in.
+  // The supply line subtracts them from the mint's total only when that
+  // total carries the same pass number -- see refreshMoney().
+  walletsReadAt = Date.now();
+  walletsPass = currentPass;
   $("wallets-dir").textContent = r.data.dir || "the workdir";
   renderWallets();
   // Balances first, then what each wallet has handed out and nobody has
@@ -2008,7 +2817,7 @@ async function createWallet() {
   busy = false; done($("w-create"));
   if (!r.ok) { fail($("w-msg"), r); return; }
   $("w-name").value = "";
-  await refreshWallets();
+  await refreshMoney();
   setActive(name);
   // A new wallet takes over as the active one, which is the thing a reader
   // following a walkthrough does not expect and is not told. Say it here,
@@ -2050,7 +2859,24 @@ function invalidateQuote() {
        sentence left standing
    Five states, one defect, so they get one answer rather than five: the
    sentence in #p-quote remembers which mint state it was computed under,
-   and any change of that state voids it and re-checks. */
+   and any change of that state voids it and re-checks.
+
+   THE SAME RULE, FOR EVERY OTHER FIGURE THAT OUTLIVES ITS SOURCE. The
+   quote is not the only derived number on this page, and the principle
+   was never about quotes:
+     - the funding cost line in section 1 is derived from the burn policy,
+       and the burn policy is edited in a form sitting directly above it.
+       pendingPolicyState() is this same check for that figure: the boxes
+       and the policy the figure came from are compared, and a figure whose
+       policy has been edited away is voided rather than recomputed from
+       boxes no mint has read. See the comment above policyKey().
+     - the mint's supply snapshot in section 2 is a figure read at an
+       instant, so it is printed WITH that instant, caveated the moment
+       the mint stops answering, and discarded outright when the mint
+       answering is a different mint than the one that signed it. See
+       renderSupply().
+   A figure that cannot say when it was read, or that cannot notice its
+   source being replaced, is the same defect wearing different clothes. */
 function mintKey() {
   if (linkFailure) return "link:" + linkFailure.kind;
   if (mint.unknown) return "mint-unknown";
@@ -2172,6 +2998,96 @@ async function refreshQuote() {
   $("p-go").disabled = busy;
 }
 
+/* ---------- an aborted request is not a payment that did not happen ----
+   THE CLIENT GIVING UP IS NOT AN OUTCOME. api() aborts at its deadline,
+   which stops this page waiting; it does not stop app.py, the wallet or
+   the mint. A payment abandoned at twenty seconds can commit at
+   twenty-five: the wallet persists a payment's strings before it sends
+   the exchange, precisely because the answer may never come back, and
+   the mint commits when it commits. So the account this page gives of a
+   failed Pay must not read as "nothing moved" unless something actually
+   established that.
+   The table is the SETTLED set, not the undetermined one, and that
+   direction is the point: a code this page has never seen cannot support
+   the claim that no money moved, so anything not listed here is
+   undetermined and says so. Everything listed was refused BEFORE an
+   exchange could commit -- by this page's own gate (401/403), by app.py
+   validating the request or never routing it at all, by base_url()
+   finding no mint to send to, by walletops refusing at the door (a bad
+   amount, an unusable wallet file, a missing wallet folder, a store
+   another operation still holds, a mint address that is not one), by the
+   wallet finding it does not hold enough, or by the mint answering and
+   refusing -- INCLUDING answering 401 to an issue, which is
+   `not_authorized` and was missing from this table: an ordinary stale
+   mint-admin-keys.json made this page tell the operator that money it had
+   just been told was not created might be live in the mint.
+   WHAT IS DELIBERATELY ABSENT, and must stay absent: `wallet_store_error`,
+   `bad_component_response`, `bad_mint_response`, and above all
+   `component_error` and `internal_error`. The last two look like
+   validation failures and are not: app.py raises `component_error` from
+   the translate step that wraps ANY unexpected exception out of
+   walletops -- including one raised after ops.pay() has already exchanged
+   with the mint -- and `internal_error` is the catch-all around the whole
+   route handler, which spans the commit. A slug that CAN be raised after
+   the money moved cannot be evidence that it did not.
+   ISSUANCE ASKS THE SAME QUESTION, so it reads the same table: a
+   /api/mint/issue that nothing answered may still have reached the
+   ledger, and app.py says so in its own sentence. The two callers differ
+   only in where the money would have gone. */
+const REQUEST_SETTLED = {
+  bad_request: true, bad_json: true, bad_name: true, bad_token: true,
+  too_large: true, wallet_not_found: true, wallet_exists: true,
+  workdir_unreadable: true, wallet_create_failed: true, busy: true,
+  mint_control: true, gui_incomplete: true, not_found: true,
+  mint_stopped: true, insufficient_funds: true, mint_rejected: true,
+  rejected_by_mint: true, wrong_mint: true, not_from_this_mint: true,
+  coins_not_from_this_mint: true, amount_mismatch: true,
+  duplicate_request: true, malformed_token: true, already_spent: true,
+  wrong_lock_secret: true, bad_lock_witness: true, lock_expired: true,
+  refund_too_early: true, not_refundable: true, unauthorized: true,
+  not_loopback: true, cross_site: true,
+  // The mint answered 401 to an issue: it refused the operator
+  // credential, and nothing was issued. app.py's own sentence says so.
+  not_authorized: true,
+  // app.py never dispatched the request: no route ran.
+  method_not_allowed: true,
+  // walletops refused at the door, before anything was sent to the mint.
+  // Its own details say "nothing was sent to the mint" in as many words.
+  bad_amount: true, bad_mint_address: true, wallet_busy_elsewhere: true,
+  wallet_folder_missing: true, wallet_file_unusable: true
+};
+function requestSettled(code) { return REQUEST_SETTLED[reasonKey(code)] === true; }
+/* What #p-out says when /api/wallet/pay did not answer with a payment.
+   Pure: no DOM, no fetch. */
+function payFailureHtml(r, payer, amount, to) {
+  const code = failCode(r);
+  if (requestSettled(code)) return whyHtml(code, r.detail);
+  const who = to ? esc(to) : "whoever ends up holding the strings";
+  return '<div class="warn bad">Whether ' + esc(payer) + ' paid ' +
+    esc(mc(amount)) + ' is NOT known. ' + esc(whyText(code, r.detail)) +
+    '</div>' +
+    '<div class="note">[' + esc(reasonKey(code)) + ']</div>' +
+    '<div class="warn bad">This page stopped waiting; it did not stop the ' +
+    'request, and it cannot stop the mint. ' + esc(payer) + "'s wallet " +
+    'writes a payment\'s strings into its own file BEFORE the exchange is ' +
+    'sent, so the exchange can commit after this page has given up — ' +
+    'the money may have left ' + esc(payer) + ', and ' + who + ' may be ' +
+    'holding it. Nothing here is a record that it did not happen. The ' +
+    'balance beside ' + esc(payer) + ' above was read before this.</div>' +
+    '<div class="warn bad">Do NOT simply press Pay again: a second payment ' +
+    'of ' + esc(mc(amount)) + ' can commit on top of a first one that also ' +
+    'committed.</div>' +
+    '<div class="note">How to find out, once this page is being answered ' +
+    'again: press <b>Recover interrupted payments</b> under History, which ' +
+    'asks the mint what really became of anything this wallet started and ' +
+    'never got an answer for; read the history rows for ' + esc(payer) +
+    ', where a payment that committed is recorded and one still unsettled ' +
+    'reads "not settled"; and press <b>Show the strings nobody has ' +
+    'redeemed</b> to see which of this payment\'s strings are still money. ' +
+    'The money-adds-up line under Wallets is the other check: value that ' +
+    'left ' + esc(payer) + ' and reached nobody is in it.</div>';
+}
+
 async function payNow() {
   // The amount comes from the QUOTE, never from the input box: the box can
   // have changed since the quote was shown, and money must only ever move
@@ -2243,7 +3159,13 @@ async function payNow() {
   const r = await api("/api/wallet/pay",
                       to ? {name: payer, amount_mc: amount, to: to}
                          : {name: payer, amount_mc: amount});
-  if (!r.ok) { busy = false; done($("p-go")); fail($("p-out"), r); await refreshWallets(); return; }
+  if (!r.ok) {
+    busy = false; done($("p-go"));
+    // NOT fail(): "the request was abandoned" and "the payment did not
+    // happen" are different claims, and only one of them is established.
+    $("p-out").innerHTML = payFailureHtml(r, payer, amount, to);
+    await refreshMoney(); return;
+  }
   const tokens = r.data.tokens || [];
   // The PAYER's half of the promise, checked. The recipient's half was
   // already checked below; this half was not, and a policy change between
@@ -2282,7 +3204,7 @@ async function payNow() {
     // been used. Voided here, on the same tick it was used.
     invalidateQuote();
     $("p-out").innerHTML += await savedCopyNote(payer, tokens);
-    await refreshWallets(); await refreshHistory(); scheduleQuote(); return;
+    await refreshMoney(); await refreshHistory(); scheduleQuote(); return;
   }
   // DID THIS SERVER TAKE THE RECIPIENT? app.py answers a pay it delivered
   // itself with the record it wrote -- recipient_kind "wallet" and the
@@ -2367,7 +3289,7 @@ async function payNow() {
       $("p-out").innerHTML += await savedCopyNote(payer, tokens);
       $("p-out").innerHTML += stillMoneyHtml(payer, String(r.data.op_id));
     }
-    await refreshWallets(); await refreshHistory(); refreshQuote();
+    await refreshMoney(); await refreshHistory(); refreshQuote();
     return;
   }
   // The server did not take a recipient: deliver from here, as before, and
@@ -2433,7 +3355,7 @@ async function payNow() {
       ' token(s) rejected: ' + esc(rejectedInEnglish(rej)) +
       '</div>' + tokenBlock(rej.map(x => x.token), "Rejected:", "note") : "");
   }
-  await refreshWallets(); await refreshHistory(); refreshQuote();
+  await refreshMoney(); await refreshHistory(); refreshQuote();
 }
 
 /* ---------- receive ---------- */
@@ -2496,7 +3418,7 @@ async function receiveNow() {
       'again.</div>';
   }
   $("r-out").innerHTML = html;
-  await refreshWallets(); await refreshHistory();
+  await refreshMoney(); await refreshHistory();
 }
 
 /* The reasons a batch was partly refused, deduplicated, in English. Each
@@ -2632,6 +3554,18 @@ async function refreshHistory() {
       " \u201cnot recorded\u201d rather than \u201cdelivered\u201d. A row " +
       "that does not say cannot be read as a row that says yes.";
   }
+  // WHEN THESE ROWS WERE READ. The history is the one money panel on this
+  // page that no poll refreshes -- it is re-read on Refresh history, on a
+  // wallet switch and after this page moves money, and at no other moment
+  // -- so a table that looks current can be minutes old and say nothing
+  // about it. The rows carry no clock of their own either (the wallet
+  // store records none, which is why every When cell reads "not
+  // recorded"), so without this the panel could answer neither "when did
+  // this happen" nor "when was this read".
+  $("h-note").textContent += ($("h-note").textContent ? " " : "") +
+    "Read at " + new Date().toLocaleTimeString() +
+    ". This table does not refresh itself \u2014 press Refresh history to " +
+    "read it again.";
   historyHtml = rows.length ? rows.map(historyRowHtml).join("") : "";
   historyNote = $("h-note").textContent;
   historyName = active;
@@ -2973,10 +3907,15 @@ function unredeemedRecoverLines(rec, name) {
     // "Nothing is unredeemed either" is a statement about every payment
     // this wallet ever made. A capped read cannot make it.
     lines.push(["note bad", "Nothing is unredeemed in the " +
-      UNREDEEMED_LIMIT + " most recent payments " + who + " made. That is " +
-      "not the same as nothing being unredeemed: this page cannot read " +
-      "past " + UNREDEEMED_LIMIT + " payments in one go, so older ones " +
-      "were not read and were not asked about. " + aside]);
+      n(rec.ops.length, "payment", "payments") + " of " + who + "\u2019s that " +
+      "this read covered" +
+      (rec.payment_count ? ", out of " + rec.payment_count + " it has made" : "") +
+      ". That is not the same as nothing being unredeemed: the read takes " +
+      "the payments still holding an unretired string first and then " +
+      "stops, so the rest were not read and were not asked about." +
+      (rec.unlisted_outstanding_mc
+         ? " " + mc(rec.unlisted_outstanding_mc) + " of handed-out value " +
+           "was not reached." : "") + " " + aside]);
   }
   if (!lines.length) {
     lines.push(["note ok", rec.count
@@ -3020,14 +3959,14 @@ async function recoverNow() {
         "longer the active wallet, so its result is not shown here \u2014 it " +
         "would read as this wallet's. Click " + name + " in the wallet list " +
         "and press Recover again to read it.");
-    await refreshWallets(); await refreshHistory(); return;
+    await refreshMoney(); await refreshHistory(); return;
   }
   $("h-out").innerHTML =
     recoverLines(r.data.result, r.data.balance_mc, rec, name)
       .map(l => '<div class="' + l[0] + '">' + esc(l[1]) + '</div>').join("") +
     '<details><summary>The raw counters recovery reported</summary><pre>' +
     esc(JSON.stringify(r.data.result, null, 2)) + '</pre></details>';
-  await refreshWallets(); await refreshHistory();
+  await refreshMoney(); await refreshHistory();
 }
 
 /* ---------- token lookup ---------- */
@@ -3038,12 +3977,29 @@ async function lookupToken() {
   const r = await api("/api/token/status?token=" + encodeURIComponent(q));
   done($("t-go"));
   if (!r.ok) { fail($("t-out"), r); return; }
-  $("t-out").innerHTML = '<pre>' + esc(JSON.stringify(r.data.result || r.data.raw, null, 2)) +
-    '</pre>';
+  // WHEN, because a token's state is the one figure on this page that can
+  // change between two reads with nothing on screen moving: an unspent
+  // token is money until somebody redeems it, and this answer does not
+  // refresh itself. Same rule as the strings panel above it.
+  // ONE CLOCK, not two. When the server dates its own answer -- app.py
+  // sends `as_of` in words and `observed_at_ms` -- that date IS the
+  // answer's date and is the one shown; this page's clock speaks only
+  // when nothing else did. Printing both would put two moments beside one
+  // reading, which is the disagreement this round is about.
+  const res = r.data.result || r.data.raw;
+  const dated = (res && res.as_of) || r.data.as_of ||
+    (typeof r.data.observed_at_ms === "number" ? when(r.data.observed_at_ms) : "");
+  $("t-out").innerHTML = '<div class="note">' + (dated
+      ? esc(plain(String(dated)))
+      : 'Asked of the mint at ' + esc(new Date().toLocaleTimeString()) +
+        ' by this page\'s own clock, because the answer carried no date of ' +
+        'its own. A token that reads unspent here can be spent by whoever ' +
+        'holds it a second later; press Check status again to ask again.') +
+    '</div>' + '<pre>' + esc(JSON.stringify(res, null, 2)) + '</pre>';
 }
 
 /* ---------- wiring ---------- */
-async function refreshAll() { await refreshMint(); await refreshWallets(); await refreshHistory(); }
+async function refreshAll() { await refreshMoney(); await refreshHistory(); }
 $("m-start").addEventListener("click", startMint);
 $("m-stop").addEventListener("click", stopMint);
 $("m-refresh").addEventListener("click", refreshAll);
@@ -3070,6 +4026,17 @@ $("p-to").addEventListener("change", () => {
 for (const id of ["m-id", "m-baseline", "m-port", "m-rate", "m-cap", "m-exempt"]) {
   $(id).addEventListener("input", () => { settingsEdited = true; });
 }
+// The three burn fields are the source of two figures on this screen --
+// the policy sentence in section 1 and the funding cost line under it --
+// and both stop being true on the keystroke, not at the next four-second
+// poll. Redrawn through renderMint() rather than by calling those two
+// directly, because which sentence each of them may hold depends on
+// whether this page can see app.py and whether app.py can see the mint:
+// renderMint is the one function that knows, and a keystroke must not be
+// able to paint a policy sentence over a lockout.
+for (const id of ["m-rate", "m-cap", "m-exempt"]) {
+  $(id).addEventListener("input", renderMint);
+}
 $("p-requote").addEventListener("click", refreshQuote);
 $("p-go").addEventListener("click", payNow);
 $("r-go").addEventListener("click", receiveNow);
@@ -3092,7 +4059,7 @@ setInterval(() => {
   if (linkFailure && ANSWERED[linkFailure.kind]) return;
   // `polled` marks this as the IDLE sweep: balances every four seconds,
   // the secret-bearing unredeemed read at most every UNREDEEMED_SWEEP_MS.
-  refreshMint(); refreshWallets({polled: true});
+  refreshMoney({polled: true});
 }, 4000);
 // The uptime ticker. It must not re-assert the healthy sentence over the
 // "not answering" one renderMint just wrote -- an uptime climbing beside a
