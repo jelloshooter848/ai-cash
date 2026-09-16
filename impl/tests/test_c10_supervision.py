@@ -8,17 +8,22 @@ components/C10-supervision.md are named in each test's docstring.
 
 import http.client
 import json
+import logging
 import os
+import socket
 import sqlite3
 import tempfile
+import time
 import unittest
 from typing import NamedTuple
 
 from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger
-from aicash.mintapi import MintConfig
+from aicash import mintapi
+from aicash.mintapi import MintConfig, MintServer
 from aicash.signing import generate_keypair, verify_obj
+from aicash import supervision
 from aicash.supervision import SupervisionServer
 from aicash.tokencodec import (
     b64u_decode,
@@ -53,6 +58,21 @@ STATEMENT_KEYS = {
 }
 LINE_KEYS = {"t", "kind", "amount_mc", "counterparty_account", "ref"}
 
+#: Sentinel for "this class declares no such attribute of its own".
+_MISSING = object()
+
+
+def _sup_body_cap():
+    """The request-body bound C10 is required to enforce, in bytes.
+
+    Read from supervision.py when it declares one so a retune keeps the
+    tests in step, but DEFAULTED on purpose: a missing constant must make
+    the cap tests fail on behaviour (an over-cap body being read, parsed
+    and served) rather than on an AttributeError about a module constant.
+    """
+    return getattr(supervision, "_MAX_BODY_BYTES", 1 << 20)
+
+
 
 def api(port, method, path, obj=None, key=None):
     """One HTTP round trip; returns (status, parsed json body)."""
@@ -68,6 +88,116 @@ def api(port, method, path, obj=None, key=None):
         return resp.status, json.loads(raw.decode("utf-8"))
     finally:
         conn.close()
+
+
+def _response_complete(buf):
+    """True once `buf` holds a whole response (our mint always sends
+    Content-Length, so framing never needs chunk parsing)."""
+    head, sep, body = buf.partition(b"\r\n\r\n")
+    if not sep:
+        return False
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            return len(body) >= int(value.strip())
+    return False
+
+
+def raw_api(port, request_bytes, read_timeout=10.0):
+    """Send hand-built request bytes (so the declared Content-Length can
+    lie) and read the answer. Returns (status, parsed json), or
+    (None, None) if the server never answered — which is exactly what an
+    unbounded body read looks like from the client side."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
+    try:
+        sock.sendall(request_bytes)
+        buf = b""
+        while not _response_complete(buf):
+            try:
+                chunk = sock.recv(65536)
+            except OSError:  # includes the client-side TimeoutError
+                return None, None
+            if not chunk:  # server hung up without a full response
+                return None, None
+            buf += chunk
+        head, _, body = buf.partition(b"\r\n\r\n")
+        status = int(head.split(b" ")[1])
+        return status, json.loads(body.decode("utf-8"))
+    finally:
+        sock.close()
+
+
+def raw_probe(port, request_bytes, half_close=False, read_timeout=10.0):
+    """Send hand-built bytes and read back ONE response.
+
+    Returns (status_line, connection_header, parsed-or-raw body) — the
+    parts of an answer that are behaviour rather than environment (Date
+    and Server carry the clock and the version). (None, None, None) means
+    the server never produced a whole response, which is what an unbounded
+    read looks like from the client side. ``half_close`` shuts the write
+    side after sending, so a deliberately short body reaches the server as
+    EOF instead of as a stall.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
+    try:
+        sock.sendall(request_bytes)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
+        buf = b""
+        while not _response_complete(buf):
+            try:
+                chunk = sock.recv(65536)
+            except OSError:  # includes the client-side TimeoutError
+                return None, None, None
+            if not chunk:
+                return None, None, None
+            buf += chunk
+        head, _, body = buf.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        connection = None
+        for line in lines[1:]:
+            name, _sep, value = line.partition(b":")
+            if name.strip().lower() == b"connection":
+                connection = value.strip().lower()
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            parsed = body
+        return lines[0], connection, parsed
+    finally:
+        sock.close()
+
+
+def raw_to_eof(port, request_bytes, read_timeout=5.0):
+    """Send hand-built bytes and read until the server hangs up. Returns
+    (bytes, closed): ``closed`` is False when the server was still holding
+    the connection when the client gave up."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
+    try:
+        sock.sendall(request_bytes)
+        buf = b""
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:  # client-side timeout: still open
+                return buf, False
+            if not chunk:
+                return buf, True
+            buf += chunk
+    finally:
+        sock.close()
+
+
+def status_lines(raw):
+    """How many HTTP responses are in ``raw``.
+
+    Counts occurrences rather than LINES beginning with the status line.
+    Two pipelined responses arrive glued — the second status line follows
+    the first response's body with no CRLF in front of it
+    (``...{"status":"unauthorized"}HTTP/1.1 401 ...``) — so a line-prefix
+    scan reports 1 for exactly the desync these tests exist to catch.
+    """
+    return raw.count(b"HTTP/1.1 ")
 
 
 class Mint(NamedTuple):
@@ -1616,6 +1746,453 @@ class SupervisionTest(unittest.TestCase):
             )
         ]
         self.assertEqual(kinds, ["freeze", "unfreeze"])
+
+    # ------------------------------------------------------------------ #
+    # hardening: request-body cap, connection timeout, credential logging #
+    # ------------------------------------------------------------------ #
+    #
+    # Every test below that claims C10 hardened something first NEUTRALIZES
+    # the equivalent guard C06's handler carries. _SupHandler subclasses
+    # _Handler, so without that step an assertion like "an over-size body is
+    # refused" passes by inheritance and proves nothing about supervision.py
+    # — it would keep passing with this whole change reverted. Relaxing C06's
+    # cap / removing C06's timeout for the duration of one test leaves only
+    # supervision.py's own bound standing, which is the thing under test.
+
+    def relax_inherited_body_cap(self):
+        """Raise C06's body cap out of reach for this test.
+
+        MAX_BODY_BYTES is read per request, so this disarms the inherited
+        guard without touching C06's code. Only a cap C10 enforces itself
+        can refuse an over-size body while this is in force.
+        """
+        original = mintapi.MAX_BODY_BYTES
+        mintapi.MAX_BODY_BYTES = 1 << 40
+        self.addCleanup(setattr, mintapi, "MAX_BODY_BYTES", original)
+
+    def drop_inherited_socket_timeout(self):
+        """Remove C06's handler timeout for this test.
+
+        socketserver reads ``timeout`` off the handler CLASS, so an
+        inherited value would bound the connection even if _SupHandler
+        declared none. With it gone, a connection survives only if C10
+        bounds it.
+        """
+        parent = mintapi._Handler
+        original = parent.__dict__.get("timeout", _MISSING)
+        parent.timeout = None
+
+        def restore():
+            if original is _MISSING:  # pragma: no cover - C06 declares one
+                del parent.timeout
+            else:
+                parent.timeout = original
+
+        self.addCleanup(restore)
+
+    def shrink_c10_socket_timeout(self, seconds=0.3):
+        """Exercise the real stalled-client mechanism at a test-sized
+        timeout — but only if _SupHandler declares a timeout of its own.
+
+        Setting one unconditionally would CREATE the very attribute under
+        test, so a handler with no bound of its own is left exactly as it
+        is: the behavioural assertions then fail on a connection that is
+        never released, which is the failure this guards against.
+        """
+        own = supervision._SupHandler.__dict__.get("timeout", _MISSING)
+        if own is _MISSING:  # pragma: no cover - fix present
+            return
+        self.assertIsNotNone(own)
+        self.assertLessEqual(own, 300.0)
+        supervision._SupHandler.timeout = seconds
+        self.addCleanup(setattr, supervision._SupHandler, "timeout", own)
+
+    def start_plain_mint(self):
+        """A plain C06 mint with no Supervision Profile, for the L13/B9
+        identity comparison: same config, same ledger shape, different
+        server class."""
+        clock = FakeClock(T0)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "plain.sqlite3")
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            db_path,
+            clock,
+            NO_BURN,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=NO_BURN,
+            signing_private=priv,
+            signing_public=pub,
+            profiles=(),
+        )
+        server = MintServer(config, ledger)
+        port = server.start()
+        self.addCleanup(server.stop)
+        return port
+
+    # -- L13/B9: Layer 0 is untouched by the supervision hardening ------
+
+    def test_layer0_body_refusals_match_a_plain_c06_mint(self):
+        """L13/B9: a supervision mint must answer Layer 0 exactly as a
+        plain C06 mint does, refusals included.
+
+        C06 chooses the §3.8 reason for a body it will not read, and the
+        choice is normative: `over_batch_limit` is retryable with backoff
+        and tells the caller to split the call, `bad_format` says the
+        envelope must not be resent as-is (spec §3.8 and the retry rules
+        under "Error semantics on invalid payment"). A C10 handler that
+        re-answered the INHERITED routes with its own reason would hand a
+        Layer 0 client the wrong recovery signal for the same bytes. So
+        this compares the two servers on identical wire bytes rather than
+        asserting any particular reason string.
+        """
+        plain = self.start_plain_mint()
+        sup = self.start_mint().port
+
+        def head(path, length):
+            return (
+                "POST " + path + " HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: " + str(length) + "\r\n\r\n"
+            ).encode("ascii")
+
+        cases = [
+            # over C06's published cap: the reason that diverged.
+            (head("/v3/exchange", mintapi.MAX_BODY_BYTES + 1), b"", False),
+            (head("/v3/status", mintapi.MAX_BODY_BYTES + 1), b"", False),
+            (head("/admin/issue", mintapi.MAX_BODY_BYTES + 1), b"", False),
+            # unparseable declared length.
+            (head("/v3/exchange", "not-a-number"), b"{}", True),
+            # declared longer than sent: EOF mid-body.
+            (head("/v3/exchange", 4096), b'{"inputs":[]}', True),
+            # well-framed but not JSON.
+            (head("/v3/exchange", 7), b"nonJSON", False),
+        ]
+        for request_head, body, half_close in cases:
+            with self.subTest(request=request_head.split(b"\r\n")[0]):
+                want = raw_probe(
+                    plain, request_head + body, half_close=half_close
+                )
+                got = raw_probe(
+                    sup, request_head + body, half_close=half_close
+                )
+                self.assertIsNotNone(want[0], "plain C06 mint gave no answer")
+                self.assertEqual(got, want)
+
+    def test_malformed_content_length_closes_the_connection(self):
+        """An unparseable Content-Length on a SUPERVISION route leaves the
+        declared body unread, so the connection can no longer be framed:
+        it must be closed, not returned to the keep-alive pool.
+
+        Left open, the unconsumed octets are parsed as the next request
+        line — a pipelining client or a connection-reusing proxy turns
+        request N's body into request N+1, and the stdlib's 501 page
+        echoes the attacker's bytes back to the peer. On the server that
+        holds operator credentials, caps, freezes and pulls, that is the
+        shape of request smuggling.
+        """
+        m = self.start_mint()
+        smuggled = b'{"operator_name":"smuggled"}'
+        request = (
+            b"POST /v3/operator/register HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            # int() would accept "1_0" or " 10 "; an RFC-conformant proxy
+            # would not. The disagreement is exactly what desyncs framing.
+            b"Content-Length: 0x10\r\n\r\n"
+        ) + smuggled + b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        raw, closed = raw_to_eof(m.port, request)
+        self.assertTrue(closed, "connection held open after a refused body")
+        self.assertEqual(status_lines(raw), 1, raw[:400])
+        self.assertIn(b"400", raw.split(b"\r\n")[0])
+        self.assertIn(b"\r\nConnection: close\r\n", raw)
+        self.assertNotIn(b"smuggled", raw)
+        # Nothing was registered by either the refused or the smuggled half.
+        self.assertEqual(
+            self.sup_rows(m, "SELECT COUNT(*) FROM sup_operators")[0][0], 0
+        )
+
+    def test_supervision_get_with_a_declared_body_cannot_frame_a_request(self):
+        """A GET on a SUPERVISION route that declares a body must close.
+
+        C06's do_GET gained this guard, but ``_SupHandler.do_GET`` returns
+        before ever reaching it for a route in ``_ROUTES`` — so the two
+        GET routes this profile adds (/v3/operator/statement and
+        /v3/agent/balance) kept answering on a connection whose framing
+        was already gone. Nothing reads a GET body, so the declared octets
+        stay on the wire and the stdlib parses them as the NEXT request
+        line: the pipelined GET below got its own 200 on the same socket.
+        Behind the connection-reusing reverse proxy DEPLOYMENT.md tells
+        the operator to run, that extra response is delivered to whoever
+        holds the pooled connection next.
+
+        Asserted on the supervision route specifically: the equivalent
+        Layer 0 test lives in test_c06_mintapi and passes either way, so
+        only this one fails if the guard is dropped from _SupHandler.
+        """
+        m = self.start_mint()
+        smuggled = b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        request = (
+            b"GET /v3/agent/balance HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(smuggled)
+        ) + smuggled
+        raw, closed = raw_to_eof(m.port, request)
+        self.assertTrue(closed, "connection held open after an unread body")
+        self.assertEqual(
+            status_lines(raw),
+            1,
+            "the smuggled request line was answered as a second response: "
+            + repr(raw[:400]),
+        )
+        self.assertIn(b"\r\nConnection: close\r\n", raw)
+
+    def test_supervision_get_without_a_body_still_keeps_the_connection(self):
+        """The framing guard must not hang up on an ordinary GET.
+
+        Closing every supervision GET would be a correct-but-useless fix:
+        HTTP/1.1 keep-alive is what makes a statement poller cheap. Only a
+        DECLARED-but-unread body may cost the connection.
+        """
+        m = self.start_mint()
+        request = (
+            b"GET /v3/agent/balance HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n\r\n"
+            b"GET /v3/agent/balance HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        raw, _closed = raw_to_eof(m.port, request)
+        self.assertEqual(
+            status_lines(raw),
+            2,
+            "keep-alive was dropped on a bodiless GET: " + repr(raw[:400]),
+        )
+
+    # -- C10's own body cap ---------------------------------------------
+
+    def test_oversize_body_refused_before_it_is_read(self):
+        """A Content-Length above C10's cap is refused without reading (or
+        allocating) a byte of the declared body, so one request cannot
+        exhaust the mint's memory or park its thread waiting for a body the
+        client never sends. The refusal reuses this module's existing
+        'bad_format' rejection.
+
+        C06's cap is raised and C06's handler timeout removed first, so
+        the only thing that can produce an answer here is a bound
+        supervision.py enforces itself: with this change reverted the
+        server reads 16 GiB that never arrive and never replies.
+        """
+        self.relax_inherited_body_cap()
+        self.drop_inherited_socket_timeout()
+        m = self.start_mint()
+        _op_id, op_key = self.new_operator(m)
+        head = (
+            "POST /v3/operator/agents HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer " + op_key + "\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(1 << 34) + "\r\n\r\n"
+        ).encode("ascii")
+        # No body follows: an uncapped reader blocks here until the peer
+        # sends 16 GiB, which it never will.
+        started = time.monotonic()
+        status, connection, body = raw_probe(m.port, head, read_timeout=5.0)
+        elapsed = time.monotonic() - started
+        self.assertIsNotNone(
+            status, "no answer: the declared body was being read"
+        )
+        self.assertLess(elapsed, 2.0, "answered only after reading/waiting")
+        self.assertIn(b"400", status)
+        self.assertEqual(body, {"status": "rejected", "reason": "bad_format"})
+        self.assertEqual(connection, b"close")  # body unread => unframable
+        # ...and nothing was created by the refused request.
+        self.assertEqual(
+            self.sup_rows(m, "SELECT COUNT(*) FROM sup_agents")[0][0], 0
+        )
+
+    def test_body_cap_boundary_exact_size_still_accepted(self):
+        """The cap is a bound, not a blanket refusal: a body of exactly
+        the cap is served normally, one byte more is rejected.
+
+        Both bodies are sent in full, so neither timeouts nor C06's
+        (relaxed) cap can decide the outcome — only C10's own comparison
+        can. Reverted, the over-cap body is read, parsed and registers an
+        operator, and the count below is 2.
+        """
+        self.relax_inherited_body_cap()
+        cap = _sup_body_cap()
+        m = self.start_mint()
+
+        def sized(name, total):
+            obj = {"operator_name": name, "pad": ""}
+            obj["pad"] = "a" * (total - len(json.dumps(obj).encode("utf-8")))
+            self.assertEqual(len(json.dumps(obj).encode("utf-8")), total)
+            return obj
+
+        status, r = api(
+            m.port, "POST", "/v3/operator/register", sized("exact", cap)
+        )
+        self.assertEqual(status, 200, r)
+        self.assertIn("operator_key", r)
+
+        status, r = api(
+            m.port, "POST", "/v3/operator/register", sized("over", cap + 1)
+        )
+        self.assertEqual(status, 400, r)
+        self.assertEqual(r, {"status": "rejected", "reason": "bad_format"})
+        # Only the accepted request registered an operator.
+        self.assertEqual(
+            self.sup_rows(m, "SELECT COUNT(*) FROM sup_operators")[0][0], 1
+        )
+
+    # -- C10's own connection timeout -----------------------------------
+
+    def test_handler_has_socket_timeout_and_drops_a_stalled_client(self):
+        """A client that announces a body and then sends nothing has its
+        connection released (rejected and closed, or just closed) instead
+        of holding a ThreadingHTTPServer thread until it decides to
+        finish.
+
+        C06's inherited timeout is removed first, so the release can only
+        come from a bound _SupHandler declares itself; reverted, this
+        connection is held until the client gives up.
+        """
+        self.drop_inherited_socket_timeout()
+        self.shrink_c10_socket_timeout(0.3)
+        m = self.start_mint()
+        head = (
+            "POST /v3/operator/register HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 40\r\n\r\n"
+        ).encode("ascii")
+        # ...and never the 40 promised bytes.
+        seen, closed = raw_to_eof(m.port, head, read_timeout=5.0)
+        self.assertTrue(closed, "connection still held after C10's timeout")
+        if seen:  # if it answered first, only with the module's own reason
+            self.assertIn(b"400", seen.split(b"\r\n")[0])
+            self.assertIn(b'"reason":"bad_format"', seen)
+        # The stall cost the mint nothing: it still serves everyone else.
+        self.assertTrue(self.new_operator(m, "after")[1])
+
+    def test_idle_keep_alive_connection_is_not_held_forever(self):
+        """An HTTP/1.1 keep-alive connection left idle after a completed
+        request is closed by C10's timeout — otherwise every abandoned
+        client permanently costs one server thread. C06's timeout is
+        removed first, so only C10's own bound can close it."""
+        self.drop_inherited_socket_timeout()
+        self.shrink_c10_socket_timeout(0.3)
+        m = self.start_mint()
+        conn = http.client.HTTPConnection("127.0.0.1", m.port, timeout=10.0)
+        try:
+            conn.request(
+                "POST",
+                "/v3/operator/register",
+                json.dumps({"operator_name": "idle"}).encode("utf-8"),
+            )
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            json.loads(resp.read().decode("utf-8"))
+            conn.sock.settimeout(5.0)
+            try:
+                self.assertEqual(
+                    conn.sock.recv(1), b"", "idle connection stayed open"
+                )
+            except ConnectionError:
+                pass  # reset instead of a clean close: also released
+            except TimeoutError:
+                self.fail("idle keep-alive connection was never released")
+        finally:
+            conn.close()
+
+    def test_internal_timeout_answers_with_a_500(self):
+        """A TimeoutError raised while PRODUCING the answer is an internal
+        fault and owes the caller a 500.
+
+        The handler catches TimeoutError to cope with its own socket
+        timeout firing on a stalled peer. Catching it around the whole
+        dispatch would also swallow one raised inside _SupCore (a lock
+        wait, a clock, anything) and answer nothing at all — a caller
+        cannot tell 'the mint failed internally' from 'my connection
+        died', and the mint's 'never a stack trace, always a status'
+        contract silently stops holding.
+        """
+        m = self.start_mint()
+        core = m.server.sup
+        original = core.dispatch
+
+        def boom(*args, **kwargs):
+            raise TimeoutError("internal wait, not a dead peer")
+
+        core.dispatch = boom
+        self.addCleanup(setattr, core, "dispatch", original)
+
+        body = json.dumps({"operator_name": "x"}).encode("utf-8")
+        request = (
+            "POST /v3/operator/register HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + str(len(body)) + "\r\n\r\n"
+        ).encode("ascii") + body
+        status, _conn, parsed = raw_probe(
+            m.port, request, read_timeout=5.0
+        )
+        self.assertIsNotNone(status, "the connection was dropped in silence")
+        self.assertIn(b"500", status)
+        self.assertEqual(parsed, {"status": "error"})  # never a traceback
+
+    # -- standing guard (no fix behind it; see the docstring) ------------
+
+    def test_no_credential_reaches_the_access_log(self):
+        """STANDING GUARD on §6.1(1) bearer keys, not a regression test:
+        the credential audit that ran with this hardening changed no code,
+        because supervision.py contains no logger call and the inherited
+        access log already records route pattern + status only. This test
+        exists so that stays true — it passes today and is meant to fail
+        the day a body, a header or a query string starts being logged."""
+        m = self.start_mint()
+        _op_id, op_key = self.new_operator(m)
+        a_id, a_key = self.new_agent(m, op_key)
+
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        logger = logging.getLogger("aicash.mintapi")
+        handler = Capture()
+        logger.addHandler(handler)
+        old_level, old_prop = logger.level, logger.propagate
+        logger.setLevel(logging.DEBUG)
+        self.addCleanup(
+            lambda: (
+                logger.removeHandler(handler),
+                logger.setLevel(old_level),
+                setattr(logger, "propagate", old_prop),
+            )
+        )
+
+        self.balance(m, a_key)
+        self.balance(m, op_key, agent_id=a_id)
+        api(m.port, "GET", "/v3/agent/balance?agent_id=" + a_id, key="nope")
+        api(m.port, "POST", "/v3/operator/agents", {"agent_name": "x"},
+            key=op_key)
+
+        self.assertTrue(records, "nothing logged: the guard would be vacuous")
+        joined = "\n".join(records)
+        self.assertNotIn(op_key, joined)
+        self.assertNotIn(a_key, joined)
+        self.assertNotIn("Bearer", joined)
+        self.assertNotIn("nope", joined)
 
 
 if __name__ == "__main__":

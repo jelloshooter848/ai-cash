@@ -48,6 +48,20 @@ Design notes
   debit-like statement lines, evaluated at debit commit with the injected
   mint clock; ``absolute`` is the lifetime debit total. A line aged exactly
   window ms no longer counts (strict ``t > now - window``).
+* Serving limits (deployment hardening, not protocol): the supervision
+  routes run on a SECOND stdlib ThreadingHTTPServer, so an unbounded
+  request body or an untimed socket costs the mint memory or a parked
+  thread. ``_MAX_BODY_BYTES`` is checked against Content-Length before
+  anything is read, and ``_SupHandler.timeout`` bounds how long one
+  connection may stall or idle. Both are local copies of the guard C06's
+  handler carries: C10 must not silently lose its bound if C06's changes
+  (L17 leaves rate limiting and TLS out of the reference build, so these
+  two caps are all there is). An over-size body is refused with the
+  existing ``bad_format`` rejection — no new error vocabulary. The cap
+  lives on a C10-private reader (``_read_sup_json``), never as an
+  override of C06's ``_read_json``: the inherited Layer 0 routes must
+  keep answering exactly as a plain C06 mint does (L13/B9), including
+  C06's own choice of §3.8 reason for a body it refuses.
 * Statement (§6.1(7)): built from the ``sup_lines`` journal, pinned schema,
   signed with the mint key over canonical JSON (C05). Generation enforces
   the balance invariant: the journal-derived balance must equal both the
@@ -1221,6 +1235,29 @@ class _SupHTTPServer(_MintHTTPServer):
     sup: _SupCore  # set by SupervisionServer.start
 
 
+#: Largest request body these routes will read, in bytes. Content-Length
+#: is attacker-controlled, so reading it before checking it IS the denial
+#: of service: one request would otherwise make the mint allocate an
+#: arbitrary amount of memory. The largest legitimate supervision body is
+#: a deposit's token list (a few hundred bytes per token), so 1 MiB is
+#: orders of magnitude of headroom. Deliberately a local copy: C06's
+#: handler carries its own guard and the two servers stay uncoupled; L17
+#: keeps rate limiting out of the reference build, so this cap is the
+#: only bound on what a single supervision request can ask the mint to
+#: allocate. It bounds C10's routes only — Layer 0 keeps C06's bound and
+#: C06's refusal, byte for byte (L13/B9).
+_MAX_BODY_BYTES = 1 << 20
+
+#: Per-connection socket timeout, in seconds. socketserver applies a
+#: handler's ``timeout`` in setup(); the stdlib default is None, i.e. no
+#: timeout at all. Without one, a client that connects and then sends
+#: nothing — or that finishes a request and holds the HTTP/1.1 keep-alive
+#: connection idle — parks one ThreadingHTTPServer thread forever, so a
+#: handful of sockets exhaust the server. Generous for any real request
+#: against a local mint, short enough that stalled peers cannot pile up.
+_HANDLER_TIMEOUT_S = 10.0
+
+
 class _SupHandler(_Handler):
     """C06's handler + the Supervision Profile routes.
 
@@ -1228,11 +1265,74 @@ class _SupHandler(_Handler):
     stays authless and byte-identical to a plain C06 mint (L13/B9).
     """
 
+    #: Applied by socketserver.StreamRequestHandler.setup() to the
+    #: connection; a stalled or idle client is dropped, not hosted.
+    timeout = _HANDLER_TIMEOUT_S
+
+    def _read_sup_json(self):
+        """Body reader for the SUPERVISION routes: C06's shape, C10's cap.
+
+        Deliberately NOT an override of ``_Handler._read_json``. The
+        inherited Layer 0 routes (``/v3/exchange``, ``/v3/status``,
+        ``/admin/issue``) reach the body reader through C06's own
+        ``do_POST``, and C06 answers a refused body with a §3.8 reason it
+        chooses there (``bad_format`` vs ``over_batch_limit``, which carry
+        different retry semantics per spec §3.8 and the retry rules at
+        "Error semantics on invalid payment"). Overriding the shared name
+        silently re-answered those Layer 0 calls with C10's reason, which
+        breaks the invariant in this class's docstring — a supervision
+        mint must be byte-identical to a plain C06 mint on Layer 0
+        (L13/B9). A separate name keeps C10's cap on C10's routes and
+        leaves the inherited ones untouched.
+
+        Returns (parsed, ok). An over-size, truncated or unparseable body
+        is (None, False), which ``_SupCore.dispatch`` already answers with
+        this module's existing ``bad_format`` rejection (§6.1) — the cap
+        introduces no new error vocabulary.
+
+        Every refusal path sets ``close_connection``: the declared body is
+        left unread, so the octets still on the wire would otherwise be
+        parsed as the NEXT request on a keep-alive connection (framing
+        desync — request N's body becomes request N+1's request line).
+        ``_Handler._send`` turns the flag into a ``Connection: close``
+        header, so the peer is told as well.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            # Unparseable declared length: we cannot know how many octets
+            # belong to this request, so the connection is unframable.
+            self.close_connection = True
+            return None, False
+        if length < 0 or length > _MAX_BODY_BYTES:
+            # Refuse BEFORE allocating; a negative length is malformed
+            # and never reaches rfile.read (where -1 means "to EOF").
+            self.close_connection = True
+            return None, False
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except OSError:
+            # The socket timeout above fired mid-body (slowloris), or the
+            # peer vanished. Either way the framing is gone: stop reading
+            # and release the connection — the parked thread is the
+            # resource being protected. TimeoutError is an OSError.
+            self.close_connection = True
+            return None, False
+        if len(raw) != length:  # client hung up before sending it all
+            self.close_connection = True
+            return None, False
+        try:
+            return json.loads(raw.decode("utf-8")), True
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # The whole declared body WAS consumed here, so the stream is
+            # still framed: this one may keep the connection alive.
+            return None, False
+
     def _dispatch_sup(self, method: str, path: str) -> None:
         self._route = path  # fixed route pattern; never logs bodies/keys
         try:
             if method == "POST":
-                body, ok = self._read_json()
+                body, ok = self._read_sup_json()
                 params = {}
             else:
                 body, ok = None, True
@@ -1249,13 +1349,36 @@ class _SupHandler(_Handler):
                 self.headers.get("Authorization"),
                 params,
             )
+        except Exception:
+            # Anything raised while PRODUCING the answer is an internal
+            # fault and owes the caller a 500 — TimeoutError included, so
+            # a timeout inside dispatch is never mistaken for a dead peer
+            # and silently dropped. Socket timeouts cannot arrive here:
+            # _read_sup_json catches OSError (TimeoutError's base) itself.
+            self._safe_500()
+            return
+        try:
             self._send(code, obj)
+        except TimeoutError:
+            # Our own socket timeout fired while WRITING: the peer stopped
+            # reading. There is nowhere to put a 500, so drop the
+            # connection — the parked thread is the resource protected.
+            self.close_connection = True
         except Exception:
             self._safe_500()
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if ("GET", path) in _ROUTES:
+            # Same framing rule C06's do_GET applies, applied here because
+            # this branch RETURNS before reaching it: a supervision GET
+            # (/v3/operator/statement, /v3/agent/balance) never reads a
+            # body either, so a declared one would be left on the wire and
+            # parsed as the next request line on a keep-alive connection.
+            # Answering it and then hanging up is the only safe framing —
+            # a guard that covered Layer 0 alone would leave the profile's
+            # own routes smuggleable through the same socket.
+            self._close_if_body_goes_unread()
             self._dispatch_sup("GET", path)
             return
         super().do_GET()

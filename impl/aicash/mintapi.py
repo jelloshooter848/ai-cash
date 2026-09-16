@@ -19,13 +19,38 @@ public ``Ledger.status`` return value.
 
 Snapshot integrity (§3.6): ``snapshot_seq`` is persisted in the same
 sqlite database as the ledger (C06-owned tables, never touching C04's),
-read-and-incremented under sqlite's write lock together with the supply
-read. A restarted mint therefore continues the sequence — it can never
-sign two snapshots that violate §3.6 monotonicity ("portable proof of
-nonconformance") merely by restarting. Activity counters live in the
-same store: windowed to the current mint-clock day and counted at most
-once per idempotency key, so §3.3 replays never double-count and
-"daily" figures never accumulate process-lifetime totals.
+as the HIGH-WATER MARK of a reserved block that the server hands out from
+memory. A restarted mint therefore resumes strictly above every seq it
+could have signed — it can never sign two snapshots that violate §3.6
+monotonicity ("portable proof of nonconformance") merely by restarting —
+while a descriptor fetch stays a read, so an anonymous poller cannot take
+the payment database's write lock (see ``_Core.descriptor``). Because the
+ordering of a snapshot's supply read against its seq is now held by an
+in-process mutex rather than by sqlite's write lock, one ledger file may
+be served by exactly ONE mint process: ``_Core._claim_single_writer``
+takes an advisory ``flock`` on the ledger and a second server refuses to
+start or to serve a descriptor (§3.6's proof-of-nonconformance is not
+something an honest mint may leave to a deployment convention). Activity
+counters live in the same store: windowed to the current mint-clock day
+and counted at most once per idempotency key, so §3.3 replays never
+double-count and "daily" figures never accumulate process-lifetime
+totals.
+
+Resource bounds (deployment, not §3.7 rate limiting — L17 scopes
+enforcement out): ``MAX_BODY_BYTES`` caps what one request may make the
+server allocate, ``MAX_IDEMPOTENCY_KEY_LEN`` caps what one caller may
+write into the §8 recovery window, ``_Handler.timeout`` caps how long one
+recv may block, and ``MAX_REQUEST_SECONDS`` caps the WALL-CLOCK life of a
+whole request so a peer that drips a byte at a time — resetting the idle
+timeout on every recv — still cannot hold a thread (see
+``_DeadlineRaw``). All four bound a SINGLE request; none of them counts
+requests per caller. None is published in §3.6's ``limits``: that object
+is the pinned home of the protocol limit (``max_batch``) and its scope
+guard is explicit, so a body the mint declines to read is reported with
+the §3.8 reason for an envelope it cannot parse — ``bad_format``, which
+is permanent — and never with ``over_batch_limit``, which §9.5 classifies
+as retryable with backoff and which would send a payer into a retry loop
+over bytes that can never succeed.
 
 Secret hygiene (§3.1, requirement 5): request bodies are never logged.
 The access log (logger ``aicash.mintapi``) carries route pattern + status
@@ -37,12 +62,20 @@ log secret material. Never a stack trace in a response body.
 from __future__ import annotations
 
 import hmac
+import io
 import json
 import logging
+import os
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:  # POSIX only; the reference build targets Linux (see DEPLOYMENT).
+    import fcntl
+except ImportError:  # pragma: no cover - no advisory locking available
+    fcntl = None
 
 from aicash.burncalc import BurnPolicy, validate_policy
 from aicash.clock import system_clock
@@ -68,6 +101,44 @@ __all__ = ["MintConfig", "MintServer", "make_mint"]
 logger = logging.getLogger("aicash.mintapi")
 
 _DAY_MS = 86_400_000
+
+# Largest request body the server will read, in bytes (§3.3/§3.6 limits).
+# Sized from the ONE published limit that bounds a legal call: max_batch
+# (default 256) entries. The fattest legal entry is a claim input
+# ``{"token": "...", "witness": "..."}`` or an output carrying a §3.4 lock:
+# a token is "v3:<mint_id<=64>:<amount>:<secret b64u 43>" and every hash or
+# witness is a 43-character b64u of 32 bytes, so ~300 bytes of JSON per
+# entry is already generous. 256 entries then need ~77 KiB; 1 MiB leaves
+# better than 13x headroom for whitespace, a long mint_id and the envelope,
+# while still refusing the unbounded ``Content-Length`` a single client used
+# to be able to make the server allocate. Not a rate limit (L17 scopes those
+# out) — a per-request allocation bound.
+MAX_BODY_BYTES = 1_048_576
+
+# §3.3 idempotency keys are caller-chosen and are PERSISTED by C04 for the
+# whole §8 recovery window (90 days by default), so an unbounded key is
+# unbounded storage a caller writes into the mint for free. 128 characters
+# fits every sane construction with room to spare: a UUID is 36, a b64u
+# SHA-256 is 43, a "<caller>:<uuid>" namespaced pair well under 100.
+MAX_IDEMPOTENCY_KEY_LEN = 128
+
+# Wall-clock life of ONE request: request line, headers and body together.
+# ``_Handler.timeout`` is a per-recv IDLE timeout and nothing more — a peer
+# that sends one byte every few seconds resets it on every recv, so
+# ``Content-Length: 1048576`` (exactly at MAX_BODY_BYTES, so the byte cap
+# never fires) plus a drip holds a daemon thread and a file descriptor for
+# as long as the attacker keeps dripping; ThreadingHTTPServer caps neither
+# connections nor threads, so N such sockets are N parked threads. That is
+# the same exhaustion the idle timeout was added for, only cheaper to mount,
+# so the deadline is enforced in wall clock, not idleness (``_DeadlineRaw``).
+# 30s against the ~77 KiB of a full max_batch call is a floor of ~2.5 KiB/s,
+# far below any link a mint is reachable on and far above what a drip is.
+MAX_REQUEST_SECONDS = 30.0
+
+# §3.6 snapshot_seq allocation block. See _Core._next_snapshot_seq: the seq
+# is handed out from a reserved in-memory block so a descriptor fetch is a
+# read, not a write, amortizing one sqlite write over this many snapshots.
+_SEQ_BLOCK = 1024
 
 _PERFORMANCE_FIELDS = frozenset(
     {"p99_exchange_ms", "sustained_qps", "window_days", "measured_at"}
@@ -240,12 +311,14 @@ CREATE TABLE IF NOT EXISTS mintapi_counted (
 class _Core:
     """Route logic, shared by all handler threads. Wire in/out only.
 
-    Durable C06 state (``snapshot_seq``, day-windowed activity) lives in
-    C06-owned tables inside the ledger's sqlite file, via a dedicated
-    connection. All access is serialized by ``self._lock`` and runs under
-    ``BEGIN IMMEDIATE``, so a snapshot's seq bump shares sqlite's write
-    lock with its supply read: no exchange can commit between them, and
-    (seq, cumulatives) stay jointly monotone across restarts (§3.6).
+    Durable C06 state (``snapshot_seq`` high-water mark, day-windowed
+    activity) lives in C06-owned tables inside the ledger's sqlite file,
+    via a dedicated connection. All access is serialized by ``self._lock``.
+    Writes (activity counting, seq-block reservation) run under ``BEGIN
+    IMMEDIATE``; a descriptor serve does not, because it is a read —
+    ``self._lock`` alone orders the supply read against seq allocation, so
+    (seq, cumulatives) stay jointly monotone (§3.6). See
+    ``_next_snapshot_seq`` for why that also holds across restarts.
     """
 
     def __init__(self, config: MintConfig, ledger: Ledger):
@@ -261,6 +334,13 @@ class _Core:
             isolation_level=None,  # manual txn control, like C04
             check_same_thread=False,  # guarded by self._lock
         )
+        # Reserved §3.6 snapshot_seq block, [_seq_next, _seq_limit).
+        # Empty at boot; the first descriptor fetch reserves one.
+        self._seq_next = 0
+        self._seq_limit = 0
+        # Single-writer claim over the ledger file; see _claim_single_writer.
+        self._lock_path = ledger._db_path
+        self._lock_fd: int | None = None
         self._state.executescript(_STATE_SCHEMA)
         self._state.execute(
             "INSERT OR IGNORE INTO mintapi_state (id, snapshot_seq,"
@@ -268,6 +348,70 @@ class _Core:
             " VALUES (1, 0, -1, 0, 0)"
         )
         self._state.commit()
+
+    # -- single-writer claim over the ledger (§3.6 monotonicity) ---------
+
+    def _claim_single_writer(self) -> None:
+        """Take the advisory single-writer lock on this ledger file.
+
+        §3.6 makes "any two signed snapshots violating monotonicity"
+        PORTABLE PROOF OF NONCONFORMANCE — it is a property of the mint_id
+        and its signing key, not of a process. Snapshot ordering used to be
+        held by sqlite: the supply read and the seq bump ran inside one
+        ``BEGIN IMMEDIATE`` on the shared file, so any number of processes
+        serving one ledger were still jointly monotone. Making the
+        descriptor a read moved that ordering onto ``self._lock``, a
+        ``threading.Lock`` that exists once per process. Two mints on one
+        db file then draw disjoint seq blocks (the reservation is still
+        atomic) but order their supply READS independently, so the process
+        holding the higher block can sign a higher seq over an older
+        supply — an honest mint framed by its own signatures.
+
+        The precondition is therefore enforced, not documented: exactly one
+        process may serve a given ledger. ``flock`` is advisory but
+        whole-file and released by the kernel on exit, so a crashed mint
+        does not wedge its own restart, and it conflicts between two open
+        file descriptions even inside one process — two MintServers on one
+        db in one interpreter have the same ordering bug and are refused
+        the same way. Idempotent: a re-claim by the holder is a no-op.
+
+        Held on the LEDGER FILE itself rather than on a sidecar: nothing
+        to leave behind next to a deployment's mint.db, and the claim
+        cannot drift from the thing it claims. ``flock`` is safe to put
+        there because sqlite's unix VFS locks with POSIX record locks
+        (``fcntl(F_SETLK)``), an independent mechanism on Linux — this
+        lock neither blocks nor is blocked by any sqlite connection,
+        including C04's.
+
+        Raises RuntimeError when another mint holds the ledger.
+        """
+        if self._lock_fd is not None:
+            return
+        if fcntl is None:  # pragma: no cover - POSIX-only build target
+            return
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RuntimeError(
+                "another mint process already serves this ledger (%s). One"
+                " ledger file is served by exactly one mint: §3.6 snapshot"
+                " monotonicity is ordered per process, so a second server"
+                " could sign snapshots that are portable proof of"
+                " nonconformance against this mint_id. Stop the other"
+                " process, or give this mint its own ledger."
+                % self._lock_path
+            ) from None
+        self._lock_fd = fd
+
+    def _release_single_writer(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     # -- clock (via the Ledger's injected clock; L17 — never wall time) --
 
@@ -329,6 +473,14 @@ class _Core:
         if (
             not isinstance(key, str)
             or not key
+            # An over-length idempotency key is a malformed envelope, not a
+            # property of any one item: §3.8 `bad_format`, kind "call",
+            # index null. (The §3.8 vocabulary has no length-specific
+            # reason, and §3.8's own example of a call-level rejection is
+            # exactly "a malformed envelope".) Enforced HERE rather than in
+            # C04 because the cost being bounded is C06's: the key is what
+            # a caller writes into the ledger's 90-day recovery window.
+            or len(key) > MAX_IDEMPOTENCY_KEY_LEN
             or not isinstance(inputs, list)
             or not isinstance(outputs, list)
         ):
@@ -428,33 +580,81 @@ class _Core:
 
     # -- §3.6 descriptor --------------------------------------------------
 
-    def descriptor(self) -> tuple[int, dict]:
-        c = self.config
-        # Snapshot construction (§3.6): BEGIN IMMEDIATE takes sqlite's
-        # write lock on the shared database, so no exchange can commit
-        # between the supply read and the persisted seq bump — signed
-        # cumulatives are monotone across snapshot_seq, including across
-        # server restarts on the same ledger.
-        with self._lock:
+    def _next_snapshot_seq(self) -> int:
+        """Allocate the next §3.6 ``snapshot_seq``. Caller holds ``_lock``.
+
+        Numbers come from a block reserved with ONE sqlite write per
+        ``_SEQ_BLOCK`` snapshots, instead of a write per serve. The value
+        PERSISTED at reservation time is the block's high-water mark — the
+        largest seq this process may hand out — so any restart, crash
+        included, resumes strictly above every seq that could already have
+        been signed. §3.6 requires ``snapshot_seq`` to increase, not to be
+        contiguous, so the gap an unused block tail leaves is conformant;
+        what would be nonconformant (a repeated or regressing seq across a
+        restart, §3.6's "portable proof of nonconformance") is exactly what
+        persisting the high-water mark rules out.
+        """
+        if self._seq_next >= self._seq_limit:
             self._state.execute("BEGIN IMMEDIATE")
             try:
-                mint_time = self._mint_time()
-                supply = self.ledger.supply()  # one atomic read (C04)
                 self._state.execute(
                     "UPDATE mintapi_state SET snapshot_seq ="
-                    " snapshot_seq + 1 WHERE id = 1"
+                    " snapshot_seq + ? WHERE id = 1",
+                    (_SEQ_BLOCK,),
                 )
-                row = self._state.execute(
-                    "SELECT snapshot_seq, activity_day, activity_count,"
-                    " activity_volume_mc FROM mintapi_state WHERE id = 1"
-                ).fetchone()
+                high = self._state.execute(
+                    "SELECT snapshot_seq FROM mintapi_state WHERE id = 1"
+                ).fetchone()[0]
                 self._state.execute("COMMIT")
             except BaseException:
                 self._state.execute("ROLLBACK")
                 raise
-        snapshot_seq = row[0]
-        if row[1] == mint_time // _DAY_MS:
-            activity_count, activity_volume = row[2], row[3]
+            # Reserved: (high - _SEQ_BLOCK, high]. BEGIN IMMEDIATE makes the
+            # bump atomic, so two mints sharing one ledger file get disjoint
+            # blocks and neither can reuse the other's numbers.
+            self._seq_next = high - _SEQ_BLOCK + 1
+            self._seq_limit = high + 1
+        seq = self._seq_next
+        self._seq_next += 1
+        return seq
+
+    def descriptor(self) -> tuple[int, dict]:
+        c = self.config
+        # Snapshot construction (§3.6). This used to run BEGIN IMMEDIATE and
+        # UPDATE snapshot_seq on EVERY fetch, which made an unauthenticated
+        # GET /v3/mints take sqlite's write lock on the payment database: a
+        # descriptor poller serialized against real exchanges and could stall
+        # them for free. A descriptor serve is now a READ — reservation
+        # aside, which is one write per _SEQ_BLOCK serves.
+        #
+        # Monotonicity is preserved by ``self._lock`` instead of by sqlite's
+        # write lock. Every snapshot is built while holding it, and the
+        # supply read happens BEFORE the seq is allocated, so snapshots
+        # ordered by snapshot_seq are also ordered by the instant their
+        # supply was read; C04 commits exchanges atomically, so a later read
+        # can only see equal-or-greater cumulatives. (seq, cumulatives)
+        # therefore stay jointly monotone, and each snapshot still satisfies
+        # ``outstanding == issued − burned`` because Ledger.supply() reads
+        # all three in a single statement. Nothing is cached: the counters
+        # served are read fresh per fetch, never stale behind a completed
+        # exchange.
+        #
+        # That argument holds only for ONE process per ledger, so the claim
+        # is re-checked here rather than trusted to whoever started the
+        # server: a mint that cannot hold the single-writer lock refuses to
+        # sign a snapshot at all (RuntimeError → 500) instead of signing one
+        # that might be §3.6 proof of nonconformance against its own key.
+        with self._lock:
+            self._claim_single_writer()
+            mint_time = self._mint_time()
+            supply = self.ledger.supply()  # one atomic read (C04)
+            snapshot_seq = self._next_snapshot_seq()
+            row = self._state.execute(
+                "SELECT activity_day, activity_count, activity_volume_mc"
+                " FROM mintapi_state WHERE id = 1"
+            ).fetchone()
+        if row[0] == mint_time // _DAY_MS:
+            activity_count, activity_volume = row[1], row[2]
         else:  # counters belong to an earlier mint-clock day: none today
             activity_count, activity_volume = 0, 0
         # mint_id and baseline_model_class ride INSIDE the signed body. §4.1
@@ -567,10 +767,113 @@ class _MintHTTPServer(ThreadingHTTPServer):
         logger.info("connection error")
 
 
+class _DeadlineRaw(io.RawIOBase):
+    """The handler's raw read side, under a WALL-CLOCK request deadline.
+
+    An idle timeout alone does not bound a request. ``_Handler.timeout``
+    is applied per recv, so a peer that sends one byte every few seconds
+    resets it forever: a declared body at exactly MAX_BODY_BYTES (the cap
+    never fires) dripped one byte at a time parks a daemon thread and an
+    fd indefinitely, and ThreadingHTTPServer caps neither. So every recv
+    of a request — request line, headers and body alike — gets the SMALLER
+    of the idle timeout and the time left on ``handler.request_deadline``,
+    and an expired deadline raises before the syscall.
+
+    Sitting under ``io.BufferedReader`` rather than replacing it is what
+    makes this whole-request: BufferedReader's own loops (``readline``
+    over headers, ``read(n)`` over a body) come back through ``readinto``
+    for every refill, so each refill re-checks the clock. Wrapping the
+    BufferedReader instead would have set one timeout for an entire
+    blocking read and bounded nothing.
+
+    The exception raised is ``TimeoutError`` — ``socket.timeout`` since
+    3.10 — which BaseHTTPRequestHandler.handle_one_request already turns
+    into a silent close for the header phase, and which
+    ``_Handler._read_json`` catches for the body phase.
+
+    ``time.monotonic`` here is transport bookkeeping, not the mint clock:
+    L17 keeps C06 off wall time because mint_time is a SERVED value, and
+    no value computed here is ever served, signed or persisted.
+    """
+
+    def __init__(self, sock, handler):
+        self._sock = sock
+        self._handler = handler
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        idle = self._handler.timeout
+        deadline = self._handler.request_deadline
+        if deadline is None:
+            budget = idle
+        else:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request deadline exceeded")
+            budget = left if idle is None else min(idle, left)
+        self._sock.settimeout(budget)
+        try:
+            return self._sock.recv_into(buf)
+        finally:
+            # Restored so the response write side is never left running
+            # under whatever sliver of the read budget happened to remain.
+            self._sock.settimeout(idle)
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AICashMint/0.4"
     protocol_version = "HTTP/1.1"
     _route = "<unknown>"  # normalized route pattern, for the access log
+
+    # socketserver.StreamRequestHandler.setup() applies this to the accepted
+    # socket; the class default is None, i.e. NO timeout. With HTTP/1.1
+    # keep-alive that meant one anonymous client (§3.7 — anyone) could open
+    # a connection, send nothing or half a request, and park a daemon thread
+    # and a file descriptor for the life of the process. 10s is far longer
+    # than any Layer 0 call needs (they are single sqlite transactions) and
+    # short enough that a stalled peer cannot accumulate. A timeout fires as
+    # socket.timeout inside BaseHTTPRequestHandler.handle_one_request, which
+    # routes it to self.log_error (silenced below) and closes — no traceback
+    # on stdout; _MintHTTPServer.handle_error covers anything that escapes.
+    #
+    # It is an IDLE bound and only that: `request_timeout` below is what
+    # stops a peer from resetting it forever a byte at a time.
+    timeout = 10
+
+    # Wall-clock ceiling on one whole request, armed in handle_one_request
+    # and enforced by _DeadlineRaw on every recv. A class attribute for the
+    # same reason `timeout` is: a deployment (or a test) overrides it by
+    # subclassing, without reaching into module state.
+    request_timeout = MAX_REQUEST_SECONDS
+
+    #: Absolute monotonic instant this request must be read by; None
+    #: between requests, when only the idle timeout applies.
+    request_deadline: float | None = None
+
+    def setup(self):
+        super().setup()
+        # socketserver made rfile = connection.makefile('rb', rbufsize).
+        # Swap in the same buffered reader over a deadline-checking raw
+        # layer; closing the original only drops its socket refcount (it
+        # does not close the fd), which keeps connection.close() honest.
+        original = self.rfile
+        self.rfile = io.BufferedReader(
+            _DeadlineRaw(self.connection, self),
+            io.DEFAULT_BUFFER_SIZE if self.rbufsize <= 0 else self.rbufsize,
+        )
+        original.close()
+
+    def handle_one_request(self):
+        # Arm the deadline for this request. Keep-alive idle time between
+        # requests is covered by `timeout` alone, which is the shorter of
+        # the two, so nothing legitimate is cut short by arming here.
+        self.request_deadline = time.monotonic() + self.request_timeout
+        try:
+            super().handle_one_request()
+        finally:
+            self.request_deadline = None
 
     # ---- logging: route pattern + status only (requirement 5) ----------
 
@@ -592,16 +895,77 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # Announce the close AND (via BaseHTTPRequestHandler.send_header)
+            # set self.close_connection. Mandatory whenever we answer without
+            # having consumed the declared body: leftover octets would be
+            # parsed as the next request on a keep-alive connection.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
+    def _body_rejection(self):
+        """Refuse this request's body and hang up.
+
+        Every refusal answers with ONE §3.8 reason, ``bad_format``, so the
+        reason is a property of the route rather than of handler state a
+        body reader happened to leave behind. An earlier version carried it
+        out of band on the handler, which quietly extended the contract of
+        an OVERRIDABLE method: a subclass that replaces ``_read_json``
+        (C10's Supervision Profile handler is the live example) cannot know
+        to set a private attribute, and the inherited Layer 0 routes would
+        then answer from a stale class default — the same wire request
+        getting two different §3.8 reasons depending on profile, which
+        L13/B9 forbid. Nothing to leave behind, nothing to go stale.
+        """
+        self.close_connection = True
+        return None, False
+
     def _read_json(self):
-        """Returns (parsed, ok). Any parse trouble → (None, False)."""
+        """Returns (parsed, ok). Any trouble with the body → (None, False).
+
+        The caller answers (None, False) with §3.8 ``bad_format``, kind
+        "call", index null — §3.8's own example of a call-level rejection
+        is "a malformed envelope", and a body this layer declines to read
+        is exactly that. Deliberately NOT ``over_batch_limit``, even for a
+        body past MAX_BODY_BYTES: §9.5 pins that reason as "retryable with
+        backoff", but identical bytes over the cap fail identically
+        forever, so a spec-conforming payer would retry a call that can
+        never succeed instead of splitting it or giving up. MAX_BODY_BYTES
+        is also not a §3.6 published limit and cannot become one (that
+        object's scope guard is explicit), so no client can be expected to
+        aim at it — which is precisely what makes a permanent reason the
+        honest one. Sized at better than 13x the fattest legal max_batch
+        call, it can only be hit by a body no published limit allows.
+        """
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
-            return None, False
-        raw = self.rfile.read(length) if length > 0 else b""
+            return self._body_rejection()
+        if length < 0:
+            return self._body_rejection()
+        if length > MAX_BODY_BYTES:
+            # Refuse BEFORE allocating: the old code trusted the header and
+            # called rfile.read(length), so `Content-Length: 4294967296` was
+            # a one-line memory-exhaustion request from any anonymous caller
+            # (§3.7). Nothing is read, so the connection cannot be reused.
+            return self._body_rejection()
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except OSError:
+            # A reset peer, the idle `timeout`, or the whole-request
+            # deadline (_DeadlineRaw raises TimeoutError, an OSError, when
+            # a driblet of a body outlasts request_timeout). The socket is
+            # unusable either way; hang up rather than let the exception
+            # reach handle_error.
+            return self._body_rejection()
+        if len(raw) != length:
+            # Short read: the peer half-closed or died mid-body. Without this
+            # a truncated body either parsed as a shorter valid document
+            # (silently accepting a call the client never finished sending)
+            # or surfaced as a confusing JSONDecodeError. Either way the
+            # stream is desynchronized, so the connection does not survive.
+            return self._body_rejection()
         try:
             return json.loads(raw.decode("utf-8")), True
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -609,9 +973,37 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---- routes ---------------------------------------------------------
 
+    def _close_if_body_goes_unread(self) -> None:
+        """Hang up after answering a GET that declared a body.
+
+        A GET body is never read by this layer, so a declared one leaves
+        octets on the wire that a keep-alive peer or a pipelining proxy
+        frames as the NEXT request line — the same desync the POST path
+        closes by hanging up on a body it refuses. There is nothing here
+        to reject (the GET itself is well formed and §3.7 says anyone may
+        make it), so the request is answered and THEN the connection is
+        dropped, rather than reusing a stream that can no longer be
+        framed. Transfer-Encoding counts too: the stdlib handler does not
+        dechunk, so a chunked body is equally unconsumed.
+
+        Shared rather than duplicated because C10's ``_SupHandler``
+        answers its own GET routes without reaching this class's
+        ``do_GET`` (it returns before ``super().do_GET()`` for a
+        supervision route), and a framing guard that only covers Layer 0
+        leaves the profile's routes smuggleable — one server, one socket,
+        so it has to be one rule.
+        """
+        try:
+            declared = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            declared = -1  # unparseable is not "no body"
+        if declared != 0 or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+
     def do_GET(self):
         core: _Core = self.server.core
         try:
+            self._close_if_body_goes_unread()
             path = self.path.split("?", 1)[0]
             if path == "/v3/mints":
                 self._route = "/v3/mints"
@@ -631,6 +1023,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             path = self.path.split("?", 1)[0]
             body, ok = self._read_json()
+            # A body this layer would not read is a malformed envelope:
+            # §3.8 bad_format, kind "call", index null. Computed here from
+            # `ok` alone, never from state the reader left on the handler —
+            # `_read_json` is overridable and a subclass cannot be asked to
+            # maintain a private attribute (see _body_rejection).
             if path == "/v3/exchange":
                 self._route = "/v3/exchange"
                 code, obj = (
@@ -709,6 +1106,11 @@ class MintServer:
         """
         if self._httpd is not None:
             raise RuntimeError("server already started")
+        # Before binding: exactly one mint process may serve a ledger, or
+        # §3.6 snapshot monotonicity is no longer a property of the mint_id
+        # (see _Core._claim_single_writer). Fail here, loudly, rather than
+        # at the first descriptor a second process signs.
+        self._core._claim_single_writer()
         self._httpd = _MintHTTPServer((host, port), _Handler)
         self._httpd.core = self._core
         self._thread = threading.Thread(
@@ -721,6 +1123,7 @@ class MintServer:
 
     def stop(self) -> None:
         if self._httpd is None:
+            self._core._release_single_writer()
             return
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -728,6 +1131,9 @@ class MintServer:
             self._thread.join(timeout=10)
         self._httpd = None
         self._thread = None
+        # Released last: while a serving thread could still be building a
+        # snapshot, this mint is still the single writer.
+        self._core._release_single_writer()
 
 
 def make_mint(

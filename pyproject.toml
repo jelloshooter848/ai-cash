@@ -1,0 +1,92 @@
+# Packaging for the AICash v0.4 reference implementation.
+#
+# WHY this file exists: until now the repo only ran as a checkout. Every entry
+# point either does `sys.path.insert(0, .../impl)` (run_mint.py, mint_console.py)
+# or asks the caller for `PYTHONPATH=impl` (README, examples/). That is fine for
+# a developer sitting in the tree and wrong for everything else — a systemd
+# unit, a container image, or any other service that wants to `import aicash`
+# from its own virtualenv. Deployment needs an installable artifact, so the
+# layout is declared once here instead of being reconstructed by each caller.
+#
+# Nothing in this file is normative. `aicash-spec-v0.4.md` governs the protocol;
+# packaging is not part of it, and no value below changes mint behavior.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicash"
+
+# Hand-maintained, and tracking the SPEC revision this tree implements
+# (aicash-spec-v0.4.md), not a release cadence of its own. It is not derived
+# from the package because `impl/aicash/__init__.py` exposes no `__version__`
+# to derive it from; wiring `dynamic = ["version"]` would mean editing that
+# module, which belongs to the implementation, not to packaging. If you add
+# `__version__` there, switch this to `dynamic` in the same change so the two
+# cannot drift. Bump this whenever the implemented spec revision changes.
+version = "0.4.0"
+description = "AICash v0.4 reference implementation: sub-cent, account-free bearer value exchange between AI agents"
+readme = "README.md"
+requires-python = ">=3.12"
+keywords = ["aicash", "micropayments", "bearer-token", "mint", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+]
+
+# Stdlib + `cryptography` only, exactly as README claims. `cryptography` is
+# used for Ed25519 descriptor/statement signing (aicash.signing, L17).
+#
+# A FLOOR, not a pin: 41.0.7 is what this tree is developed and tested against,
+# and the Ed25519 surface it uses (Ed25519PrivateKey.from_private_bytes /
+# sign / verify) has been stable for many releases. Pinning `== 41.0.7` would
+# freeze an operator onto one build of a library whose whole point is that it
+# ships security fixes — and the mint's signing key is its identity (§4.1), so
+# an operator must be free to take those fixes. If a future release ever breaks
+# the Ed25519 API, add an upper bound THEN, with the failing version named.
+dependencies = ["cryptography>=41.0.7"]
+
+# DELIBERATELY ABSENT: `license`, `license-files` and `authors`.
+#
+# There is no LICENSE file in this repo, so the built METADATA carries no
+# License field, which under default copyright means ALL RIGHTS RESERVED — a
+# real blocker for anyone who has to clear third-party code before running it,
+# and DEPLOYMENT.md §2 says so to the operator's face rather than leaving it to
+# be discovered. Declaring a license here would NOT fix that: a `license =`
+# string with no LICENSE file in the tree is a claim about someone else's
+# copyright made by the packaging metadata, which is worse than the honest gap.
+# Choosing one is the copyright holder's decision. When it is made: add the
+# LICENSE file, then `license = "<SPDX expression>"` and
+# `license-files = ["LICENSE"]` here, and `authors = [...]` alongside.
+
+[project.scripts]
+# `aicash-mint` is the same launcher as `python3 run_mint.py`; run_mint.main()
+# parses argv itself, so the console script is a straight alias. The launcher is
+# explicitly non-protocol (see its module docstring) — it exists so a systemd
+# unit has a stable absolute path (<venv>/bin/aicash-mint) instead of a
+# `python3 /some/checkout/run_mint.py` that depends on where the repo was cloned.
+aicash-mint = "run_mint:main"
+
+[tool.setuptools]
+# The importable package is impl/aicash — one level down, not at the repo root —
+# so it is mapped explicitly rather than left to auto-discovery, which would
+# find nothing importable here (and would choke on the flat root full of .md
+# files). Explicit beats discovered: a silently empty wheel is the failure mode.
+packages = ["aicash"]
+
+# run_mint.py and mint_console.py live at the repo ROOT, not under impl/, so
+# they cannot ride along inside the package-dir mapping below; they are declared
+# as top-level modules. Both are needed: run_mint imports mint_console lazily
+# when --console-port is non-zero, which is the DEFAULT, so shipping the
+# launcher without the console would make the installed entry point raise
+# ImportError on a plain invocation. They install as top-level names — the cost
+# of run_mint.py never having lived inside the package.
+py-modules = ["run_mint", "mint_console"]
+
+[tool.setuptools.package-dir]
+# Only the `aicash` key is remapped; the root "" keeps its default (the project
+# directory), which is what lets the two py-modules above be found at the root.
+aicash = "impl/aicash"

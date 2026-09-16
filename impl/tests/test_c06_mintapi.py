@@ -6,20 +6,32 @@ named in each test's docstring. All time comes from a FakeClock injected
 through the Ledger (L17).
 """
 
+import contextlib
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
+import socket
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from typing import NamedTuple
 
 from aicash.burncalc import BurnPolicy
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger
-from aicash.mintapi import MintConfig, MintServer
+from aicash.mintapi import (
+    MAX_BODY_BYTES,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_REQUEST_SECONDS,
+    MintConfig,
+    MintServer,
+    _Handler,
+)
 from aicash.signing import generate_keypair, verify_obj
 from aicash.tokencodec import (
     b64u_decode,
@@ -60,8 +72,9 @@ def make_lock(preimage: bytes, refund: bytes, expiry: int) -> dict:
     }
 
 
-def http_raw(port, method, path, body: bytes | None = None, headers=None):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+def http_raw(port, method, path, body: bytes | None = None, headers=None,
+             timeout=30):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request(method, path, body, headers or {})
         resp = conn.getresponse()
@@ -71,10 +84,47 @@ def http_raw(port, method, path, body: bytes | None = None, headers=None):
         conn.close()
 
 
-def http_json(port, method, path, obj=None, headers=None):
+def http_json(port, method, path, obj=None, headers=None, timeout=30):
     body = None if obj is None else json.dumps(obj).encode("utf-8")
-    status, raw, hdrs = http_raw(port, method, path, body, headers)
+    status, raw, hdrs = http_raw(port, method, path, body, headers, timeout)
     return status, json.loads(raw.decode("utf-8")), hdrs
+
+
+def raw_request(port, request_bytes: bytes, *, shutdown_write=False,
+                timeout=8.0) -> bytes:
+    """Speak HTTP by hand and read until the server hangs up.
+
+    http.client will not send a Content-Length that disagrees with the body
+    it is given, which is precisely the shape these deployment tests need.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(request_bytes)
+        if shutdown_write:
+            sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            part = sock.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+def parse_http(raw: bytes):
+    """(status, headers-lowercased, parsed json body) from raw response bytes."""
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        key, _, value = line.partition(b":")
+        headers[key.decode("latin-1").strip().lower()] = (
+            value.decode("latin-1").strip()
+        )
+    return status, headers, (json.loads(body.decode("utf-8")) if body else None)
 
 
 class Mint(NamedTuple):
@@ -1341,3 +1391,540 @@ class RateSchemaConformance(unittest.TestCase):
                                          "scope": "connection"})
         self.assertEqual("connection", c.anonymous_rate["scope"])
 
+
+
+class DeploymentHardeningTest(unittest.TestCase):
+    """Resource-exhaustion holes in the HTTP surface, found reviewing C06
+    for a real deployment (2026-09-15).
+
+    None of these is the §3.7 rate limiting L17 scopes out: each bounds a
+    SINGLE request — how much one body may allocate, how long one silent
+    peer may hold a thread, how much one caller may write into the §8
+    recovery window, and whether an unauthenticated read takes the payment
+    database's write lock. No request is ever counted per caller.
+
+    The mint-building helpers are borrowed from MintApiTest rather than
+    inherited, so the B1-B8 suite is not re-run under this class's name.
+    """
+
+    maxDiff = None
+    start_mint = MintApiTest.start_mint
+    issue = MintApiTest.issue
+    exchange = MintApiTest.exchange
+    status_batch = MintApiTest.status_batch
+
+    # ------------------------------------------------------------------
+    # 1. unbounded request body
+    # ------------------------------------------------------------------
+
+    def test_max_body_bytes_fits_a_full_max_batch_call(self):
+        """The cap must not be able to reject a call the descriptor says is
+        legal: a full limits.max_batch batch has to fit with room to spare.
+
+        A boundary guard rather than a regression: it is what keeps the
+        UNPUBLISHED byte cap from quietly overriding the one limit §3.6
+        does publish. So it is driven over the wire, not just measured —
+        the fattest legal call has to come back with per-index §3.8 errors
+        (the tokens are made up), never with a call-level refusal, which
+        is what the byte cap would produce."""
+        mint = self.start_mint()
+        _, desc, _ = http_json(mint.port, "GET", "/v3/mints")
+        max_batch = desc["limits"]["max_batch"]
+        call = {
+            "idempotency_key": "k" * MAX_IDEMPOTENCY_KEY_LEN,
+            "inputs": [
+                {"token": tok(100_000, new_secret()),
+                 "witness": b64u_encode(new_secret())}
+                for _ in range(max_batch // 2)
+            ],
+            "outputs": [
+                out_hash(1_000, new_secret(),
+                         make_lock(new_secret(), new_secret(), T0 + DAY_MS))
+                for _ in range(max_batch - max_batch // 2)
+            ],
+        }
+        body = json.dumps(call).encode("utf-8")
+        self.assertLess(
+            len(body) * 4, MAX_BODY_BYTES,
+            "MAX_BODY_BYTES must leave real headroom over the fattest legal "
+            "max_batch call, or the byte cap silently overrides the "
+            "published entry-count limit",
+        )
+        status, answer, _ = http_json(
+            mint.port, "POST", "/v3/exchange", call, timeout=30
+        )
+        self.assertEqual(status, 400, answer)
+        kinds = {e["kind"] for e in answer["errors"]}
+        self.assertEqual(kinds, {"input"}, answer["errors"][:3])
+        self.assertEqual(len(answer["errors"]), max_batch // 2)
+
+    def test_oversized_content_length_rejected_before_reading_the_body(self):
+        """A declared body over MAX_BODY_BYTES is refused on the header
+        alone — no allocation, no read, no hang. Before the fix the server
+        trusted Content-Length and called rfile.read(length), so this
+        request (headers only, no body ever sent) parked the thread
+        forever and a truthful huge length allocated that many bytes.
+
+        The reason must be the PERMANENT one. §9.5 pins `over_batch_limit`
+        as "retryable with backoff", but identical bytes over the byte cap
+        fail identically forever, so that reason sends a spec-conforming
+        payer into a retry loop over a call that can never succeed. Nor is
+        MAX_BODY_BYTES a §3.6 published limit a client could aim at — the
+        `limits` object holds max_batch and its scope guard is explicit —
+        which is exactly why the honest answer is §3.8 `bad_format`: an
+        envelope the mint will not parse, do not resend it as-is."""
+        mint = self.start_mint()
+        declared = MAX_BODY_BYTES + 1
+        request = (
+            b"POST /v3/status HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(declared).encode("ascii") + b"\r\n"
+            b"\r\n"
+        )  # deliberately: not one byte of body follows
+        raw = raw_request(mint.port, request, timeout=8.0)
+        status, headers, body = parse_http(raw)
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {
+            "status": "rejected",
+            "errors": [{"index": None, "kind": "call",
+                        "reason": "bad_format"}],
+        })
+        self.assertNotEqual(
+            body["errors"][0]["reason"], "over_batch_limit",
+            "§9.5 makes over_batch_limit retryable with backoff; a body "
+            "past the byte cap fails permanently, so that reason would "
+            "tell the payer to retry bytes that can never be accepted",
+        )
+        # The declared octets were never consumed, so the connection cannot
+        # be reused: anything left would be read as the next request.
+        self.assertEqual(headers.get("connection"), "close")
+        # The mint is unharmed and still serving.
+        st, desc, _ = http_json(mint.port, "GET", "/v3/mints", timeout=8)
+        self.assertEqual(st, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+    def test_body_shorter_than_content_length_is_not_silently_accepted(self):
+        """A short body is a truncated call, not a smaller one. Before the
+        fix read() returned what had arrived and the server happily served
+        it: this request declares 500 bytes, sends a complete but shorter
+        document, and used to succeed with 200."""
+        mint = self.start_mint()
+        short = b'{"hashes": []}'
+        request = (
+            b"POST /v3/status HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 500\r\n"
+            b"\r\n" + short
+        )
+        raw = raw_request(mint.port, request, shutdown_write=True, timeout=8.0)
+        status, headers, body = parse_http(raw)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body, {
+            "status": "rejected",
+            "errors": [{"index": None, "kind": "call",
+                        "reason": "bad_format"}],
+        })
+        self.assertEqual(headers.get("connection"), "close")
+
+    # ------------------------------------------------------------------
+    # 2. no socket timeout
+    # ------------------------------------------------------------------
+
+    def test_handler_declares_a_finite_socket_timeout(self):
+        """BaseHTTPRequestHandler's default is None. With HTTP/1.1 keep-alive
+        that is an unbounded thread-and-fd hold for any anonymous caller."""
+        self.assertIsNotNone(
+            _Handler.timeout,
+            "_Handler.timeout=None lets a silent peer park a daemon thread",
+        )
+        self.assertGreater(_Handler.timeout, 0)
+        self.assertLessEqual(_Handler.timeout, 60)
+
+    def test_silent_connection_is_closed_and_leaves_no_traceback(self):
+        """Connect, send nothing, and the server must hang up on its own —
+        cleanly, with no traceback on the process's stderr."""
+        original = _Handler.timeout
+        # Assert the SHIPPED default is finite before standing anything on
+        # it — with timeout=None this connection is never closed at all and
+        # the recv below would simply block. Then clamp it so the test
+        # exercises the same mechanism in under a second instead of ten.
+        self.assertIsNotNone(original, "_Handler.timeout must not be None")
+        _Handler.timeout = min(original, 0.4)
+        self.addCleanup(setattr, _Handler, "timeout", original)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            mint = self.start_mint()
+            sock = socket.create_connection(("127.0.0.1", mint.port),
+                                            timeout=6.0)
+            self.addCleanup(sock.close)
+            started = time.monotonic()
+            # recv raises socket.timeout at 6s if the server never closes,
+            # which is exactly the pre-fix behaviour.
+            data = sock.recv(65536)
+            elapsed = time.monotonic() - started
+            time.sleep(0.2)  # let the serving thread finish unwinding
+        self.assertEqual(data, b"", "server should have closed the connection")
+        self.assertLess(elapsed, 5.0)
+        self.assertNotIn("Traceback", captured.getvalue())
+
+    # ------------------------------------------------------------------
+    # 3. unbounded idempotency key
+    # ------------------------------------------------------------------
+
+    def test_over_length_idempotency_key_rejected_before_the_ledger(self):
+        """§3.3 keys are caller-chosen and C04 keeps them for the §8
+        recovery window. An unbounded key is unbounded storage written by a
+        stranger, so it is a malformed envelope: §3.8 call-level
+        bad_format, and the exchange must not have executed."""
+        mint = self.start_mint()
+        s0, s1 = new_secret(), new_secret()
+        self.issue(mint, 100_000, s0)
+        long_key = "k" * (MAX_IDEMPOTENCY_KEY_LEN + 1)
+        status, body, _ = self.exchange(
+            mint, long_key, [tok(100_000, s0)], [out_hash(99_000, s1)]
+        )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body, {
+            "status": "rejected",
+            "errors": [{"index": None, "kind": "call",
+                        "reason": "bad_format"}],
+        })
+        # Rejected before C04 saw it: the input is untouched, the output
+        # was never created, and nothing was written under that key.
+        _, sbody, _ = self.status_batch(
+            mint, [ledger_key(s0), ledger_key(s1)]
+        )
+        self.assertEqual(sbody["results"][0]["state"], "unspent")
+        self.assertEqual(sbody["results"][1]["state"], "unknown")
+
+    def test_idempotency_key_at_the_limit_is_accepted(self):
+        """Off-by-one guard: the cap is a maximum, not an exclusive bound."""
+        mint = self.start_mint()
+        s0, s1 = new_secret(), new_secret()
+        self.issue(mint, 100_000, s0)
+        status, body, _ = self.exchange(
+            mint, "k" * MAX_IDEMPOTENCY_KEY_LEN,
+            [tok(100_000, s0)], [out_hash(99_000, s1)],
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["outputs_confirmed"], 1)
+
+    # ------------------------------------------------------------------
+    # 4. the descriptor endpoint was a write
+    # ------------------------------------------------------------------
+
+    def test_descriptor_fetch_does_not_take_the_payment_write_lock(self):
+        """GET /v3/mints is unauthenticated (§3.7) and used to run BEGIN
+        IMMEDIATE plus a snapshot_seq UPDATE on every fetch, so a poller
+        serialized against real exchanges on the same sqlite file.
+
+        Proof: hold the database's write lock from outside and serve
+        descriptors anyway. Before the fix each fetch blocked on that lock
+        (sqlite timeout 30s) and then failed; after it, a fetch is a read.
+        §3.6 monotonicity is asserted throughout, including that the
+        PERSISTED seq stays at or above every seq served — which is what
+        makes a restart resume above, never inside, what was signed."""
+        mint = self.start_mint()
+        s0, s1, s2 = new_secret(), new_secret(), new_secret()
+        self.issue(mint, 100_000, s0)
+        self.exchange(mint, "dh-1", [tok(100_000, s0)], [out_hash(99_000, s1)])
+        # Warm-up fetch: this one may reserve a seq block (one write).
+        st, d0, _ = http_json(mint.port, "GET", "/v3/mints", timeout=8)
+        self.assertEqual(st, 200)
+
+        blocker = sqlite3.connect(
+            mint.ledger._db_path, timeout=30.0, isolation_level=None
+        )
+        self.addCleanup(blocker.close)
+        blocker.execute("BEGIN IMMEDIATE")  # sqlite's write lock, held
+        try:
+            descs = [d0]
+            for _ in range(4):
+                st, d, _ = http_json(mint.port, "GET", "/v3/mints", timeout=8)
+                self.assertEqual(
+                    st, 200,
+                    "a descriptor fetch must not need the write lock",
+                )
+                descs.append(d)
+            persisted = blocker.execute(
+                "SELECT snapshot_seq FROM mintapi_state WHERE id = 1"
+            ).fetchone()[0]
+        finally:
+            blocker.execute("ROLLBACK")
+
+        supplies = [d["supply"] for d in descs]
+        seqs = [s["snapshot_seq"] for s in supplies]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(set(seqs)), len(seqs), seqs)  # strictly up
+        # The durable high-water mark covers everything signed, so a restart
+        # can only continue above it (§3.6 "portable proof of nonconformance"
+        # is a repeated or regressing seq; this is what forecloses it).
+        self.assertGreaterEqual(persisted, max(seqs))
+        for before, after in zip(supplies, supplies[1:]):
+            self.assertGreaterEqual(after["cumulative_issued_mc"],
+                                    before["cumulative_issued_mc"])
+            self.assertGreaterEqual(after["cumulative_burned_mc"],
+                                    before["cumulative_burned_mc"])
+        for snap in supplies:
+            self.assertTrue(verify_obj(snap, mint.pub))
+            self.assertEqual(
+                snap["outstanding_mc"],
+                snap["cumulative_issued_mc"] - snap["cumulative_burned_mc"],
+            )
+
+    def test_descriptor_is_never_stale_behind_a_completed_exchange(self):
+        """Cheap must not mean cached: the snapshot following an exchange
+        has to show that exchange's burn and issuance, not the previous
+        fetch's numbers."""
+        mint = self.start_mint()
+        _, before, _ = http_json(mint.port, "GET", "/v3/mints")
+        _, before2, _ = http_json(mint.port, "GET", "/v3/mints")
+        # Back-to-back fetches with no write between them still advance the
+        # sequence (C06 requirement 3: strictly increasing per serve).
+        self.assertGreater(before2["supply"]["snapshot_seq"],
+                           before["supply"]["snapshot_seq"])
+
+        s0, s1 = new_secret(), new_secret()
+        self.issue(mint, 100_000, s0)
+        status, body, _ = self.exchange(
+            mint, "dh-stale", [tok(100_000, s0)], [out_hash(99_000, s1)]
+        )
+        self.assertEqual(status, 200, body)
+
+        _, after, _ = http_json(mint.port, "GET", "/v3/mints")
+        self.assertEqual(after["supply"]["cumulative_issued_mc"],
+                         before2["supply"]["cumulative_issued_mc"] + 100_000)
+        self.assertEqual(after["supply"]["cumulative_burned_mc"],
+                         before2["supply"]["cumulative_burned_mc"] + 1_000)
+        self.assertEqual(after["supply"]["outstanding_mc"], 99_000)
+        self.assertGreater(after["supply"]["snapshot_seq"],
+                           before2["supply"]["snapshot_seq"])
+        self.assertTrue(verify_obj(after["supply"], mint.pub))
+        self.assertEqual(after["activity"]["daily_exchange_count"], 1)
+
+    # ------------------------------------------------------------------
+    # 5. an idle timeout is not a request deadline
+    # ------------------------------------------------------------------
+
+    def test_request_deadline_is_finite_and_is_the_handler_default(self):
+        """A per-recv idle timeout bounds nothing on its own, so there has
+        to be a wall-clock ceiling on a whole request as well, and it has
+        to be the shipped default rather than something only a test sets."""
+        self.assertGreater(MAX_REQUEST_SECONDS, 0)
+        self.assertLessEqual(MAX_REQUEST_SECONDS, 120)
+        self.assertEqual(_Handler.request_timeout, MAX_REQUEST_SECONDS)
+        # The deadline must be the LONGER of the two: otherwise it would be
+        # doing the idle timeout's job and cutting slow-but-live clients.
+        self.assertGreater(MAX_REQUEST_SECONDS, _Handler.timeout)
+
+    def test_dripped_body_cannot_hold_a_thread_past_the_deadline(self):
+        """The cheap version of the exhaustion the socket timeout was added
+        for, and the one it does NOT close.
+
+        `_Handler.timeout` is applied per recv, so a client that declares
+        exactly MAX_BODY_BYTES (the byte cap never fires) and then sends
+        one byte every few seconds resets it on every recv and holds a
+        daemon thread and an fd for as long as it keeps dripping — at one
+        byte per nine seconds, ~109 days for a single connection, and
+        ThreadingHTTPServer caps neither connections nor threads.
+
+        So the drip here is deliberately far FASTER than the idle timeout:
+        nothing but a wall-clock deadline on the whole request can end it.
+        The shipped ceiling is asserted above; it is clamped here only so
+        the test takes a second instead of thirty.
+        """
+        original = _Handler.request_timeout
+        self.assertIsNotNone(original)
+        _Handler.request_timeout = 1.0
+        self.addCleanup(setattr, _Handler, "request_timeout", original)
+        # The idle timeout stays at its shipped value on purpose: if it
+        # were what ended this connection the test would prove nothing.
+        self.assertGreaterEqual(_Handler.timeout, 5)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            mint = self.start_mint()
+            sock = socket.create_connection(("127.0.0.1", mint.port),
+                                            timeout=20.0)
+            self.addCleanup(sock.close)
+            sock.sendall(
+                b"POST /v3/status HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(MAX_BODY_BYTES).encode("ascii")
+                + b"\r\n\r\n"
+            )
+            started = time.monotonic()
+            sock.settimeout(0.1)
+            closed = False
+            while time.monotonic() - started < 15.0:
+                try:
+                    sock.sendall(b"{")  # one byte of the declared megabyte
+                except OSError:
+                    closed = True  # server hung up on us mid-drip
+                    break
+                try:
+                    if sock.recv(65536) == b"":
+                        closed = True
+                        break
+                    # A 400 arrived; drain to EOF and stop.
+                    while sock.recv(65536):
+                        pass
+                    closed = True
+                    break
+                except TimeoutError:
+                    pass
+            elapsed = time.monotonic() - started
+            time.sleep(0.2)  # let the serving thread unwind
+        self.assertTrue(
+            closed,
+            "a dripped body held the connection (and its thread) open",
+        )
+        self.assertLess(
+            elapsed, 5.0,
+            "the request outlived its deadline: %.1fs" % elapsed,
+        )
+        self.assertNotIn("Traceback", captured.getvalue())
+        # And the mint is still serving everyone else.
+        st, desc, _ = http_json(mint.port, "GET", "/v3/mints", timeout=8)
+        self.assertEqual(st, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+    def test_body_refusal_reason_is_not_carried_on_handler_state(self):
+        """The §3.8 reason for a refused body must be derivable from the
+        route, not left on the handler by whoever read the body.
+
+        `_read_json` is overridable — C10's Supervision Profile handler is
+        the live subclass — and a subclass cannot be asked to maintain a
+        private attribute it has never heard of. While the reason rode on
+        one, an inherited Layer 0 route served whatever the class default
+        happened to be, so the same wire bytes drew two different §3.8
+        reasons depending on profile (L13/B9 forbid exactly that)."""
+        self.assertFalse(
+            hasattr(_Handler, "_body_error"),
+            "the body-refusal reason is out-of-band handler state again; "
+            "an overriding subclass will serve a stale default",
+        )
+
+    # ------------------------------------------------------------------
+    # 6. one ledger file, one mint process (§3.6 monotonicity)
+    # ------------------------------------------------------------------
+
+    def _server_on(self, db_path: str) -> MintServer:
+        """An unstarted MintServer over `db_path`. Called twice on one path
+        it models the deployment slip §3.6 monotonicity has to survive: two
+        run_mint.py processes on the same ledger, different ports (the only
+        collision run_mint.py can detect today is the port bind)."""
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            db_path,
+            FakeClock(T0),
+            POLICY,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        return MintServer(config, ledger)
+
+    def _shared_ledger_pair(self) -> tuple[MintServer, MintServer]:
+        """Two MintServers over ONE sqlite file; the first is serving."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "ledger.sqlite3")
+        first = self._server_on(db_path)
+        first.start()
+        self.addCleanup(first.stop)
+        second = self._server_on(db_path)
+        self.addCleanup(second.stop)
+        return first, second
+
+    def test_second_mint_on_the_same_ledger_refuses_to_start(self):
+        """§3.6 monotonicity is a property of the mint_id and its signing
+        key, not of a process.
+
+        Ordering a snapshot's supply read against its seq used to be
+        sqlite's job (one BEGIN IMMEDIATE covered both), which held across
+        any number of processes sharing the file. Making the descriptor a
+        read moved that ordering onto a threading.Lock, which exists once
+        per process: two mints on one ledger draw disjoint seq blocks but
+        order their supply reads independently, so the one holding the
+        higher block can sign a higher seq over an OLDER supply — two
+        signed snapshots violating monotonicity, which §3.6 calls portable
+        proof of nonconformance against an honest mint. The precondition
+        is therefore enforced, not left to DEPLOYMENT.md."""
+        first, second = self._shared_ledger_pair()
+        with self.assertRaises(RuntimeError) as caught:
+            second.start()
+        self.assertIn("ledger", str(caught.exception).lower())
+        # Refused at the door, so no port was bound and nothing is serving.
+        self.assertIsNone(second._httpd)
+        # The mint that does hold the ledger is untouched.
+        port = first._httpd.server_address[1]
+        st, desc, _ = http_json(port, "GET", "/v3/mints", timeout=8)
+        self.assertEqual(st, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+    def test_a_mint_without_the_claim_refuses_to_sign_a_snapshot(self):
+        """Enforced where the guarantee lives, not only at start().
+
+        A server class that binds its own socket without going through
+        MintServer.start (C10's SupervisionServer does exactly that) would
+        otherwise sign snapshots with no claim at all, so the descriptor
+        re-checks it: a mint that cannot hold the ledger declines to sign
+        rather than signing something that may be §3.6 proof of
+        nonconformance against its own key."""
+        _, second = self._shared_ledger_pair()
+        with self.assertRaises(RuntimeError):
+            second._core.descriptor()  # start() bypassed entirely
+
+    def test_the_claim_is_released_so_a_restart_can_take_it(self):
+        """A stopped mint must hand the ledger back: a single-writer guard
+        that outlived its process would turn every restart into an
+        outage."""
+        first, second = self._shared_ledger_pair()
+        with self.assertRaises(RuntimeError):
+            second.start()
+        first.stop()
+        port = second.start()  # must not raise now
+        st, desc, _ = http_json(port, "GET", "/v3/mints", timeout=8)
+        self.assertEqual(st, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+    # ------------------------------------------------------------------
+    # 7. a GET body is never consumed, so it must not be reusable
+    # ------------------------------------------------------------------
+
+    def test_get_with_a_declared_body_cannot_frame_a_second_request(self):
+        """`do_GET` reads no body, so a GET that declares one leaves octets
+        on the wire. Held open, a keep-alive peer or a pipelining proxy
+        parses them as the next request line — request N's body becomes
+        request N+1. Same desync the POST path closes; the GET itself is a
+        legal §3.7 anonymous read, so it is answered and then hung up on,
+        not rejected."""
+        mint = self.start_mint()
+        smuggled = b'{"x":1}GET /v3/status/smuggled HTTP/1.1\r\nHost: h\r\n\r\n'
+        request = (
+            b"GET /v3/mints HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 7\r\n"
+            b"\r\n" + smuggled
+        )
+        raw = raw_request(mint.port, request, timeout=8.0)
+        status, headers, body = parse_http(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mint_id"], MINT_ID)
+        self.assertEqual(headers.get("connection"), "close")
+        # Exactly one answer came back: the smuggled line was never served.
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
+        self.assertNotIn(b"smuggled", raw)
