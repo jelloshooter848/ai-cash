@@ -22,7 +22,7 @@ Every journey **completed** (real value moved, supply reconciled) in every round
 
 **Fixes applied (spec-faithful, no checks weakened):**
 - `README.md` + runnable `examples/quickstart.py` (the whole §0 loop in ~30 lines, executed and asserted).
-- Package-root exports: 61 names including every integrator-facing type, function, **and the exception classes each call raises**.
+- Package-root exports: every integrator-facing type, function, **and the exception classes each call raises**.
 - Ergonomic client surface: `MintClient.admin_issue`, `Wallet.connect` (zero-config §7.2 entry), `Wallet.pay_many` and `Wallet.receive_batch` (one call = one burn), `Wallet.quote` (budget before paying), `make_mint` factory (single source of truth for policy), `ChannelPayer.estimate_open_cost`.
 - Wire codecs for the cross-agent handoffs the spec defines as messages: `ChannelInfo.to_json/from_json`, `FundingInfo.to_dict/from_dict`, and a discoverable `aicash.envelope` module.
 - Traps closed: `mint_id` now validated in config (fails at boot, not payment); `:memory:` rejected with an explanation; the misspelled `freezed` response field renamed `frozen`; `amount_mismatch` errors now carry `expected_burn_mc`.
@@ -44,4 +44,4 @@ Every journey **completed** (real value moved, supply reconciled) in every round
 
 ## Bottom line
 
-An AI agent — or the framework wrapping one — can integrate AICash for any of the seven core value-exchange patterns from the repository's own documentation, without reading implementation internals, and the first payment is a `Wallet.connect(...).receive(token)` away. The remaining friction is cosmetic. Suite: **307 tests, 0 failures**, covering the adversarial cases behind each journey.
+An AI agent — or the framework wrapping one — can integrate AICash for any of the seven core value-exchange patterns from the repository's own documentation, without reading implementation internals, and the first payment is a `Wallet.connect(...).receive(token)` away. The remaining friction is cosmetic. Suite: **0 failures**, covering the adversarial cases behind each journey.

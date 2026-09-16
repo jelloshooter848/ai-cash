@@ -34,7 +34,10 @@ class MintConfig:
     policy_url: str = "about:blank"
     performance: dict | None = None      # see "performance shape" below
     profiles: tuple[str, ...] = ()
-    admin_token: str | None = None       # gates /admin/issue when set (non-normative)
+    admin_token: str | _AdminIssuanceMode   # REQUIRED; a credential, ADMIN_ISSUANCE_DISABLED,
+                                         # or ADMIN_ISSUANCE_OPEN (tests only). No default:
+                                         # omitting it raises ValueError at build time, and
+                                         # admin_token=None is rejected by name.
 
 class MintServer:
     def __init__(self, config: MintConfig, ledger: Ledger): ...
@@ -59,7 +62,7 @@ def make_mint(config: MintConfig, db_path: str, clock=system_clock) -> tuple[Min
 ```
 
 ### `POST /admin/issue` (non-normative)
-Not part of the spec's Layer 0 surface — a reference-implementation operator path for §7.1 funding. When `MintConfig.admin_token` is set, the request MUST carry it in the `X-Admin-Token` header (constant-time compared); a missing/wrong header → `401 {"status": "unauthorized"}`. With no token configured the route is open (test/ops bootstrap).
+Not part of the spec's Layer 0 surface — a reference-implementation operator path for §7.1 funding. When `MintConfig.admin_token` is set, the request MUST carry it in the `X-Admin-Token` header (constant-time compared); a missing/wrong header → `401 {"status": "unauthorized"}`. With no token configured the mint refuses to build; name `ADMIN_ISSUANCE_DISABLED` to close the route or `ADMIN_ISSUANCE_OPEN` to open it deliberately (tests/sandboxes only, and it logs an unauthenticated-mint warning at boot). Both sentinels are importable from the package root and from `aicash.mintapi`.
 ```
 Request:  { "outputs": [ <§3.3 output form>, ... ] }        # by-hash {amount_mc, secret_hash}
                                                             # or by-secret {amount_mc, secret},

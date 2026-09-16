@@ -1392,10 +1392,6 @@ class EnvelopeAliasTest(unittest.TestCase):
         self.assertIsNone(env.channel_draw)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RateSchemaConformance(unittest.TestCase):
     """§3.6 pins the rate schema. Nothing checked it, and the descriptor
     shipped without `scope` against OPEN-QUESTIONS R15, which had closed
@@ -2636,6 +2632,604 @@ class GuidanceNamesAWorkingImportTest(unittest.TestCase):
                     self.assertIs(value, getattr(mintapi, name), name)
 
 
+class PackageRootSurfaceTest(unittest.TestCase):
+    """`from aicash import X` must work for every X the docs promise.
+
+    Round 4 gave MintConfig two sentinels, ADMIN_ISSUANCE_DISABLED and
+    ADMIN_ISSUANCE_OPEN, and made a mint refuse to build until one of them
+    or a real credential is named. They went into aicash.mintapi.__all__
+    and not into the package root, while aicash/__init__.py's own docstring
+    tells an embedder the integrator-facing surface lives at the root. So
+    `from aicash import ADMIN_ISSUANCE_DISABLED` -- the single line whose
+    entire job is to stop someone shipping an open mint -- raised
+    ImportError, and the audience that hardening existed to protect was the
+    audience it stranded.
+
+    Adding those two names fixes one instance. These tests are written to
+    fail on the NEXT name that lands in the same shape: they derive what the
+    root must carry from the modules themselves, so a name added to mintapi
+    (or a new exception, or a new return type) and forgotten here fails
+    here, with a message naming it.
+    """
+
+    # Empty, and it has to be earned back. The one entry that used to sit
+    # here said aicash.lockeval.LockError never reaches an integrator
+    # because "ledgerstore catches it internally". That was written from
+    # reading ledgerstore.py:351 (validate_lock, which IS wrapped) and not
+    # ledgerstore.py:303 (evaluate, which is not): a mint.db row whose
+    # lock_preimage_hash is not b64u makes Ledger.exchange -- a root-
+    # exported class's method -- raise LockError straight out at the
+    # caller. test_lockerror_really_does_escape_to_a_root_only_caller
+    # causes exactly that, every run.
+    #
+    # So the rule for adding an entry back: do not reason about whether an
+    # exception can escape, CAUSE it escaping or failing to. An allowlist
+    # entry is a claim about runtime behaviour, and the wrong kind of claim
+    # to take on trust -- it is the one thing in this class that turns the
+    # detector off.
+    EXCEPTIONS_DELIBERATELY_OFF_ROOT: set = set()
+
+    # Every module whose whole __all__ the root mirrors. The rule is not
+    # "mintapi is special", it is "a module an embedder integrates against
+    # has no member they are meant to be kept away from": mintapi builds a
+    # mint, wallet pays and gets paid (the README's headline surface),
+    # envelope is the §9.5 wire object between two agents, supervision runs
+    # a fleet. Pinning only mintapi left wallet -- the surface most people
+    # touch first -- guarded by nothing for non-exception names.
+    #
+    # NOT on this list, with the reason, because an unexplained split is
+    # how the last gap hid: burncalc, channels, escrow, ledgerstore,
+    # lockeval, receipts, signing, swap and tokencodec all export internals
+    # (validate_policy, split_tranches, parse_output_wire, sign_raw,
+    # SCHEMA_V, ...) that belong to the implementation's own layering, not
+    # to a first integration. Those modules are covered by the narrower
+    # return-type / parameter-type / exception sweeps below instead.
+    WHOLLY_MIRRORED_MODULES = ("mintapi", "wallet", "envelope", "supervision")
+
+    @staticmethod
+    def aicash_modules():
+        """Every submodule of the package, imported."""
+        import importlib
+        import pkgutil
+
+        import aicash
+
+        mods = []
+        for info in pkgutil.iter_modules(aicash.__path__):
+            mods.append(importlib.import_module("aicash." + info.name))
+        return mods
+
+    def test_every_name_in_all_is_actually_importable_from_the_root(self):
+        """`__all__` is a promise `from aicash import *` has to keep."""
+        import aicash
+
+        for name in aicash.__all__:
+            with self.subTest(name=name):
+                ns = {}
+                try:
+                    exec("from aicash import %s" % name, ns)
+                except ImportError as exc:
+                    self.fail("aicash.__all__ promises %r: %s" % (name, exc))
+                self.assertIs(ns[name], getattr(aicash, name), name)
+        self.assertEqual(
+            len(set(aicash.__all__)), len(aicash.__all__),
+            "aicash.__all__ lists a name twice: %s"
+            % sorted({n for n in aicash.__all__ if aicash.__all__.count(n) > 1}),
+        )
+
+    def test_the_import_line_in_the_package_docstring_runs(self):
+        """The docstring shows an import. Readers type what they are shown."""
+        import aicash
+
+        shown = re.findall(r"from aicash import ([^`\n]+)", aicash.__doc__ or "")
+        self.assertTrue(shown, "the package docstring no longer shows an import")
+        for clause in shown:
+            names = [n.strip() for n in clause.split(",")]
+            names = [n for n in names if n and n != "..."]
+            self.assertTrue(names, clause)
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name, aicash.__all__)
+                    self.assertTrue(hasattr(aicash, name), name)
+
+    def test_the_integrator_facing_modules_reach_the_root_whole(self):
+        """The defect this class exists for, stated as a set difference.
+
+        Round 4's gap was mintapi's; the rule is wider than mintapi. Each
+        module in WHOLLY_MIRRORED_MODULES is one an embedder integrates
+        against, with no member meant to be kept away from them, so the
+        whole of its __all__ belongs at the root. The next name added to
+        ANY of them is caught here without editing this test.
+
+        Identity, not name: a same-named object from another module bound
+        at the root is exactly the silent substitution this is meant to
+        catch, and it is not hypothetical -- aicash.escrow.__all__ and
+        aicash.receipts.__all__ both name make_dispute_record, and they are
+        two different functions with different signatures.
+        """
+        import importlib
+
+        import aicash
+
+        for mod_name in self.WHOLLY_MIRRORED_MODULES:
+            mod = importlib.import_module("aicash." + mod_name)
+            with self.subTest(module=mod_name):
+                missing = [n for n in mod.__all__ if n not in aicash.__all__]
+                self.assertEqual(
+                    missing, [],
+                    "aicash.%s.__all__ names %s, which aicash/__init__.py"
+                    " does not re-export. Add them to the import and to"
+                    " __all__ there: the package docstring points"
+                    " integrators at the root and names this module as one"
+                    " it mirrors whole." % (mod_name, missing),
+                )
+                for name in mod.__all__:
+                    with self.subTest(name=name):
+                        self.assertIs(
+                            getattr(aicash, name), getattr(mod, name),
+                            "aicash.%s is not aicash.%s.%s -- the root binds"
+                            " a different object under the same name"
+                            % (name, mod_name, name),
+                        )
+
+    def test_the_mirror_list_names_only_real_modules_with_an_all(self):
+        """A typo in WHOLLY_MIRRORED_MODULES would silently guard nothing."""
+        import importlib
+
+        for mod_name in self.WHOLLY_MIRRORED_MODULES:
+            with self.subTest(module=mod_name):
+                mod = importlib.import_module("aicash." + mod_name)
+                self.assertTrue(
+                    getattr(mod, "__all__", None),
+                    "aicash.%s is listed as wholly mirrored but declares no"
+                    " __all__, so the check above compares nothing" % mod_name,
+                )
+
+    @staticmethod
+    def annotated_targets():
+        """(label, callable) for everything reachable from the root.
+
+        Exported functions, exported classes' public methods, and each
+        exported class's __init__ -- a constructor argument is a type the
+        caller has to be able to NAME just as much as a return value is.
+        """
+        import inspect
+
+        import aicash
+
+        targets = []
+        for name in aicash.__all__:
+            obj = getattr(aicash, name)
+            if inspect.isclass(obj):
+                targets.append(("%s.__init__" % name, obj.__init__))
+                for attr in dir(obj):
+                    if attr.startswith("_"):
+                        continue
+                    member = getattr(obj, attr, None)
+                    if callable(member):
+                        targets.append(("%s.%s" % (name, attr), member))
+            elif callable(obj):
+                targets.append((name, obj))
+        return targets
+
+    @staticmethod
+    def leaked_annotations(which):
+        """Classes named in annotations that the root cannot bind.
+
+        `which` is "return" or "param". A class is fine if the root binds
+        THAT object -- identity, not name. A same-named different class at
+        the root is the substitution the sentinel test guards against with
+        assertIs, and these sweeps used to accept it.
+        """
+        import inspect
+        import typing
+
+        import aicash
+
+        leaked = {}
+        for label, fn in PackageRootSurfaceTest.annotated_targets():
+            try:
+                hints = typing.get_type_hints(fn)
+            except Exception:
+                continue  # forward ref we cannot resolve; not this test's job
+            if which == "return":
+                items = [("return", hints.get("return"))]
+            else:
+                items = [(k, v) for k, v in hints.items() if k != "return"]
+            for pname, ann in items:
+                for cand in (ann,) + tuple(typing.get_args(ann) or ()):
+                    if not inspect.isclass(cand):
+                        continue
+                    if not getattr(cand, "__module__", "").startswith("aicash."):
+                        continue
+                    if cand.__name__.startswith("_"):
+                        # A private class is one the caller is never meant
+                        # to name: MintConfig.admin_token is annotated
+                        # `str | _AdminIssuanceMode`, and every legal value
+                        # of it (a credential string, ADMIN_ISSUANCE_OPEN,
+                        # ADMIN_ISSUANCE_DISABLED) is nameable at the root
+                        # without the class. Exempt by construction, not by
+                        # allowlist, so it cannot go stale.
+                        continue
+                    if getattr(aicash, cand.__name__, None) is cand:
+                        continue
+                    where = "%s:%s" % (label, pname) if which == "param" else label
+                    leaked.setdefault(
+                        "%s.%s" % (cand.__module__, cand.__name__), []
+                    ).append(where)
+        return {k: sorted(set(v)) for k, v in leaked.items()}
+
+    def test_types_the_surface_returns_can_be_named_from_the_surface(self):
+        """A call at the root that hands back a class only a submodule
+        names forces the caller back into implementation source to write an
+        annotation or an isinstance check. parse_token -> Token and
+        parse_envelope -> Envelope were both in that state."""
+        leaked = self.leaked_annotations("return")
+        self.assertEqual(
+            leaked, {},
+            "these types are returned by package-root calls but cannot be"
+            " imported from the package root: %s" % (leaked,),
+        )
+
+    def test_types_the_surface_demands_can_be_named_from_the_surface(self):
+        """The neighbour of the test above, and the reason it is here.
+
+        The return sweep covered types a root call hands BACK and said
+        nothing about types it ASKS FOR -- and a caller who cannot name an
+        argument type is in exactly the same scavenger hunt: they cannot
+        annotate the variable they are about to pass, or build one. Clean
+        today; the point is that it stays clean when a public helper class
+        is added to a submodule and threaded into a root-exported call.
+        """
+        leaked = self.leaked_annotations("param")
+        self.assertEqual(
+            leaked, {},
+            "these types are accepted as arguments by package-root calls"
+            " but cannot be imported from the package root: %s" % (leaked,),
+        )
+
+    def test_exceptions_the_surface_raises_are_catchable_from_the_surface(self):
+        """Round 4's shape, generalised. aicash/__init__.py already says
+        'error handling is part of the integration surface' and the README
+        promises the exception classes each call can raise are re-exported;
+        PolicyError (raised by the root-exported compute_burn) and
+        EnvelopeError (raised by the root-exported parse_envelope) were not.
+        A new exception class either lands on the root or gets written into
+        EXCEPTIONS_DELIBERATELY_OFF_ROOT with the reason."""
+        import inspect
+
+        import aicash
+
+        off_root = []
+        for mod in self.aicash_modules():
+            for name, obj in vars(mod).items():
+                if not inspect.isclass(obj) or not issubclass(obj, BaseException):
+                    continue
+                if obj.__module__ != mod.__name__:
+                    continue  # imported into this module, owned by another
+                qual = "%s.%s" % (obj.__module__, name)
+                if qual in self.EXCEPTIONS_DELIBERATELY_OFF_ROOT:
+                    continue
+                # Identity, not name: `except SomeError` that binds a
+                # different class of the same name is a bare `except` that
+                # looks careful. Matching on the name alone accepted that.
+                if getattr(aicash, name, None) is obj:
+                    continue
+                off_root.append(qual)
+        self.assertEqual(
+            sorted(off_root), [],
+            "these exception classes cannot be caught by a caller who"
+            " imported only from the package root: %s. Re-export them in"
+            " aicash/__init__.py, or list them in"
+            " EXCEPTIONS_DELIBERATELY_OFF_ROOT with why a caller never"
+            " sees them." % (sorted(off_root),),
+        )
+
+    def test_the_allowlist_does_not_outlive_the_names_on_it(self):
+        """A stale exemption is how the next gap hides. Every entry must
+        still name a real exception class."""
+        import importlib
+
+        for qual in self.EXCEPTIONS_DELIBERATELY_OFF_ROOT:
+            with self.subTest(qual=qual):
+                mod_name, _, cls_name = qual.rpartition(".")
+                mod = importlib.import_module(mod_name)
+                cls = getattr(mod, cls_name, None)
+                self.assertTrue(
+                    isinstance(cls, type) and issubclass(cls, BaseException),
+                    "%s is exempted from the package surface but is no longer"
+                    " an exception class defined there; drop the entry" % qual,
+                )
+
+    def test_lockerror_really_does_escape_to_a_root_only_caller(self):
+        """Causes the escape the old allowlist entry said was impossible.
+
+        The entry read "ledgerstore catches it internally rather than
+        letting it reach a caller". ledgerstore wraps validate_lock on the
+        way IN (:351) and does not wrap evaluate on the way OUT (:303),
+        and _lock_from_row re-validates nothing -- so a mint.db row with an
+        unreadable lock_preimage_hash (damaged file, hand-edited row,
+        restored-from-a-bad-backup operator) raises aicash.lockeval.LockError
+        out of Ledger.exchange, which is a root-exported class's method.
+
+        This test exists so the claim is re-caused on every run rather than
+        re-reasoned. If ledgerstore ever does catch it, this fails and says
+        so -- at which point LockError may go back on the allowlist WITH a
+        pointer to that catch, and not before.
+        """
+        import base64
+
+        import aicash
+        from aicash.lockeval import InputForm
+        from aicash.tokencodec import Token, new_secret
+
+        def b64u(raw):
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "mint.db")
+            ledger = aicash.Ledger(
+                db,
+                FakeClock(1_000),
+                BurnPolicy(rate_ppm=0, cap_mc=0, exempt_below_mc=10),
+                0,
+                None,
+            )
+            secret = new_secret()
+            preimage = os.urandom(32)
+            ledger.issue([
+                aicash.OutputSpec(
+                    amount_mc=100,
+                    secret=secret,
+                    lock={
+                        "preimage_hash": b64u(hashlib.sha256(preimage).digest()),
+                        "expiry": 10 ** 12,
+                        "refund_hash": b64u(hashlib.sha256(os.urandom(32)).digest()),
+                    },
+                )
+            ])
+            conn = sqlite3.connect(db)
+            conn.execute("UPDATE entries SET lock_preimage_hash = '!!!not-b64u!!!'")
+            conn.commit()
+            conn.close()
+
+            form = InputForm(
+                kind="claim",
+                token=Token(mint_id="mint-abc", amount_mc=100, secret=secret),
+                witness=preimage,
+            )
+            # The point of the test: an integrator holding only root
+            # imports must be able to WRITE this except clause.
+            with self.assertRaises(aicash.LockError):
+                ledger.exchange(
+                    "idem-corrupt-lock",
+                    "digest-corrupt-lock",
+                    [form],
+                    None,
+                    [aicash.OutputSpec(amount_mc=100, secret=new_secret())],
+                )
+
+        self.assertNotIn(
+            "aicash.lockeval.LockError", self.EXCEPTIONS_DELIBERATELY_OFF_ROOT,
+            "LockError escapes Ledger.exchange (just demonstrated above), so"
+            " it cannot be exempted from the package root",
+        )
+
+    # (repo-relative file, the stale sentence in it). Each pair must be
+    # mentioned in the package docstring's "Known-stale neighbours" block
+    # exactly while the sentence is still there -- see the test below.
+    STALE_NEIGHBOURS = (
+        ("components/C06-mintapi.md", "admin_token: str | None = None"),
+        ("components/C06-mintapi.md",
+         "With no token configured the route is open"),
+        ("README.md", "61 names"),
+        ("USABILITY-REPORT.md", "61 names"),
+    )
+
+    @staticmethod
+    def repo_root():
+        here = os.path.dirname(os.path.abspath(__file__))       # impl/tests
+        return os.path.dirname(os.path.dirname(here))           # repo root
+
+    @staticmethod
+    def stale_notes_block():
+        """The package docstring's "Known-stale neighbours" section."""
+        import aicash
+
+        doc = aicash.__doc__ or ""
+        _, sep, rest = doc.partition("Known-stale neighbours")
+        return rest if sep else ""
+
+    def test_the_root_docstring_corrects_the_docs_that_contradict_it(self):
+        """The adjacency this class could not fix by editing its own files.
+
+        README.md:73 sends a reader to the components/ "Public API" blocks
+        as THE per-module reference, and aicash/__init__.py's docstring
+        repeats that pointer. components/C06-mintapi.md still documents
+        `admin_token: str | None = None` and still says /admin/issue is
+        open when unconfigured -- the exact footgun round 4 removed, and
+        the opposite of what LOCKED-DESIGN-DECISIONS.md, DEPLOYMENT.md and
+        the code say. Two neighbouring documents, opposite answers to "what
+        happens if I say nothing about admin_token?", and the wrong one is
+        the safety-critical one.
+
+        components/ is not this slice's to edit, so the root docstring --
+        which IS -- carries the correction, and this test keeps the
+        correction honest in both directions: it fails if a stale sentence
+        is still out there unmentioned, and it fails if someone fixes the
+        document and leaves a note here claiming it is still broken. Either
+        way the note cannot quietly become the next false statement.
+        """
+        block = self.stale_notes_block()
+        for rel, sentence in self.STALE_NEIGHBOURS:
+            with self.subTest(file=rel, sentence=sentence):
+                path = os.path.join(self.repo_root(), rel)
+                try:
+                    with io.open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError:
+                    text = ""
+                still_stale = sentence in text
+                basename = os.path.basename(rel)
+                noted = basename in block and sentence in block
+                if still_stale:
+                    self.assertTrue(
+                        noted,
+                        "%s still says %r, and the package docstring's"
+                        " Known-stale neighbours block does not say so. An"
+                        " integrator pointed at that document by README.md"
+                        " gets the pre-round-4 answer with nothing at the"
+                        " root to contradict it." % (rel, sentence),
+                    )
+                else:
+                    self.assertFalse(
+                        noted,
+                        "%s no longer says %r -- drop it from the package"
+                        " docstring's Known-stale neighbours block before"
+                        " the correction becomes the stale statement."
+                        % (rel, sentence),
+                    )
+
+    @staticmethod
+    def name_collisions():
+        """Names two modules both export, bound to different objects.
+
+        The root can bind only one of them, so `from aicash import <name>`
+        silently gives one module's caller the other module's function.
+        """
+        import collections
+        import importlib
+        import pkgutil
+
+        import aicash
+
+        owners = collections.defaultdict(list)
+        for info in pkgutil.iter_modules(aicash.__path__):
+            mod = importlib.import_module("aicash." + info.name)
+            for name in getattr(mod, "__all__", ()):
+                owners[name].append((info.name, getattr(mod, name)))
+        return {
+            name: sorted(m for m, _ in owned)
+            for name, owned in owners.items()
+            if len(owned) > 1 and len({id(o) for _, o in owned}) > 1
+        }
+
+    def test_every_root_name_two_modules_fight_over_is_disclosed(self):
+        """Found while sweeping the neighbours of the mirror rule.
+
+        aicash.escrow.__all__ and aicash.receipts.__all__ both name
+        make_dispute_record, and they are different functions taking
+        different arguments (evidence vs evidence_hash). `from aicash
+        import make_dispute_record` binds the receipts one, so an escrow
+        user who followed the root -- the import line this package's
+        docstring tells everyone to use -- gets a function that does not
+        take their arguments, with no error until call time.
+
+        Renaming either belongs to those modules. What belongs here is
+        that the collision is stated where the root sends people, and this
+        pins that both ways: a new collision must be disclosed, and a
+        disclosure must be deleted once the collision is gone.
+        """
+        collisions = self.name_collisions()
+        block = self.stale_notes_block()
+        for name in sorted(collisions):
+            with self.subTest(name=name):
+                self.assertIn(
+                    name, block,
+                    "aicash.%s is exported by %s with different objects"
+                    " behind it; the package docstring does not tell a"
+                    " reader which one the root binds"
+                    % (name, collisions[name]),
+                )
+        for line in block.splitlines():
+            if "aicash.escrow.__all__" not in line:
+                continue
+            self.assertTrue(
+                collisions,
+                "the package docstring still discloses a two-module name"
+                " collision, but no module pair exports the same name with"
+                " different objects any more; delete the note",
+            )
+
+    def test_the_note_about_components_not_naming_the_sentinels_is_current(self):
+        """Same two-way pin for the other half of the C06 gap: the two
+        sentinels a mint cannot be built without appear nowhere under
+        components/, though the root docstring and DEPLOYMENT.md lead with
+        them."""
+        claim = "does not yet mention either sentinel"
+        block = self.stale_notes_block()
+        root = os.path.join(self.repo_root(), "components")
+        found = []
+        for dirpath, _dirs, files in os.walk(root):
+            for fname in files:
+                if not fname.endswith(".md"):
+                    continue
+                with io.open(os.path.join(dirpath, fname), encoding="utf-8") as fh:
+                    if "ADMIN_ISSUANCE" in fh.read():
+                        found.append(fname)
+        if found:
+            self.assertNotIn(
+                claim, block,
+                "components/%s now names ADMIN_ISSUANCE_*; the package"
+                " docstring still says components/ does not mention the"
+                " sentinels" % (sorted(found),),
+            )
+        else:
+            self.assertIn(
+                claim, block,
+                "no file under components/ mentions ADMIN_ISSUANCE_OPEN or"
+                " ADMIN_ISSUANCE_DISABLED -- the names round 4 made"
+                " mandatory -- and the package docstring no longer says so",
+            )
+
+    def test_the_root_docstring_states_the_live_admin_token_rule(self):
+        """The correcting half has to be right, not just present: build a
+        MintConfig the stale component doc endorses and check the root
+        docstring already told the reader what happens."""
+        import aicash
+
+        doc = aicash.__doc__ or ""
+        priv, pub = generate_keypair()
+        base = dict(
+            mint_id="mint-doc-check",
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+        )
+        # Exactly the config components/C06-mintapi.md still says is legal.
+        with self.assertRaises(ValueError) as unset:
+            MintConfig(**base)
+        with self.assertRaises(ValueError) as explicit_none:
+            MintConfig(admin_token=None, **base)
+        self.assertIn("admin_token", str(unset.exception))
+        self.assertIn("admin_token", str(explicit_none.exception))
+        flat = " ".join(doc.split())
+        self.assertIn("``MintConfig`` has NO default for ``admin_token``", flat)
+        self.assertIn("``admin_token=None`` is rejected by name", flat)
+        for name in ("ADMIN_ISSUANCE_DISABLED", "ADMIN_ISSUANCE_OPEN"):
+            self.assertIn(name, doc, name)
+
+    def test_the_two_sentinels_survive_the_trip_through_the_root(self):
+        """Identity, not equality: admin_authorized() compares with `is`,
+        so a root re-export that produced a copy would silently disable the
+        refusal it exists to serve."""
+        import aicash
+
+        self.assertIs(aicash.ADMIN_ISSUANCE_OPEN, ADMIN_ISSUANCE_OPEN)
+        self.assertIs(aicash.ADMIN_ISSUANCE_DISABLED, ADMIN_ISSUANCE_DISABLED)
+        priv, pub = generate_keypair()
+        cfg = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            admin_token=aicash.ADMIN_ISSUANCE_DISABLED,
+        )
+        self.assertIs(cfg.admin_token, ADMIN_ISSUANCE_DISABLED)
+
+
 class AdminAuthorizedUnitTest(unittest.TestCase):
     """admin_authorized() directly, including the comparison it must use."""
 
@@ -2734,3 +3328,7 @@ class DescriptorCompletenessTest(MintHarness, unittest.TestCase):
             "lock_params", "retention", "profiles", "activity",
         ):
             self.assertIn(key, desc, key)
+
+
+if __name__ == "__main__":
+    unittest.main()

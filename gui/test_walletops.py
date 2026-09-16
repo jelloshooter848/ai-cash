@@ -9,6 +9,7 @@ Run:  cd <repo root> && python3 -m unittest gui.test_walletops -v
 
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -187,9 +188,11 @@ class TestSummary(MintFixture):
 
         (Was test_mint_id_recovered_from_store_without_the_sidecar, which
         deleted a `<store>.mint` sidecar file.  That sidecar no longer
-        exists — the module writes exactly one file, the store — so the
-        deletion line was removed.  The assertion is unchanged and is now
-        the only path, not the fallback path.)
+        exists — the mint_id is read out of the store — so the deletion
+        line was removed.  The assertion is unchanged and is now the only
+        path, not the fallback path.  The payment record written beside
+        the store since is not a cache of this or of anything else: it
+        holds no mint_id this function would ever read.)
         """
         w = self.ops("other")
         w.receive([self.issue(1_000)])
@@ -533,21 +536,39 @@ class TestHistory(MintFixture):
     def test_every_entry_has_the_agreed_shape(self):
         """Five keys now: an op that did not commit carries WHY it did not.
 
-        (Was four.  ``cause`` was added deliberately — a history row that
-        cannot say why an operation failed is the defect this round closes,
-        and the field is part of the pinned shape, not an extra.)
+        (Was four, then five.  ``cause`` was added when a row that could
+        not say why an operation failed was the defect of the round; the
+        five payment-record fields were added when a row that could not
+        say whether a payment ARRIVED was the defect of the next one.  All
+        ten are the pinned shape, not extras.)
         """
         w = self.ops()
         w.receive([self.issue(10_000)])
         w.pay(100)
         for e in w.history():
             self.assertEqual(set(e),
-                             {"ts_ms", "kind", "amount_mc", "detail", "cause"})
+                             {"ts_ms", "op_id", "kind", "amount_mc", "detail",
+                              "cause", "recipient", "recipient_kind",
+                              "delivery", "delivery_cause",
+                              "delivery_attempt"})
             self.assertIsInstance(e["ts_ms"], int)
+            self.assertIsInstance(e["op_id"], str)
             self.assertIsInstance(e["kind"], str)
             self.assertIsInstance(e["amount_mc"], int)
             self.assertIsInstance(e["detail"], str)
             self.assertIsInstance(e["cause"], str)
+            for field in ("recipient", "recipient_kind", "delivery",
+                          "delivery_cause", "delivery_attempt"):
+                self.assertIsInstance(e[field], str)
+            # A closed set, "" included: "nothing was recorded" is a real
+            # value and anything outside the three would widen it.
+            self.assertIn(e["delivery_attempt"],
+                          ("", "attempted", "not_attempted"))
+            self.assertIn(e["delivery"], ("", "delivered", "undelivered",
+                                          "unknown"))
+            self.assertIn(e["recipient_kind"], ("", "wallet", "bearer"))
+            self.assertTrue(e["delivery_cause"] == "" or
+                            e["delivery_cause"] in _causes())
             # Everything here committed, so there is no cause to give.
             self.assertEqual(e["cause"], "")
 
@@ -711,18 +732,35 @@ class TestBrokenStore(MintFixture):
         self.assertEqual(cm.exception.reason, "wallet folder missing")
         self.assertFalse(os.path.exists(os.path.join(self.dir, "no")))
 
-    def test_exactly_one_file_per_wallet_is_written(self):
-        """The pinned layout is var/wallets/<name>.db — nothing beside it."""
+    def test_exactly_two_files_per_wallet_are_written(self):
+        """The pinned layout: the store, and the payment record beside it.
+
+        (Was test_exactly_one_file_per_wallet_is_written, asserting the
+        store alone.  The second file is deliberate and is NOT a relaxing
+        of that claim: what the one-file rule protected was "no second
+        copy of live bearer money on disk", and that is asserted here
+        directly — the record is opened and searched for the strings the
+        payment produced.  The set is still exact: a third artefact, a
+        cache, a lock file or a stray temp file fails this test as it
+        always did.)
+        """
         w = self.ops("solo")
         w.receive([self.issue(10_000)])
         w.summary()
         w.summary()
         w.history()
-        w.pay(100)
+        paid = w.pay(100)
         w.close()
         made = {e for e in os.listdir(self.dir) if e.startswith("solo")}
-        self.assertEqual(made, {"solo.db"})
+        self.assertEqual(made, {"solo.db", "solo.payments.db"})
         self.assertFalse(os.path.exists(self.path("solo") + ".mint"))
+        # The record describes money; it must never BE money.
+        with open(os.path.join(self.dir, "solo.payments.db"), "rb") as fh:
+            blob = fh.read()
+        self.assertNotIn(b"aicash:", blob)
+        for token in paid["tokens"]:
+            self.assertNotIn(token.encode(), blob)
+            self.assertNotIn(token.split(":")[-1].encode(), blob)
 
 
 # ---------------------------------------------------------------------------
@@ -996,13 +1034,29 @@ class TestHistoryEfficiency(MintFixture):
             len(count), 2,
             f"history opened {len(count)} connections for {len(rows)} rows",
         )
-        # One ops query plus one grouped outputs query. A per-row query is
-        # an N+1 and also means each row is read under its own snapshot.
+        # One ops query, one grouped outputs query, one grouped causes
+        # query, one grouped payment-record query. A per-row query is an
+        # N+1 and also means each row is read under its own snapshot.
         self.assertLessEqual(
-            len(queries), 3,
+            len(queries), 4,
             f"history ran {len(queries)} queries for {len(rows)} rows:"
             f" {queries}",
         )
+        # And the real invariant behind that number, which a bound alone
+        # does not pin: the count does not GROW with the rows. Nine rows
+        # and three rows must cost the same number of queries.
+        for_nine = list(queries)
+        del queries[:]
+        _sq.connect = counting_ro
+        try:
+            short = fresh.history(limit=3)
+        finally:
+            _sq.connect = real
+        self.assertEqual(len(short), 3)
+        self.assertEqual(
+            len(queries), len(for_nine),
+            f"history costs {len(queries)} queries for 3 rows and"
+            f" {len(for_nine)} for 9 — that is an N+1")
 
 
 # ---------------------------------------------------------------------------
@@ -1545,24 +1599,36 @@ class TestOutstandingPayments(MintFixture):
         self.assertEqual(set(out), {"checked", "mint_id", "payments"})
         for payment in out["payments"]:
             self.assertEqual(set(payment),
-                             {"op_id", "amount_mc", "live_mc", "tokens"})
+                             {"op_id", "amount_mc", "live_mc", "tokens",
+                              "recipient", "recipient_kind", "delivery",
+                              "delivery_cause", "delivery_attempt"})
+            self.assertIn(payment["delivery_attempt"],
+                          ("", "attempted", "not_attempted"))
             for token in payment["tokens"]:
                 self.assertEqual(set(token),
                                  {"token", "amount_mc", "key", "state"})
 
     def test_no_second_copy_of_the_money_is_written_anywhere(self):
-        """The decision: read the store back, never write a sidecar.
+        """The decision: read the store back, never write the strings down.
 
         A file of bearer strings beside the wallet would be a second
-        complete copy of live money on disk — and the pinned layout is one
-        file per wallet.
+        complete copy of live money on disk.  The payment record beside
+        the store is NOT that file and this proves it rather than
+        asserting it: the record is opened and searched for every string
+        the payment produced, and for the secret halves on their own.
         """
         w = self.funded("solo-out")
-        w.pay(1_000)
-        w.outstanding_payments()
+        paid = w.pay(1_000)
+        w.unredeemed_payments()
         w.close()
         made = {e for e in os.listdir(self.dir) if e.startswith("solo-out")}
-        self.assertEqual(made, {"solo-out.db"})
+        self.assertEqual(made, {"solo-out.db", "solo-out.payments.db"})
+        with open(os.path.join(self.dir, "solo-out.payments.db"), "rb") as fh:
+            blob = fh.read()
+        self.assertNotIn(b"aicash:", blob)
+        for token in paid["tokens"]:
+            self.assertNotIn(token.encode(), blob)
+            self.assertNotIn(token.split(":")[-1].encode(), blob)
 
     def test_many_payments_are_checked_in_batches_the_mint_accepts(self):
         """More outstanding strings than one /v3/status call may carry.
@@ -1638,6 +1704,818 @@ class TestCausePerOpTable(unittest.TestCase):
                     got, sentence = self.table(state, cause, "a sentence")
                     self.assertIn(got, module.CAUSES)
                     self.assertTrue(sentence.strip())
+
+
+# ---------------------------------------------------------------------------
+# THE PAYMENT RECORD: a delivered payment and a dead delivery must not be
+# the same row three months later.  Every failure below is REAL — a mint
+# actually stopped, a token actually spent elsewhere, a process actually
+# killed — because a mocked delivery proves nothing about a delivery.
+# ---------------------------------------------------------------------------
+
+
+def _record_rows(store_path):
+    """The payment record beside a store, read raw and independently."""
+    import sqlite3
+    path = store_path[:-3] + ".payments.db" if store_path.endswith(".db") \
+        else store_path + ".payments.db"
+    if not os.path.exists(path):
+        return []
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT op_id, amount_mc, burn_mc, change_mc, token_count,"
+            " recipient, recipient_kind, delivery, delivery_cause, note,"
+            " delivery_attempt"
+            f" FROM walletops_payments").fetchall()
+    finally:
+        conn.close()
+
+
+class TestPaymentRecord(MintFixture):
+
+    def funded(self, name="payer", face=100_000):
+        w = self.ops(name)
+        w.receive([self.issue(face)])
+        return w
+
+    def pay_row(self, w, op_id=None):
+        """The history row for a payment, by op_id."""
+        rows = [r for r in w.history() if r["kind"] == "pay"]
+        if op_id is not None:
+            rows = [r for r in rows if r["op_id"] == op_id]
+        self.assertTrue(rows, "no committed pay row in history")
+        return rows[0]
+
+    # -- delivered vs not delivered -------------------------------------
+
+    def test_a_delivered_payment_and_a_dead_delivery_are_different_rows(self):
+        """THE DEFECT THIS EXISTS TO CLOSE.
+
+        Two payments of the same size out of the same wallet: one arrives,
+        one is killed in flight by the mint going down between the payment
+        committing and the delivery being attempted.  Every field used to
+        be identical.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        good = alice.pay(5_000, to="bob", deliver=bob.receive)
+        self.assertEqual(good["delivery"], "delivered")
+        self.assertEqual(good["recipient"], "bob")
+        self.assertEqual(good["recipient_kind"], "wallet")
+        self.assertEqual(good["delivery_cause"], "")
+
+        # ...and now the mint dies between the pay and the delivery.  The
+        # GUI can see the process is gone (this is the hook gui/app.py
+        # installs), so the delivery is KNOWN not to have landed.
+        def deliver_into_a_dead_mint(tokens):
+            self.stop_mint()
+            bob.mint_running = lambda: False
+            return bob.receive(tokens)
+
+        dead = alice.pay(5_000, to="bob",
+                         deliver=deliver_into_a_dead_mint)
+        self.assertEqual(dead["delivery"], "undelivered")
+        self.assertEqual(dead["delivery_cause"], "mint_stopped")
+        self.assertEqual(dead["recipient"], "bob")
+
+        rows = {r["op_id"]: r for r in alice.history() if r["kind"] == "pay"}
+        self.assertEqual(rows[good["op_id"]]["delivery"], "delivered")
+        self.assertEqual(rows[dead["op_id"]]["delivery"], "undelivered")
+        self.assertEqual(rows[dead["op_id"]]["delivery_cause"], "mint_stopped")
+        # The two rows differ in words a human reads, not only in a field.
+        self.assertNotEqual(rows[good["op_id"]]["detail"],
+                            rows[dead["op_id"]]["detail"])
+        self.assertIn("did not take", rows[dead["op_id"]]["detail"])
+
+    def test_an_undelivered_payment_says_how_to_find_the_value_again(self):
+        """Undelivered is only useful if the money can be reached."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+
+        def deliver(tokens):
+            self.stop_mint()
+            bob.mint_running = lambda: False
+            return bob.receive(tokens)
+
+        dead = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertEqual(dead["delivery"], "undelivered")
+        row = self.pay_row(alice, dead["op_id"])
+        self.assertIn(dead["op_id"], row["detail"])
+
+        # The op_id in the row is the handle the read-back groups by, and
+        # the strings are really there.
+        self.restart_mint()
+        out = alice.unredeemed_payments()
+        entry = [p for p in out["payments"] if p["op_id"] == dead["op_id"]]
+        self.assertEqual(len(entry), 1)
+        self.assertEqual(entry[0]["delivery"], "undelivered")
+        self.assertEqual(entry[0]["recipient"], "bob")
+        self.assertEqual(entry[0]["live_mc"], 5_000)
+        strings = [t["token"] for t in entry[0]["tokens"]]
+        self.assertEqual(sorted(strings), sorted(dead["tokens"]))
+        # ...and it is money, not a description of money.
+        got = bob.receive(strings)
+        self.assertEqual(got["rejected"], [])
+        self.assertEqual(got["accepted_mc"], 4_950)
+
+    def test_nobody_answering_is_recorded_unknown_and_never_undelivered(self):
+        """§5.1: an exchange nothing answered may still have landed.
+
+        Same stopped mint as above, but with nothing able to see the
+        PROCESS — only the socket.  The weaker claim is the true one, and
+        the record must not upgrade it into "it did not arrive".
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+
+        def deliver(tokens):
+            self.stop_mint()
+            return bob.receive(tokens)
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertEqual(out["delivery"], "unknown")
+        # The OUTCOME is weakened to unknown; the CAUSE is not discarded.
+        # "nobody answered" is the precise, pinned word for what happened,
+        # and throwing it away made this row byte-identical to a payment
+        # whose delivery was never attempted at all.
+        self.assertEqual(out["delivery_cause"], "mint_unreachable")
+        self.assertEqual(out["delivery_attempt"], "attempted")
+        self.assertIn("undetermined", out["delivery_detail"])
+        # ...and never the stronger claim.
+        self.assertNotIn("undelivered", out["delivery_detail"])
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(row["delivery_cause"], "mint_unreachable")
+        self.assertEqual(row["recipient"], "bob")
+        self.assertIn("undetermined", row["detail"])
+
+    def test_a_partly_refused_delivery_is_undelivered_and_says_how_much(self):
+        """A real race: a string of the payment is spent elsewhere first.
+
+        No skip, and deliberately so.  This used to bail out when the
+        payment happened to split into a single token, which meant it
+        could silently disarm itself — and it did, under a mutation run.
+        The thief takes the FIRST string whatever the split is, so the
+        race happens every time: with one token the whole payment is
+        refused, with more, part of it.  Both are the same finding.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        thief = self.ops("thief")
+        seen = {}
+
+        def deliver(tokens):
+            seen["n"] = len(tokens)
+            thief.receive(tokens[:1])       # always, so this never skips
+            return bob.receive(tokens)
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertGreaterEqual(seen.get("n", 0), 1)
+        self.assertEqual(out["delivery"], "undelivered")
+        self.assertEqual(out["delivery_cause"], "already_spent")
+        self.assertIn("refused 1 of %d" % seen["n"], out["delivery_detail"])
+
+    def test_already_spent_is_never_recorded_as_money_this_wallet_has(self):
+        """THE RACE THE REVIEWER DROVE, and the claim it disproved.
+
+        A third wallet redeems the payment's strings before the recipient
+        sees them.  The record used to say, for EVERY undelivered cause,
+        "the refused value is still this wallet's money" — while
+        unredeemed_payments() reported live_mc 0 and every token spent in
+        the same instant.  Two views of one payment, opposite answers
+        about whether thousands of millicredits exist, and the permanent
+        one was the wrong one.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        thief = self.ops("thief")
+
+        def deliver(tokens):
+            thief.receive(list(tokens))     # ALL of them, before bob
+            return bob.receive(tokens)
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertEqual(out["delivery"], "undelivered")
+        self.assertEqual(out["delivery_cause"], "already_spent")
+        for text in (out["delivery_detail"],
+                     self.pay_row(alice, out["op_id"])["detail"],
+                     _record_rows(self.path("alice"))[0][9]):
+            self.assertIn("ALREADY BEEN REDEEMED", text)
+            self.assertNotIn("still this wallet's money", text)
+
+        # ...and the panel next door agrees, in the same instant.
+        report = alice.unredeemed_payments()
+        entry = [p for p in report["payments"]
+                 if p["op_id"] == out["op_id"]][0]
+        self.assertTrue(report["checked"])
+        self.assertEqual(entry["live_mc"], 0)
+        self.assertEqual({t["state"] for t in entry["tokens"]}, {"spent"})
+
+    def test_a_refusal_that_consumed_nothing_does_say_the_value_is_live(self):
+        """The other side of the same judgement: not everything is lost.
+
+        A mint that was DOWN when the recipient tried consumed nothing, so
+        the refused value really is still the payer's — and the record
+        says so, because a row that hedged about every cause would be as
+        useless as one that asserted about every cause.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        bob.mint_running = lambda: False    # the GUI knows it is stopped
+
+        def deliver(tokens):
+            self.stop_mint()
+            return bob.receive(tokens)
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertEqual(out["delivery"], "undelivered")
+        self.assertEqual(out["delivery_cause"], "mint_stopped")
+        self.assertIn("still this wallet's money", out["delivery_detail"])
+        self.assertNotIn("ALREADY BEEN REDEEMED", out["delivery_detail"])
+        self.restart_mint()
+        entry = alice.unredeemed_payments()["payments"][0]
+        self.assertEqual(entry["live_mc"], 5_000)
+
+    # -- inside "unknown": four situations, four rows ---------------------
+
+    def test_the_four_unknown_deliveries_are_not_the_same_row(self):
+        """``unknown`` is where most payments land, so it cannot be one box.
+
+        Bearer / never-watched, named-but-never-attempted, attempted and
+        interrupted, and attempted with nobody answering all read
+        ``delivery: unknown``.  They used to be byte-identical in every
+        machine-readable field but one, which is the very defect the
+        record was added to remove, reproduced one level down.  "Never
+        sent" and "sent and lost" send an operator to different places.
+        """
+        alice = self.funded("alice", face=200_000)
+        bob = self.ops("bob")
+        seen = {}
+
+        seen["bearer"] = alice.pay(5_000)["op_id"]
+        seen["named"] = alice.pay(5_000, to="bob")["op_id"]
+
+        def interrupted(_tokens):
+            raise KeyboardInterrupt("operator hit ctrl-c")
+
+        with self.assertRaises(KeyboardInterrupt):
+            alice.pay(5_000, to="bob", deliver=interrupted)
+
+        def nobody_answers(tokens):
+            self.stop_mint()
+            return bob.receive(tokens)
+
+        alice.pay(5_000, to="bob", deliver=nobody_answers)
+
+        rows = [r for r in alice.history() if r["kind"] == "pay"]
+        self.assertEqual(len(rows), 4)
+        shapes = {(r["recipient_kind"], r["delivery"], r["delivery_attempt"],
+                   r["delivery_cause"]) for r in rows}
+        self.assertEqual({r["delivery"] for r in rows}, {"unknown"})
+        self.assertEqual(shapes, {
+            ("bearer", "unknown", "not_attempted", ""),
+            ("wallet", "unknown", "not_attempted", ""),
+            ("wallet", "unknown", "attempted", ""),
+            ("wallet", "unknown", "attempted", "mint_unreachable"),
+        })
+        # and no two of the four share a full field set
+        self.assertEqual(len(shapes), 4)
+
+    def test_a_checked_report_can_still_know_nothing_about_a_string(self):
+        """``checked`` means THE MINT ANSWERED, not "every state is known".
+
+        A different mint on the same address answers perfectly and has no
+        ledger entry for these strings, so every state is "unknown" and
+        live_mc used to be 0 there -- 0 mc KNOWN TO BE UNSPENT, printed
+        as a total about 5000 mc whose fate the same report calls unknown
+        on the next line. There is no single number that answers the
+        question, so the field says None and the per-token states carry
+        what is actually known.
+        """
+        alice = self.funded("alice")
+        out = alice.pay(5_000)
+        alice.close()
+        self.replacement_mint("other-mint")
+        alice = WalletOps(self.path("alice"), self.base)
+        report = alice.unredeemed_payments()
+        entry = [p for p in report["payments"]
+                 if p["op_id"] == out["op_id"]][0]
+        self.assertTrue(report["checked"], "the mint answered")
+        self.assertEqual({t["state"] for t in entry["tokens"]}, {"unknown"})
+        self.assertIsNone(entry["live_mc"])
+        self.assertEqual(entry["amount_mc"], 5_000)
+
+    def test_live_mc_is_a_number_only_when_every_string_has_an_answer(self):
+        """The neighbour of the case above: a mixture.
+
+        One string of a payment spent, another the mint has no entry for.
+        A sum over the definite ones would present a partial account as a
+        total, which is the same defect in smaller print.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000)
+        bob.receive(out["tokens"])              # all of it, really spent
+        report = alice.unredeemed_payments()
+        entry = [p for p in report["payments"]
+                 if p["op_id"] == out["op_id"]][0]
+        # every state definite -> a real number, and it is 0
+        self.assertEqual(entry["live_mc"], 0)
+        self.assertEqual({t["state"] for t in entry["tokens"]}, {"spent"})
+
+    def test_a_long_refusal_never_crowds_out_the_money_or_the_op_id(self):
+        """The trim cuts from the right, so what is at the right matters.
+
+        A recipient that answers with 900 characters of prose used to
+        push the clause about whether the value still exists, and the
+        op_id that finds it again, off the end of a record bounded at
+        _SENTENCE_MAX -- leaving a row that quoted somebody else's stack
+        trace and said nothing an operator could act on. The quote is the
+        part that gets clipped now, and the caller's copy is the same
+        sentence as the stored one rather than a longer version of it.
+        """
+        module = sys.modules[WalletOps.__module__]
+        alice = self.funded("alice")
+
+        class Wordy(Exception):
+            cause = "already_spent"
+            reason = "already spent"
+            detail = "x" * 900
+
+        def deliver(_tokens):
+            raise module.WalletOpsError(Wordy.reason, Wordy.detail,
+                                        Wordy.cause)
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        note = out["delivery_detail"]
+        self.assertLessEqual(len(note), module._SENTENCE_MAX)
+        self.assertIn("not this wallet's money", note)
+        self.assertIn(out["op_id"], note)
+        # ...and what was returned is byte-for-byte what was written down
+        self.assertEqual(_record_rows(self.path("alice"))[0][9], note)
+        self.assertEqual(self.pay_row(alice, out["op_id"])["detail"]
+                         .endswith(note), True)
+
+    def test_the_record_file_is_created_0600_like_the_store(self):
+        """A sidecar's whole defence is "it holds no secret".
+
+        True, and not the same claim as "anyone on this machine may read
+        it": it holds every recipient name, amount, burn, change and
+        op_id this wallet ever paid — the payment graph — and it sat at
+        the ambient umask, 0644 under a default 022, beside a store the
+        protocol layer took care to make 0600.
+        """
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        alice = self.funded("alice")
+        alice.pay(5_000, to="bob")
+        record = alice.record_path
+        self.assertTrue(os.path.exists(record))
+        self.assertEqual(stat.S_IMODE(os.stat(record).st_mode), 0o600)
+        # and the recipient really is in there in plaintext, which is why
+        with open(record, "rb") as handle:
+            self.assertIn(b"bob", handle.read())
+
+    def test_a_record_file_left_world_readable_is_repaired_on_the_next_write(self):
+        alice = self.funded("alice")
+        alice.pay(1_000, to="bob")
+        os.chmod(alice.record_path, 0o644)
+        alice.pay(1_000, to="carol")
+        self.assertEqual(stat.S_IMODE(os.stat(alice.record_path).st_mode),
+                         0o600)
+
+    # -- a settled outcome is permanent -----------------------------------
+
+    def test_a_settled_outcome_is_never_rewritten(self):
+        """The row is the permanent record, not the latest opinion."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000, to="bob", deliver=bob.receive)
+        self.assertEqual(out["delivery"], "delivered")
+        again = alice.settle_delivery(
+            out["op_id"], result={"rejected": [{"cause": "already_spent"}],
+                                  "accepted": 0})
+        self.assertFalse(again["recorded"])
+        self.assertEqual(self.pay_row(alice, out["op_id"])["delivery"],
+                         "delivered")
+
+    def test_settle_delivery_records_what_the_other_side_watched(self):
+        """The second way this product delivers a payment.
+
+        A wallet that pays and then hands the strings over separately
+        produced exactly the same outcome as pay(deliver=...), and the
+        observation used to be thrown away — so one payment read
+        "delivered to bob" through one route and "unknown" through the
+        other.
+        """
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000, to="bob")
+        self.assertEqual(out["delivery"], "unknown")
+        got = bob.receive(out["tokens"])
+        self.assertEqual(got["rejected"], [])
+        noted = alice.settle_delivery(out["op_id"], result=got,
+                                      recipient="bob")
+        self.assertTrue(noted["recorded"])
+        self.assertEqual(noted["delivery"], "delivered")
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["delivery"], "delivered")
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["delivery_attempt"], "attempted")
+
+    def test_settle_delivery_names_a_bearer_payment_it_watched_land(self):
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000)                      # no recipient named
+        self.assertEqual(out["recipient_kind"], "bearer")
+        bob.receive(out["tokens"])
+        alice.settle_delivery(out["op_id"],
+                              result={"rejected": [], "accepted_mc": 4_950},
+                              recipient="bob")
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        self.assertEqual(row["delivery"], "delivered")
+
+    def test_settle_delivery_on_an_op_with_no_record_records_nothing(self):
+        alice = self.funded("alice")
+        out = alice.settle_delivery("not-an-op", result={"rejected": []})
+        self.assertFalse(out["recorded"])
+        self.assertEqual(out["delivery"], "delivered")   # what was observed
+        self.assertEqual(_record_rows(self.path("alice")), [])
+
+    def test_settle_delivery_with_nothing_observed_writes_nothing(self):
+        alice = self.funded("alice")
+        out = alice.pay(5_000, to="bob")
+        noted = alice.settle_delivery(out["op_id"])
+        self.assertFalse(noted["recorded"])
+        self.assertEqual(noted["delivery"], "unknown")
+        self.assertEqual(self.pay_row(alice, out["op_id"])["delivery"],
+                         "unknown")
+
+    def test_a_record_written_before_the_attempt_column_existed_still_reads(self):
+        """The column was added after the table shipped.
+
+        A file an older build wrote has the table already, so CREATE TABLE
+        IF NOT EXISTS does nothing to it — and an INSERT or a SELECT
+        naming a column it lacks fails silently, which would turn "a field
+        was added" into "this wallet records nothing any more".
+        """
+        import sqlite3
+        alice = self.funded("alice")
+        out = alice.pay(5_000, to="bob")
+        record = alice.record_path
+        conn = sqlite3.connect(record)
+        try:
+            conn.execute("ALTER TABLE walletops_payments"
+                         " RENAME TO walletops_payments_new")
+            conn.execute(
+                "CREATE TABLE walletops_payments AS SELECT op_id, mint_id,"
+                " amount_mc, burn_mc, change_mc, token_count, recipient,"
+                " recipient_kind, delivery, delivery_cause, note"
+                " FROM walletops_payments_new")
+            conn.execute("DROP TABLE walletops_payments_new")
+            conn.commit()
+        finally:
+            conn.close()
+        alice.close()
+        alice = WalletOps(self.path("alice"), self.base)
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["recipient"], "bob")       # still readable
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(row["delivery_attempt"], "")   # nothing recorded
+        # ...and a later write migrates the file rather than failing
+        alice.pay(1_000, to="carol")
+        rows = {r[5]: r[10] for r in _record_rows(self.path("alice"))}
+        self.assertEqual(rows["carol"], "not_attempted")
+        self.assertEqual(rows["bob"], "")
+
+    # -- interruption: the honest unknown --------------------------------
+
+    def test_an_interrupted_delivery_is_left_unknown_not_guessed(self):
+        """A KeyboardInterrupt through the delivery is not an observation."""
+        alice = self.funded("alice")
+
+        def deliver(_tokens):
+            raise KeyboardInterrupt("operator hit ctrl-c")
+
+        with self.assertRaises(KeyboardInterrupt):
+            alice.pay(5_000, to="bob", deliver=deliver)
+        row = self.pay_row(alice)
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["delivery_cause"], "")
+        # and the value is still findable
+        entry = alice.unredeemed_payments()["payments"][0]
+        self.assertEqual(entry["op_id"], row["op_id"])
+        self.assertEqual(entry["live_mc"], 5_000)
+
+    def test_the_record_is_written_before_the_delivery_is_attempted(self):
+        """The ordering IS the durability claim, so it is read mid-flight."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        during = {}
+
+        def deliver(tokens):
+            during["rows"] = _record_rows(self.path("alice"))
+            return bob.receive(tokens)
+
+        alice.pay(5_000, to="bob", deliver=deliver)
+        rows = during["rows"]
+        self.assertEqual(len(rows), 1, "no record existed during delivery")
+        self.assertEqual(rows[0][7], "unknown")     # delivery
+        self.assertEqual(rows[0][5], "bob")         # recipient
+        self.assertEqual(rows[0][1], 5_000)         # amount_mc
+
+    def test_the_record_survives_the_process_that_wrote_it_being_killed(self):
+        """A REAL process death, mid-delivery, and a REAL restart after it.
+
+        The GUI is a process; "durable" has to mean "survives that process
+        dying", not "survives another method call".  A child interpreter
+        pays and is killed inside the delivery; the parent then reads the
+        record back with a wallet it opens fresh.
+        """
+        import subprocess
+        alice = self.funded("killed")
+        alice.close()
+        script = (
+            "import os, sys\n"
+            "sys.path[:0] = [%r, %r]\n"
+            "from walletops import WalletOps\n"
+            "w = WalletOps(%r, %r)\n"
+            "def deliver(tokens):\n"
+            "    os._exit(9)\n"
+            "w.pay(5000, to='bob', deliver=deliver)\n"
+            % (os.path.join(_ROOT, "impl"), _HERE,
+               self.path("killed"), self.base)
+        )
+        done = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 9,
+                         "the child did not die where it was meant to: %s"
+                         % done.stderr[-400:])
+
+        fresh = WalletOps(self.path("killed"), self.base)
+        row = self.pay_row(fresh)
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(row["recipient"], "bob")
+        self.assertEqual(row["recipient_kind"], "wallet")
+        self.assertEqual(row["amount_mc"], 5_000)
+        # ...and the money the dead process paid out is still reachable.
+        out = fresh.unredeemed_payments()
+        self.assertTrue(out["checked"])
+        entry = [p for p in out["payments"] if p["op_id"] == row["op_id"]]
+        self.assertEqual(len(entry), 1)
+        self.assertEqual(entry[0]["live_mc"], 5_000)
+        self.assertEqual(entry[0]["delivery"], "unknown")
+        self.assertEqual(entry[0]["recipient"], "bob")
+
+    # -- bearer, and the absence of a record -----------------------------
+
+    def test_pay_returns_exactly_the_documented_keys(self):
+        """The pinned shape, so a caller may rely on all ten."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        for label, out in (
+                ("bearer", alice.pay(500)),
+                ("named", alice.pay(500, to="bob")),
+                ("delivered", alice.pay(500, to="bob",
+                                        deliver=bob.receive))):
+            with self.subTest(payment=label):
+                self.assertEqual(set(out), {
+                    "tokens", "amount_mc", "burn_mc", "change_mc", "op_id",
+                    "recipient", "recipient_kind", "delivery",
+                    "delivery_cause", "delivery_attempt",
+                    "delivery_detail"})
+                self.assertIn(out["delivery"], ("delivered", "undelivered",
+                                                "unknown"))
+                self.assertIn(out["delivery_attempt"],
+                              ("attempted", "not_attempted"))
+                self.assertIn(out["recipient_kind"], ("wallet", "bearer"))
+                self.assertTrue(out["delivery_cause"] == "" or
+                                out["delivery_cause"] in _causes())
+                self.assertTrue(out["delivery_detail"].strip())
+                self.assertTrue(out["op_id"])
+
+    def test_bearer_strings_are_recorded_as_bearer_not_as_a_recipient(self):
+        alice = self.funded("alice")
+        out = alice.pay(5_000)
+        self.assertEqual(out["recipient"], "")
+        self.assertEqual(out["recipient_kind"], "bearer")
+        self.assertEqual(out["delivery"], "unknown")
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["recipient_kind"], "bearer")
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertIn("bearer", row["detail"])
+        # "bearer" and "nothing was recorded" are different states and the
+        # row says which: one names the kind, the other cannot.
+        self.assertNotEqual(row["recipient_kind"], "")
+
+    def test_a_payment_with_no_record_reads_unknown_never_delivered(self):
+        """An older build, wallet_cli, or a deleted record file."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000, to="bob", deliver=bob.receive)
+        self.assertEqual(out["delivery"], "delivered")
+        os.unlink(alice.record_path)
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(row["recipient"], "")
+        self.assertEqual(row["recipient_kind"], "")
+        self.assertIn("not known", row["detail"])
+
+    def test_a_corrupt_record_file_reads_unknown_and_does_not_raise(self):
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000, to="bob", deliver=bob.receive)
+        with open(alice.record_path, "wb") as fh:
+            fh.write(b"this is not a database" * 100)
+        row = self.pay_row(alice, out["op_id"])
+        self.assertEqual(row["delivery"], "unknown")
+        self.assertEqual(alice.unredeemed_payments()["payments"][0]
+                         ["delivery"], "unknown")
+
+    def test_only_a_committed_payment_claims_a_delivery_at_all(self):
+        """A pay that did not commit moved no money, so it delivered none.
+
+        The neighbouring state: these rows must not say "unknown delivery"
+        (there was no delivery) and must not say "delivered" either.  They
+        say nothing, and `cause` — the round-4 field — is what explains
+        them.
+        """
+        alice = self.funded("alice")
+        # Stop the mint AFTER the plan has hit the disk, so the op really
+        # is stranded rather than never started: that is the row that used
+        # to be indistinguishable from a rejection, and it is the row next
+        # door to the delivery record.
+        alice._open()
+        killed = []
+
+        def kill(event, _op_id):
+            if event == "persist_fsync" and not killed:
+                killed.append(True)
+                self.stop_mint()
+
+        alice._wallet.event_hook = kill
+        with self.assertRaises(WalletOpsError):
+            alice.pay(5_000, to="bob", deliver=lambda t: None)
+        self.assertTrue(killed, "the mint was not stopped mid-flight")
+        rows = [r for r in alice.history() if r["kind"].startswith("pay")]
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertNotEqual(row["kind"], "pay")     # it did not commit
+            self.assertEqual(row["delivery"], "")
+            self.assertEqual(row["recipient"], "")
+            self.assertEqual(row["recipient_kind"], "")
+            self.assertEqual(row["delivery_cause"], "")
+            self.assertIn(row["cause"], _causes())
+        # ...and no record was written for a payment that never happened.
+        self.assertEqual(_record_rows(self.path("alice")), [])
+
+    # -- the record is a record, never money -----------------------------
+
+    def test_a_delivery_note_never_carries_a_token_or_a_secret(self):
+        alice = self.funded("alice")
+        leaked = {}
+
+        def deliver(tokens):
+            leaked["tokens"] = list(tokens)
+            raise WalletOpsError(
+                "mint said no",
+                "the mint refused %s outright" % tokens[0],
+                "mint_rejected")
+
+        out = alice.pay(5_000, to="bob", deliver=deliver)
+        self.assertEqual(out["delivery"], "undelivered")
+        self.assertEqual(out["delivery_cause"], "mint_rejected")
+        self.assertNotIn("aicash:", out["delivery_detail"])
+        row = self.pay_row(alice, out["op_id"])
+        for token in leaked["tokens"]:
+            self.assertNotIn(token, row["detail"])
+            self.assertNotIn(token.split(":")[-1], row["detail"])
+        self.assertNotIn("aicash:", row["detail"])
+
+    def test_a_recipient_name_is_bounded_and_free_of_control_characters(self):
+        alice = self.funded("alice")
+        for bad in ("x" * 65, "bo\nb", "bo\x00b", "", "   ", 7, b"bob"):
+            with self.subTest(recipient=repr(bad)[:20]):
+                with self.assertRaises(WalletOpsError) as cm:
+                    alice.pay(100, to=bad)
+                self.assertEqual(cm.exception.reason, "bad request")
+        # and nothing was paid while those were being refused
+        self.assertEqual(_record_rows(self.path("alice")), [])
+
+    def test_deliver_without_a_recipient_name_is_refused_not_guessed(self):
+        """Both halves have to be there or the record cannot route anyone."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        with self.assertRaises(WalletOpsError) as cm:
+            alice.pay(100, to="bob", deliver="not callable")
+        self.assertEqual(cm.exception.reason, "bad request")
+        # ...and a delivery to a recipient with no NAME: "delivered" over
+        # a blank recipient is a confident field with nothing behind it.
+        with self.assertRaises(WalletOpsError) as cm:
+            alice.pay(100, deliver=bob.receive)
+        self.assertEqual(cm.exception.reason, "bad request")
+        self.assertIn("no recipient name", cm.exception.detail)
+        self.assertEqual(_record_rows(self.path("alice")), [])
+
+    def test_a_named_recipient_with_no_delivery_says_it_was_not_watched(self):
+        """Recording WHO without claiming WHAT HAPPENED."""
+        alice = self.funded("alice")
+        out = alice.pay(5_000, to="bob")
+        self.assertEqual(out["recipient"], "bob")
+        self.assertEqual(out["recipient_kind"], "wallet")
+        self.assertEqual(out["delivery"], "unknown")
+        self.assertIn("not asked to deliver", out["delivery_detail"])
+
+    # -- the arithmetic the row has to carry -----------------------------
+
+    def test_the_row_records_what_left_the_burn_and_the_change(self):
+        alice = self.funded("alice", face=100_000)
+        bob = self.ops("bob")
+        before = alice.summary()["balance_mc"]
+        out = alice.pay(5_000, to="bob", deliver=bob.receive)
+        after = alice.summary()["balance_mc"]
+        rows = _record_rows(self.path("alice"))
+        self.assertEqual(len(rows), 1)
+        op_id, amount, burn, change, count, recipient, kind, delivery, \
+            cause, _note, attempt = rows[0]
+        self.assertEqual(op_id, out["op_id"])
+        self.assertEqual(amount, 5_000)
+        self.assertEqual(burn, out["burn_mc"])
+        self.assertEqual(change, out["change_mc"])
+        self.assertEqual(count, len(out["tokens"]))
+        self.assertEqual((recipient, kind, delivery, cause, attempt),
+                         ("bob", "wallet", "delivered", "", "attempted"))
+        # the three figures are the whole of what left the wallet
+        self.assertEqual(before - after, amount + burn)
+        # ...and the mint's own conservation rule holds over them
+        self.assertEqual(sum(t["amount_mc"] for t in
+                             alice.unredeemed_payments()["payments"][0]
+                             ["tokens"]), amount)
+
+    # -- one question, one name ------------------------------------------
+
+    def test_the_two_questions_disagree_and_are_both_right(self):
+        """THE REVIEWER'S SCENARIO, reproduced and pinned as legitimate.
+
+        220 mc across four strings from one method, "nothing to recover"
+        from the other, from the same wallet against the same mint in the
+        same instant.  Neither is wrong: they answer different questions,
+        and this test exists so that a future change that "fixes" the
+        disagreement has to argue with it.
+        """
+        alice = self.funded("alice")
+        for _ in range(4):
+            alice.pay(55)               # handed over, nobody redeemed them
+        out = alice.unredeemed_payments()
+        self.assertEqual(len(out["payments"]), 4)
+        self.assertTrue(out["checked"])
+        self.assertEqual(sum(p["live_mc"] for p in out["payments"]), 220)
+
+        settled = alice.recover()
+        self.assertEqual(
+            [v for v in settled.values() if isinstance(v, int) and v], [],
+            "recover() claimed work to do over payments that committed: %s"
+            % settled)
+
+        # And the distinction is legible from the methods themselves, not
+        # only from the numbers.
+        module = sys.modules[WalletOps.__module__]
+        recovered = module.WalletOps.recover.__doc__
+        unredeemed = module.WalletOps.unredeemed_payments.__doc__
+        self.assertIn("IN-FLIGHT QUESTION", recovered)
+        self.assertIn("HANDED-OVER QUESTION", unredeemed)
+        self.assertIn("unredeemed_payments", recovered)
+        self.assertIn("recover", unredeemed)
+
+    def test_the_old_name_still_answers_and_says_it_is_the_old_name(self):
+        alice = self.funded("alice")
+        alice.pay(1_000)
+        module = sys.modules[WalletOps.__module__]
+        self.assertEqual(alice.outstanding_payments(),
+                         alice.unredeemed_payments())
+        doc = module.WalletOps.outstanding_payments.__doc__
+        self.assertIn("OLD NAME", doc)
+        self.assertIn("unredeemed_payments", doc)
+
+    def test_history_unredeemed_and_the_record_join_on_one_op_id(self):
+        """Three views of one payment; they must not be able to drift."""
+        alice = self.funded("alice")
+        bob = self.ops("bob")
+        out = alice.pay(5_000, to="bob", deliver=bob.receive)
+        row = self.pay_row(alice, out["op_id"])
+        entry = alice.unredeemed_payments()["payments"][0]
+        raw = _record_rows(self.path("alice"))[0]
+        self.assertEqual({out["op_id"], row["op_id"], entry["op_id"], raw[0]},
+                         {out["op_id"]})
+        for view in (row, entry):
+            self.assertEqual(view["recipient"], "bob")
+            self.assertEqual(view["delivery"], "delivered")
+            self.assertEqual(view["delivery_cause"], "")
+
 
 
 if __name__ == "__main__":

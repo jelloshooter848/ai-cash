@@ -70,7 +70,7 @@ PYTHONPATH=impl python3 examples/quickstart.py
 | Move value across mints atomically | `SwapParty`, `compute_margin` | §11, `examples/j7-swap/` |
 | Budget a payment before making it | `Wallet.quote` | — |
 
-`from aicash import *`-able: everything an integrator needs — types, functions, **and the exception classes each call can raise** (`PaymentInvalid`, `InsufficientFunds`, `ExchangeRejected`, `ChannelInvalid`, `FundingInvalid`, `QuoteRefused`, …) — is re-exported from the package root (`aicash.__all__`, 61 names). You should not need to read implementation source to integrate — if you do, that's a bug in these docs; the component "Public API" blocks are the reference, and each documents the exceptions its methods raise.
+`from aicash import *`-able: everything an integrator needs — types, functions, **and the exception classes each call can raise** (`PaymentInvalid`, `InsufficientFunds`, `ExchangeRejected`, `ChannelInvalid`, `FundingInvalid`, `QuoteRefused`, …) — is re-exported from the package root (`aicash.__all__`). You should not need to read implementation source to integrate — if you do, that's a bug in these docs; the component "Public API" blocks are the reference, and each documents the exceptions its methods raise.
 
 ## Two things that will bite you if unsaid
 
@@ -83,7 +83,7 @@ PYTHONPATH=impl python3 examples/quickstart.py
 cd impl && python3 -m unittest discover -s tests -t .
 ```
 
-293 tests, covering every component and the adversarial cases (double-spend races, channel witness-leak attempts, cross-mint silent-claim attacks, freeze/pull interactions). The reference implementation is the seed of the conformance suite (see `BOOTSTRAP.md` §4).
+The protocol suite covers every component and the adversarial cases (double-spend races, channel witness-leak attempts, cross-mint silent-claim attacks, freeze/pull interactions). The reference implementation is the seed of the conformance suite (see `BOOTSTRAP.md` §4).
 
 ## Status
 

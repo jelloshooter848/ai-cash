@@ -67,6 +67,7 @@ import base64
 import contextlib
 import errno
 import hmac
+import inspect
 import ipaddress
 import json
 import os
@@ -99,6 +100,9 @@ REQUEST_TIMEOUT_S = 30
 # relaying the mint's 500.
 MAX_AMOUNT_MC = (1 << 53) - 1
 WALLET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+# A PAYEE is not a wallet name. Mirrors gui/walletops.py's own bound, so a
+# label this server accepts is one that component will accept too.
+RECIPIENT_NAME_MAX = 64
 # Mirrors aicash.tokencodec.MINT_ID_RE. Checked here only to give a better
 # message than a component exception would; MintControl re-checks it, and the
 # mint itself is the authority.
@@ -143,6 +147,40 @@ _REASON_CAUSE = {
     "mint_stopped": "mint_stopped",
     "wallet_error": "unknown",
 }
+
+
+#: What became of a payment's delivery, relayed from walletops.py and
+#: never re-derived here. "unknown" is a real answer -- an interrupted
+#: delivery leaves exactly that -- and "" means the question does not
+#: arise (nothing moved, so nothing was delivered).
+DELIVERIES = ("delivered", "undelivered", "unknown")
+
+#: What the recipient field of a payment record means. "" is the fourth
+#: state: nothing was recorded, which is not the same as "no recipient".
+RECIPIENT_KINDS = ("wallet", "bearer")
+
+#: DID THE PAYING WALLET EVER TRY? Relayed from walletops.py, never
+#: re-derived here. It is what tells apart the situations that all read
+#: ``delivery: "unknown"`` -- a payment never delivered from one that was
+#: attempted and lost -- and those send an operator to different places.
+#: "" is the third value and means nothing was recorded.
+DELIVERY_ATTEMPTS = ("not_attempted", "attempted")
+
+
+def clean_attempt(value) -> str:
+    """Coerce into DELIVERY_ATTEMPTS, or "" for nothing recorded."""
+    text = str(value or "").strip()
+    return text if text in DELIVERY_ATTEMPTS else ""
+
+
+def clean_delivery(value, default: str = "") -> str:
+    """Coerce a delivery outcome into DELIVERIES, or into ``default``.
+
+    Same discipline as clean_cause: a component that answers something
+    outside the closed set does not get to widen it through this server.
+    """
+    text = str(value or "").strip()
+    return text if text in DELIVERIES else default
 
 
 def clean_cause(value) -> str:
@@ -193,22 +231,78 @@ def _cookie_values(header, name: str) -> list:
     return out
 
 
-def _trimmed(value):
-    """A pasted credential with its surrounding whitespace removed.
+#: THE EXACT WHITESPACE A PASTED KEY MAY CARRY, decided rather than
+#: inherited. ``str.strip()`` with no argument removes every character
+#: Python calls whitespace -- including U+00A0, U+2028, the Unicode space
+#: family and the vertical tab -- from both ends, in any quantity. That
+#: was never the intent: the intent is the one or two characters a
+#: TERMINAL COPY carries, which is this set and no more.
+#:
+#: space and tab       a selection that ran past the end of the URL
+#: CR and LF           the line break a copied terminal line ends with
+#:
+#: ``+`` needs no entry: a query string decodes ``+`` to a space before
+#: this sees it, so a trailing plus IS a trailing space here.
+#:
+#: Everything else is refused, and deliberately: a non-breaking space or
+#: a zero-width character does not come off a terminal, it comes off a
+#: rendered page or a crafted URL, and quietly accepting it would widen
+#: the set of strings that open this GUI for a case nobody has.
+KEY_EDGE_WHITESPACE = " \t\r\n"
 
-    Why this is safe rather than a loosened comparison: the key is
-    ``secrets.token_urlsafe``, whose alphabet is ``A-Za-z0-9-_`` -- it
-    contains no whitespace at any position, so stripping whitespace can
+#: ...and at most this many of them at EACH end. A paste carries one or
+#: two; a hundred is not a copy accident, and an unbounded tolerance is a
+#: tolerance nobody has measured. Refusing past the bound costs a real
+#: operator nothing and keeps the accepted shape something a test can
+#: state exhaustively.
+KEY_EDGE_WHITESPACE_MAX = 8
+
+
+def _trimmed(value):
+    """A pasted credential with the whitespace a terminal copy adds removed.
+
+    Exactly ``KEY_EDGE_WHITESPACE``, at most ``KEY_EDGE_WHITESPACE_MAX``
+    characters at each end, and nothing else -- see those constants for
+    why each part of that is deliberate. A string carrying more, or
+    carrying whitespace of another kind, is returned UNCHANGED and is
+    then refused by the comparison like any other wrong key.
+
+    Why trimming at all is safe rather than a loosened comparison: the key
+    is ``secrets.token_urlsafe``, whose alphabet is ``A-Za-z0-9-_`` -- it
+    contains no whitespace at any position, so removing whitespace can
     never turn one valid key into another, and cannot turn a wrong key into
     a right one. What it removes is the trailing space or newline a
     terminal copy picks up, which used to produce a bare 401 whose message
     described none of it: the one place in this flow where the error did
     not name the actual problem.
 
+    It does no comparison itself and never looks at the secret, so it is
+    not on the constant-time path: `_secret_eq` still decides, on bytes,
+    with hmac.compare_digest.
+
     Non-str values pass through untouched, so the comparison below still
     decides them.
     """
-    return value.strip() if isinstance(value, str) else value
+    if not isinstance(value, str):
+        return value
+    start, end = 0, len(value)
+    while (start < end and value[start] in KEY_EDGE_WHITESPACE
+           and start < KEY_EDGE_WHITESPACE_MAX):
+        start += 1
+    stop = 0
+    while (end > start and value[end - 1] in KEY_EDGE_WHITESPACE
+           and stop < KEY_EDGE_WHITESPACE_MAX):
+        end -= 1
+        stop += 1
+    # More than the bound at either end: not a paste artefact. Hand back
+    # what was presented and let it be refused on its merits.
+    if start >= KEY_EDGE_WHITESPACE_MAX and start < len(value) and \
+            value[start] in KEY_EDGE_WHITESPACE:
+        return value
+    if stop >= KEY_EDGE_WHITESPACE_MAX and end > start and \
+            value[end - 1] in KEY_EDGE_WHITESPACE:
+        return value
+    return value[start:end]
 
 
 def _secret_eq(known, presented) -> bool:
@@ -313,6 +407,22 @@ class _Auth:
         copy that took the line break with it, produces exactly this: the
         right secret with a space or a newline through the middle of it.
         Still compare_digest, still on bytes, still constant-time.
+
+        This diagnosis is deliberately WIDER than what key_ok accepts: it
+        also recognises the key wearing whitespace key_ok refuses (a
+        non-breaking space, or more edge whitespace than the bound), and
+        names that as the problem. Widening a message is not widening a
+        door -- nothing here issues a session -- and telling an operator
+        "that is your key with whitespace in it" beats a blank refusal for
+        exactly the case this method exists for.
+
+        AND THE PAGE SAYS SO. LOCKED_PAGE_WHITESPACE spells out the shape
+        _trimmed actually accepts -- up to KEY_EDGE_WHITESPACE_MAX of
+        KEY_EDGE_WHITESPACE at each end, nothing else -- because this
+        widening once left the page still telling the operator that edge
+        whitespace was fine while being served for a trailing non-breaking
+        space. A diagnosis and the sentence it is shown with have to be
+        widened together or the message points at the wrong thing.
         """
         if not self.enabled or not isinstance(presented, str):
             return False
@@ -424,6 +534,20 @@ class _Components:
             return None                 # cannot answer knows nothing
         return None
 
+    def walletops(self):
+        """The walletops module itself, loaded and contract-checked once.
+
+        Exposed because this file has to ASK what that build can do (does
+        its pay() take a recipient?) before handing it a call it might
+        raise on. Loading is the same lazy, checked load every other use
+        goes through.
+        """
+        with self._lock:
+            if self._walletops_mod is None:
+                self._walletops_mod = self._load(
+                    "walletops", ("WalletOps", "WalletOpsError"))
+            return self._walletops_mod
+
     def wallet(self, store_path: str, base_url: str):
         """A fresh WalletOps for one wallet file.
 
@@ -431,11 +555,7 @@ class _Components:
         connection, and sqlite connections belong to the thread that made
         them. This is a ThreadingHTTPServer.
         """
-        with self._lock:
-            if self._walletops_mod is None:
-                self._walletops_mod = self._load(
-                    "walletops", ("WalletOps", "WalletOpsError"))
-            module = self._walletops_mod
+        module = self.walletops()
         try:
             ops = module.WalletOps(store_path, base_url)
         except Exception as exc:
@@ -645,6 +765,25 @@ class Api:
             "base_url": raw.get("base_url") if isinstance(raw.get("base_url"), str) else None,
             "started_at_ms": _as_int(raw.get("started_at_ms")),
             "last_error": raw.get("last_error") if isinstance(raw.get("last_error"), str) else None,
+            # IS IT ANSWERING -- which is not the same question as "is the
+            # process alive", and dropping it was this GUI flattening two
+            # states into one. MintControl.status() probes the descriptor
+            # and reports the answer; a mint that is alive but not
+            # answering (starting up, shutting down, SIGSTOPped, wedged)
+            # came through here as an ordinary running mint, so the page
+            # lit the healthy indicator and showed an uptime for something
+            # that refuses every payment. The whole difference was left in
+            # the English of last_error, which the page renders only when
+            # the mint is STOPPED -- so on screen there was no difference
+            # at all.
+            #
+            # None, not False, when the component did not say: "it did not
+            # tell us" is a third answer and the page must be able to tell
+            # it from "it told us no". Nothing here infers it from
+            # last_error or from running.
+            "responding": (bool(raw["responding"])
+                           if isinstance(raw.get("responding"), bool)
+                           else None),
         }
         # No _remember() here on purpose: /api/mint/status is a GET, and a
         # GET does not write to the workdir. MintControl.status() keeps the
@@ -860,8 +999,34 @@ class Api:
         secrets = [new_secret() for _ in range(count)]
         outputs = [{"amount_mc": amount, "secret_hash": ledger_key(s)}
                    for s in secrets]
-        status, obj = self._mint_http("POST", "/admin/issue",
-                                      {"outputs": outputs}, admin=True)
+        try:
+            status, obj = self._mint_http("POST", "/admin/issue",
+                                          {"outputs": outputs}, admin=True)
+        except GuiError as exc:
+            # ADJACENCY, and a money claim: every other failure in this
+            # route happens after the mint ANSWERED. This one is the mint
+            # not answering, and "could not reach the mint" on its own
+            # implies nothing was created -- which this server cannot
+            # know. The secrets live only in this function, so if the mint
+            # did issue against them they are unspendable from this
+            # moment on, and the operator has to be told that rather than
+            # left to retry into a silently doubled supply.
+            # mint_stopped is deliberately NOT in this set: that one is
+            # raised by base_url() BEFORE anything is sent, so nothing
+            # reached the ledger and its own sentence already says so.
+            # Rewriting it into "undetermined" would be this round's
+            # defect committed in the other direction.
+            if exc.cause in ("mint_unreachable", "unknown"):
+                raise GuiError(
+                    exc.status, exc.reason,
+                    f"{exc.detail} Whether {amount * count} mc was issued "
+                    f"is UNDETERMINED: the request may have reached the "
+                    f"ledger. The secrets for it existed only in this "
+                    f"request and are now gone, so if it did, that money "
+                    f"is unspendable by anyone. Check the mint's supply "
+                    f"in the descriptor before issuing again.",
+                    exc.cause) from None
+            raise
         if status == 401:
             raise GuiError(
                 403, "not_authorized",
@@ -869,10 +1034,13 @@ class Api:
                 f"{os.path.join(self.workdir, 'mint-admin-keys.json')}; that "
                 "file belongs to the mint that is running now.")
         if status != 200:
+            # It answered, and refused. That IS a rejection and is the one
+            # place in this route entitled to the word.
             raise GuiError(
                 502, "issue_rejected",
                 f"The mint rejected the issue request (http {status}): "
-                f"{json.dumps(obj)[:400]}")
+                f"{json.dumps(obj)[:400]}. Nothing was issued.",
+                "mint_rejected")
         return {"amount_mc": amount,
                 "count": count,
                 "total_mc": amount * count,
@@ -1017,15 +1185,65 @@ class Api:
             # one whose cause was never recorded ("unknown") -- and the
             # component's own detail says which.
             cause = row.get("cause")
+            delivery_cause = row.get("delivery_cause")
             out.append({"ts_ms": _as_int(row.get("ts_ms")),
+                        "op_id": str(row.get("op_id", "")),
                         "kind": str(row.get("kind", "")),
                         "amount_mc": _as_int(row.get("amount_mc")),
                         "detail": str(row.get("detail", "")),
                         "cause": "" if cause in (None, "") else
-                                 clean_cause(cause)})
+                                 clean_cause(cause),
+                        # The payment record, relayed exactly as recorded.
+                        # "" means the question does not arise (nothing
+                        # moved); "unknown" means it arose and nobody
+                        # knows the answer. Those are different rows and
+                        # this layer must not merge them.
+                        "recipient": str(row.get("recipient", "")),
+                        "recipient_kind": (row.get("recipient_kind")
+                                           if row.get("recipient_kind")
+                                           in RECIPIENT_KINDS else ""),
+                        # Absent means the component said nothing about
+                        # delivery, which is "" -- the question does not
+                        # arise. Present but unrecognised means it DID
+                        # answer and this file cannot read the answer,
+                        # which is "unknown". Merging those two would be
+                        # the same conflation this round is about.
+                        "delivery": ("" if row.get("delivery") in (None, "")
+                                     else clean_delivery(row.get("delivery"),
+                                                         "unknown")),
+                        "delivery_cause": ("" if not delivery_cause else
+                                           clean_cause(delivery_cause)),
+                        # Did the paying wallet ever try? Four situations
+                        # read "unknown" and this is one of the two fields
+                        # that tell them apart -- see DELIVERY_ATTEMPTS.
+                        # Relayed, never inferred from the other fields.
+                        "delivery_attempt": clean_attempt(
+                            row.get("delivery_attempt"))})
         return {"name": name, "history": out}
 
     def route_wallet_receive(self, _query, body) -> dict:
+        """Credit a wallet with pasted strings -- and, when the caller says
+        which payment they came from, RECORD the outcome against it.
+
+        The recording half exists because this route is the other way this
+        product delivers a payment. ``POST /api/wallet/pay`` with ``to``
+        performs the delivery itself and the payer's record gets
+        "delivered"; a caller that pays and then pastes the strings here
+        produced exactly the same outcome and, until now, this server
+        watched it land and threw the observation away -- so one payment
+        read "delivered to bob" through one route and "unknown" through
+        the other, which is two panels on one screen disagreeing about one
+        payment.
+
+        Optional ``payer`` (a wallet in this workdir) and ``op_id`` are
+        what let it be recorded. Both or neither; with neither, this is
+        the plain Receive it always was, because strings pasted out of an
+        email genuinely have no payment this server can name. The write
+        goes through walletops, is made ONCE (a settled outcome is never
+        rewritten), and never fails the request: the money moved either
+        way, and a record that could not be written reads "unknown",
+        which is then what is true.
+        """
         name, path = self._wallet_ops(body)
         tokens = body.get("tokens")
         if isinstance(tokens, str):
@@ -1040,13 +1258,51 @@ class Api:
         if len(tokens) > 100:
             raise GuiError(400, "bad_request",
                            "Receive at most 100 tokens at a time.")
+        payer, payer_path, op_id = self._settles(body, name)
         base = self.base_url(required=True)
-        with self._wallet_lock(name):
+        # Both wallets, in NAME ORDER, exactly as route_wallet_pay takes
+        # them: this route can now touch the payer's record while holding
+        # the receiver's lock, and two calls in opposite directions taking
+        # them in call order would deadlock.
+        with contextlib.ExitStack() as stack:
+            for who in sorted({name} | ({payer} if payer else set())):
+                stack.enter_context(self._wallet_lock(who))
+            failed = None
             with self._wallet(name, path, base) as ops:
-                raw = self.components.call(f"WalletOps({name}).receive",
-                                           ops.receive, tokens)
-                raw = self.components.expect_dict(
-                    raw, f"WalletOps({name}).receive")
+                try:
+                    raw = self.components.call(f"WalletOps({name}).receive",
+                                               ops.receive, tokens)
+                except GuiError as exc:
+                    # The delivery is still an OUTCOME, and it is the one
+                    # the payer's record is waiting for. Recorded below,
+                    # then re-raised unchanged.
+                    failed, raw = exc, None
+                if raw is not None:
+                    # The counters are REQUIRED, and required to be
+                    # NUMBERS. A key that is present and null is not an
+                    # answer; _as_int(..., 0) supplying a zero for it is
+                    # the same fabricated zero as a missing key, one step
+                    # to the side. Either way this server has not been
+                    # told what happened and says so with a 502.
+                    raw = self.components.expect_dict(
+                        raw, f"WalletOps({name}).receive",
+                        ("accepted", "accepted_mc"))
+                    accepted = _as_int(raw.get("accepted"))
+                    accepted_mc = _as_int(raw.get("accepted_mc"))
+                    if accepted is None or accepted_mc is None:
+                        raise GuiError(
+                            502, "bad_component_response",
+                            f"WalletOps({name}).receive returned accepted / "
+                            f"accepted_mc that are not whole numbers. That "
+                            f"file does not match the contract this page "
+                            f"expects, and this server will not print a zero "
+                            f"it was not told.")
+            recorded = None
+            if payer:
+                recorded = self._record_delivery(
+                    payer, payer_path, base, op_id, name, raw, failed)
+            if failed is not None:
+                raise failed
             summary = self._summary(name, base)
         rejected = []
         for item in (raw.get("rejected") or []):
@@ -1056,10 +1312,79 @@ class Api:
                                  "detail": str(item.get("detail", "")),
                                  "cause": clean_cause(item.get("cause"))})
         return {"name": name,
-                "accepted": _as_int(raw.get("accepted"), 0),
-                "accepted_mc": _as_int(raw.get("accepted_mc"), 0),
+                "accepted": accepted,
+                "accepted_mc": accepted_mc,
                 "rejected": rejected,
-                "balance_mc": summary["balance_mc"]}
+                "balance_mc": summary["balance_mc"],
+                # None when the caller named no payment. Otherwise what
+                # was written down, in the record's own vocabulary --
+                # ``recorded: false`` means there was no unsettled record
+                # for that op_id, which is a fact, not a failure.
+                "recorded": recorded}
+
+    def _settles(self, body, name: str) -> tuple:
+        """(payer, payer_path, op_id) for a receive that names a payment."""
+        payer = body.get("payer")
+        op_id = str(body.get("op_id") or "").strip()
+        if payer in (None, "") and not op_id:
+            return "", "", ""
+        if payer in (None, "") or not op_id:
+            raise GuiError(
+                400, "bad_request",
+                "To record this delivery against a payment, send BOTH payer "
+                "(the wallet that paid) and op_id (from that payment's "
+                "response or its history row). One without the other names "
+                "no payment.")
+        if len(op_id) > 128:
+            raise GuiError(400, "bad_request", "That op_id is not an op_id.")
+        payer, payer_path = self._wallet_ops({"name": payer})
+        if payer == name:
+            raise GuiError(
+                400, "bad_request",
+                f"{name} cannot be the payer of a payment it is receiving.")
+        return payer, payer_path, op_id
+
+    def _record_delivery(self, payer: str, payer_path: str, base: str,
+                         op_id: str, recipient: str, raw, failed) -> dict:
+        """Hand the outcome this route just watched to the payer's record.
+
+        Best effort in the strict sense: it never fails the receive and
+        never changes what the receive returns. A walletops build with no
+        settle_delivery says so rather than pretending it recorded
+        something.
+        """
+        with self._wallet(payer, payer_path, base) as payer_ops:
+            settle = getattr(payer_ops, "settle_delivery", None)
+            if not callable(settle):
+                return {"recorded": False, "op_id": op_id,
+                        "delivery": "unknown", "delivery_cause": "",
+                        "delivery_detail": (
+                            "gui/walletops.py here has no settle_delivery, so "
+                            "this delivery was not written into " + payer +
+                            "'s payment record")}
+            try:
+                # GuiError carries .reason/.detail/.cause -- the exact
+                # three attributes walletops reads off a WalletOpsError,
+                # and _translate already put the component's own cause in
+                # them (sharpened to mint_stopped where this server knows
+                # the process is down). So the refusal is classified from
+                # what actually failed, not from "a delivery failed".
+                out = settle(op_id, result=raw, error=failed,
+                             recipient=recipient)
+            except Exception:           # noqa: BLE001 - a record is not the
+                out = None              # money path; see walletops.py
+        if not isinstance(out, dict):
+            return {"recorded": False, "op_id": op_id, "delivery": "unknown",
+                    "delivery_cause": "", "delivery_detail": (
+                        "the payment record could not be written, so " +
+                        payer + "'s row for this payment still reads "
+                        "unknown")}
+        return {"recorded": bool(out.get("recorded")),
+                "op_id": str(out.get("op_id", op_id)),
+                "delivery": clean_delivery(out.get("delivery"), "unknown"),
+                "delivery_cause": ("" if not out.get("delivery_cause")
+                                   else clean_cause(out.get("delivery_cause"))),
+                "delivery_detail": str(out.get("delivery_detail", ""))}
 
     def _amount(self, body) -> int:
         amount = _strict_int(body.get("amount_mc"))
@@ -1087,26 +1412,216 @@ class Api:
                 "inputs_mc": _as_int(raw.get("inputs_mc"))}
 
     def route_wallet_pay(self, _query, body) -> dict:
+        """Pay, and -- when a recipient is named -- deliver and RECORD it.
+
+        ``to`` is optional and is the whole of this round's fix at this
+        layer. Without it the money leaves as bearer strings and the
+        record says exactly that. With it, this server performs the
+        delivery itself, which is what lets walletops.py watch the
+        delivery and write down whether it landed: a browser that pays and
+        then separately calls /api/wallet/receive keeps that knowledge in
+        a DOM node, where a reload destroys it and no history row can ever
+        recover it.
+
+        AND ``to`` IS NOT ONLY A LOCAL WALLET. Requiring one made the
+        record possible exactly where it is least interesting -- money
+        moving between two wallets in one workdir -- while aicash's actual
+        payee, an agent somewhere else, could never be recorded by anyone:
+        the request 404'd. So ``to`` is any recipient LABEL, and
+        ``deliver: false`` says this server is not the one handing the
+        strings over. The payment is then recorded with the recipient's
+        name, ``delivery: "unknown"`` and
+        ``delivery_attempt: "not_attempted"``, which is exactly what is
+        true: somebody was named, nothing was delivered from here, and the
+        row says both instead of saying "bearer" about a payment that had
+        a payee. A ``to`` that names no local wallet WITHOUT
+        ``deliver: false`` is still refused -- silently recording instead
+        of delivering would be this server deciding, on a typo, not to do
+        what it was asked.
+
+        A delivery that FAILS does not fail this request: the money left
+        the wallet, the strings are in the response and in the wallet
+        file, and ``delivery`` says what became of them. Failing here
+        would tell the operator nothing moved, which is false.
+        """
         name, path = self._wallet_ops(body)
         amount = self._amount(body)
+        to = body.get("to")
         base = self.base_url(required=True)
-        with self._wallet_lock(name):
+        deliver_here = body.get("deliver", True)
+        if deliver_here not in (None, True, False):
+            raise GuiError(400, "bad_request",
+                           "deliver must be true (this server hands the "
+                           "strings to a wallet it holds) or false (it does "
+                           "not, and only the recipient's name is recorded).")
+        recipient = None            # a local wallet this server delivers into
+        recipient_path = ""
+        record_for = ""             # the name written into the record
+        if to not in (None, ""):
+            record_for = self._recipient_name(to)
+            if record_for == name:
+                raise GuiError(
+                    400, "bad_request",
+                    f"{name} cannot pay itself: pick a different recipient, "
+                    f"or leave the recipient empty to take the token "
+                    f"strings away as bearer money.")
+            if not self._pay_can_record():
+                raise GuiError(
+                    503, "gui_incomplete",
+                    "gui/walletops.py does not accept a recipient for a "
+                    "payment, so this GUI cannot record who a payment was "
+                    "meant for or whether it arrived. Leave the recipient "
+                    "empty and deliver the strings with Receive; the "
+                    "money is unaffected.")
+            if deliver_here is not False:
+                local = (WALLET_NAME_RE.fullmatch(record_for) and
+                         os.path.exists(self._store_path(record_for)))
+                if not local:
+                    raise GuiError(
+                        404, "wallet_not_found",
+                        f"There is no wallet called {record_for} in "
+                        f"{self.wallets_dir}, so this server cannot deliver "
+                        f"to it. To pay a payee it does not hold and still "
+                        f"record who the money was for, send deliver:false: "
+                        f"the strings come back in the response and the "
+                        f"record says the delivery was not attempted from "
+                        f"here.")
+                recipient, recipient_path = self._wallet_ops(
+                    {"name": record_for})
+        # BOTH wallets are locked for the whole payment, in NAME ORDER:
+        # a delivery writes to the recipient's store, and two payments in
+        # opposite directions taking their locks in call order would
+        # deadlock. Taken once, here, because these locks are not
+        # reentrant.
+        with contextlib.ExitStack() as stack:
+            for who in sorted({name} | ({recipient} if recipient else set())):
+                stack.enter_context(self._wallet_lock(who))
             with self._wallet(name, path, base) as ops:
-                raw = self.components.call(f"WalletOps({name}).pay",
-                                           ops.pay, amount)
+                if recipient is None and not record_for:
+                    raw = self.components.call(f"WalletOps({name}).pay",
+                                               ops.pay, amount)
+                elif recipient is None:
+                    # Named, not delivered from here. The record carries
+                    # the payee; delivery stays unknown and the attempt
+                    # says it was never made, which is the honest pair.
+                    raw = self.components.call(f"WalletOps({name}).pay",
+                                               ops.pay, amount,
+                                               to=record_for)
+                else:
+                    # The recipient's wallet is opened for the length of
+                    # the delivery only. Handing its receive() to the
+                    # payer is what lets the component watch the delivery
+                    # and record the outcome.
+                    with self._wallet(recipient, recipient_path,
+                                      base) as payee:
+                        raw = self.components.call(
+                            f"WalletOps({name}).pay", ops.pay, amount,
+                            to=recipient, deliver=payee.receive)
                 raw = self.components.expect_dict(
-                    raw, f"WalletOps({name}).pay", ("tokens",))
+                    raw, f"WalletOps({name}).pay", ("tokens", "amount_mc"))
                 tokens = self.components.expect_list(
                     raw.get("tokens"), f"WalletOps({name}).pay tokens")
+                # WHAT ACTUALLY LEFT, from the component that watched it.
+                # It used to fall back to the amount REQUESTED, which is
+                # the same shape of fabrication as receive's zero: a
+                # number this server was not told, printed as a fact about
+                # money. burn_mc and change_mc are already null when the
+                # component gave none, and this is now the same rule.
+                paid_mc = _as_int(raw.get("amount_mc"))
+                if paid_mc is None:
+                    raise GuiError(
+                        502, "bad_component_response",
+                        f"WalletOps({name}).pay returned an amount_mc that "
+                        f"is not a whole number. This server will not print "
+                        f"the amount it asked for as the amount that left.")
             summary = self._summary(name, base)
         return {"name": name,
                 "tokens": [str(t) for t in tokens],
-                "amount_mc": _as_int(raw.get("amount_mc"), amount),
+                "amount_mc": paid_mc,
                 "burn_mc": _as_int(raw.get("burn_mc")),
-                "balance_mc": summary["balance_mc"]}
+                "change_mc": _as_int(raw.get("change_mc")),
+                "balance_mc": summary["balance_mc"],
+                "op_id": str(raw.get("op_id", "")),
+                # Relayed exactly as recorded. "unknown" stays unknown
+                # here: this server watched nothing walletops did not.
+                "recipient": str(raw.get("recipient", "")),
+                "recipient_kind": (raw.get("recipient_kind")
+                                   if raw.get("recipient_kind")
+                                   in RECIPIENT_KINDS else ""),
+                "delivery": clean_delivery(raw.get("delivery"), "unknown"),
+                "delivery_cause": (
+                    "" if not raw.get("delivery_cause")
+                    else clean_cause(raw.get("delivery_cause"))),
+                "delivery_attempt": clean_attempt(
+                    raw.get("delivery_attempt")),
+                "delivery_detail": str(raw.get("delivery_detail", ""))}
+
+    def _recipient_name(self, to) -> str:
+        """A recipient LABEL, bounded the way walletops.py bounds it.
+
+        Not a wallet name: a payee is whoever the operator says it is, and
+        restricting the label to the local wallet alphabet is what made
+        every external payment unrecordable. It is a label and nothing
+        else -- it never becomes a path, a header or a query -- so what it
+        has to be is short, printable and one line, because it ends up in
+        a permanent record and in sentences shown to humans.
+        """
+        if not isinstance(to, str) or not to.strip():
+            raise GuiError(400, "bad_request",
+                           "A recipient must be a non-empty name, or left "
+                           "out entirely for bearer strings.")
+        label = to.strip()
+        if len(label) > RECIPIENT_NAME_MAX:
+            raise GuiError(400, "bad_request",
+                           f"A recipient name is at most "
+                           f"{RECIPIENT_NAME_MAX} characters.")
+        if any(ch < " " or ch == "\x7f" for ch in label):
+            raise GuiError(400, "bad_request",
+                           "A recipient name cannot contain control "
+                           "characters.")
+        return label
+
+    def _pay_can_record(self) -> bool:
+        """Does the walletops build here take a recipient at all?
+
+        The same defensiveness as every other component call in this file:
+        a build that predates the payment record must not be handed a
+        keyword it will raise on, and must not be allowed to pay while
+        this server believes a record is being written. Absent the
+        capability the route refuses the recipient and says why, rather
+        than paying and recording nothing.
+        """
+        # Loaded outside the guard: a walletops.py that is absent or
+        # broken is its own error with its own message, not "this build
+        # cannot record a recipient".
+        module = self.components.walletops()
+        try:
+            params = inspect.signature(module.WalletOps.pay).parameters
+            return "to" in params and "deliver" in params
+        except Exception:               # noqa: BLE001 - an unreadable
+            return False                # signature is not a capability
 
     def route_wallet_outstanding(self, query, _body) -> dict:
-        """The payment strings this wallet handed out, read back from disk.
+        """THE HANDED-OVER QUESTION: what has nobody redeemed yet?
+
+        Of the value this wallet has ALREADY PAID OUT, which strings does
+        the mint still call unspent -- plus, per payment, who it was meant
+        for and whether the delivery landed.
+
+        THIS IS NOT /api/wallet/recover's QUESTION, and the two answering
+        differently at the same instant is normal rather than a bug. This
+        route can report 220 mc across four strings while recover()
+        reports nothing to settle, both correct: a payment that committed
+        is not an operation in flight, and an operation in flight is not
+        handed-over value. The reviewer who found those two numbers side
+        by side had nothing on the wire telling them which question each
+        was answering, so both responses now carry a ``scope`` sentence
+        that says it in words, and the component method behind this one
+        was renamed ``unredeemed_payments`` -- "outstanding" is exactly
+        the word that reads as "needs recovering".
+
+        The path keeps its old spelling because page.html calls it and
+        page.html is not this file's to change.
 
         Why this route exists: page.html tells the operator that the token
         strings in its result panel are "the only copy" of the money, and
@@ -1116,19 +1631,24 @@ class Api:
         closed tab or a delivery that failed halfway really did destroy the
         only accessible copy of real value.
 
-        Nothing new is persisted to make this work (see walletops.py for
-        the reasoning: a sidecar of bearer strings is a second complete
-        copy of live money on disk, bought for durability the store already
-        has). This is a READ.
+        No copy of the MONEY is persisted to make this work (see
+        walletops.py: a sidecar of bearer strings would be a second
+        complete copy of live money on disk, bought for durability the
+        store already has). The strings here are rebuilt from the wallet
+        file; this is a READ. The recipient and delivery outcome beside
+        each payment come from the payment record, which holds amounts and
+        an op_id and never a secret.
 
         WHAT IT DOES NOT REACH, because the claim is about money and a
         half-true recovery story is worse than none:
 
-          * page.html does not call this route. The sentence "these
-            strings are the only copy of it" is still printed after a
-            failed delivery, so today the read-back is reachable from
-            Python and from this API and not from the screen. Wiring it up
-            is a page.html change, and page.html is not this file.
+          * what the SCREEN does with it is page.html's, not this
+            file's. This route exists and answers; a claim here about
+            whether some other file calls it is a claim about a file this
+            one does not own and cannot keep true. (As this was written,
+            page.html calls it on every pay result and prints "These are
+            not the only copy" -- but the read-back would be worth having
+            either way.)
           * it recovers PAYMENTS, not issuance. /api/mint/issue returns
             freshly issued strings and persists nothing anywhere -- the
             mint keeps ledger-key hashes, never secrets -- so for those
@@ -1157,15 +1677,23 @@ class Api:
         limit = _strict_int(query.get("limit"), 20) or 20
         limit = max(1, min(limit, 100))
         with self._wallet(name, path, self.base_url(required=False)) as ops:
-            fn = getattr(ops, "outstanding_payments", None)
+            # The new name first, the old one after it: a component build
+            # from either side of the rename answers the same question,
+            # and neither spelling is required to exist.
+            method = "unredeemed_payments"
+            fn = getattr(ops, method, None)
+            if not callable(fn):
+                method = "outstanding_payments"
+                fn = getattr(ops, method, None)
             if not callable(fn):
                 raise GuiError(
                     503, "gui_incomplete",
-                    "gui/walletops.py does not define outstanding_payments. "
-                    "Payment strings can still be copied from the result "
-                    "panel when a payment is made, but this GUI cannot read "
-                    "them back out of the wallet file.")
-            what = f"WalletOps({name}).outstanding_payments"
+                    "gui/walletops.py defines neither unredeemed_payments "
+                    "nor outstanding_payments. Payment strings can still be "
+                    "copied from the result panel when a payment is made, "
+                    "but this GUI cannot read them back out of the wallet "
+                    "file.")
+            what = f"WalletOps({name}).{method}"
             raw = self.components.call(what, fn, limit=limit)
         raw = self.components.expect_dict(raw, what, ("payments",))
         payments = []
@@ -1185,17 +1713,86 @@ class Api:
                     # the ledger", and the two must not merge.
                     "state": state if state in ("unspent", "spent", "unknown")
                              else None})
+            delivery_cause = item.get("delivery_cause")
             payments.append({"op_id": str(item.get("op_id", "")),
                              "amount_mc": _as_int(item.get("amount_mc")),
                              "live_mc": _as_int(item.get("live_mc")),
+                             # Same record, same words, as history(): one
+                             # payment must not read "delivered" in one
+                             # view and "unknown" in the other.
+                             "recipient": str(item.get("recipient", "")),
+                             "recipient_kind": (item.get("recipient_kind")
+                                                if item.get("recipient_kind")
+                                                in RECIPIENT_KINDS else ""),
+                             "delivery": clean_delivery(item.get("delivery"),
+                                                        "unknown"),
+                             "delivery_cause": (
+                                 "" if not delivery_cause
+                                 else clean_cause(delivery_cause)),
+                             "delivery_attempt": clean_attempt(
+                                 item.get("delivery_attempt")),
                              "tokens": tokens})
+        checked = bool(raw.get("checked"))
+        # THE TOTALS, DECOMPOSED BY WHAT THE MINT ACTUALLY SAID. Summed
+        # from the per-token states in this very response, so the headline
+        # number and the lines under it cannot answer the same question
+        # differently.
+        #
+        # ``checked`` means THE MINT ANSWERED. It does not mean every
+        # string carries a state: a wallet holding a payment against
+        # mint-a, read while mint-b answers on that address, comes back
+        # checked with every state "unknown" -- the ledger has no entry,
+        # so whether anybody redeemed those strings is not known. Folding
+        # that into a single total made it read 0, which is the fabricated
+        # zero this file refuses everywhere else and is worse here because
+        # the money is real.
+        by_state = {"unspent": 0, "spent": 0, "unknown": 0, None: 0}
+        for payment in payments:
+            for token in payment["tokens"]:
+                by_state[token["state"]] += (token["amount_mc"] or 0)
+        complete = checked and not by_state["unknown"] and not by_state[None]
         return {"name": name,
-                "checked": bool(raw.get("checked")),
+                "checked": checked,
                 "mint_id": raw.get("mint_id") if isinstance(
                     raw.get("mint_id"), str) else None,
+                # The one number that answers "how much of what this
+                # wallet paid out is still unredeemed" -- and it is None
+                # unless every string in the report carries the mint's own
+                # word for it. Any "0" here is 0 because the mint said so
+                # about every string, never because some of them went
+                # unanswered.
+                "unredeemed_mc": (by_state["unspent"] if complete else None),
+                # ...and the parts, always, so a report that cannot give
+                # the total still says exactly what it does know. These
+                # four sum to the value handed over in the payments
+                # listed: nothing is rounded into another.
+                "unspent_mc": by_state["unspent"],
+                "spent_mc": by_state["spent"],
+                # The mint answered and has NO LEDGER ENTRY for these --
+                # a different mint's database, most often. Not zero, not
+                # spent, not unspent.
+                "unstated_mc": by_state["unknown"],
+                # The mint was not asked, or answered about only some.
+                "unchecked_mc": by_state[None],
+                "scope": ("value this wallet has already paid out that "
+                          "nobody has redeemed yet; it says nothing about "
+                          "operations left in flight -- POST "
+                          "/api/wallet/recover is the one that settles "
+                          "those, and it can correctly report nothing to "
+                          "do while this reports money"),
                 "payments": payments}
 
     def route_wallet_recover(self, _query, body) -> dict:
+        """THE IN-FLIGHT QUESTION: did an operation never get an answer?
+
+        Settles operations this wallet started and got no answer for,
+        against the ledger (§5.1). It does NOT look at value already
+        handed over, so "nothing recovered" here is not a statement that
+        the wallet has no unredeemed payments -- GET /api/wallet/outstanding
+        answers that, and the two disagreeing at the same instant is
+        normal. Both responses carry a ``scope`` sentence saying which
+        question they answered, because a number on its own did not.
+        """
         name, path = self._wallet_ops(body)
         base = self.base_url(required=True)
         with self._wallet_lock(name):
@@ -1205,7 +1802,13 @@ class Api:
                 raw = self.components.expect_dict(
                     raw, f"WalletOps({name}).recover")
             summary = self._summary(name, base)
-        return {"name": name, "result": raw, "balance_mc": summary["balance_mc"]}
+        return {"name": name, "result": raw,
+                "balance_mc": summary["balance_mc"],
+                "scope": ("operations this wallet started and never got an "
+                          "answer for; it does not look at payments that "
+                          "committed, so nothing to recover here does not "
+                          "mean nothing is unredeemed -- GET "
+                          "/api/wallet/outstanding answers that")}
 
 
 # ----------------------------------------------------------------------
@@ -1259,13 +1862,20 @@ LOCKED_PAGE_WHITESPACE = """<!doctype html><meta charset=utf-8>
 <title>aicash operator - locked</title>
 <body style="font:15px/1.5 system-ui;padding:40px;max-width:44em">
 <h1>That key has whitespace in it</h1>
-<p>What you opened is this GUI's key with a space or a line break
-<em>inside</em> it &mdash; which is what happens when the terminal wraps the
-address over two lines and only part of it is selected, or when a copy takes
-the line break along.</p>
+<p>What you opened is this GUI's key wearing whitespace the key itself does
+not contain &mdash; which is what happens when the terminal wraps the address
+over two lines and only part of it is selected, or when a copy takes the line
+break along, or when something on the way substituted a fancy space
+character.</p>
 <p>Go back to the terminal window running <code>app.py</code>, copy the whole
-address as ONE unbroken line, and open it again. A space at either end is
-fine; one in the middle is not, because it is not the same key.</p>
+address as ONE unbroken line, and open it again.</p>
+<p>What is forgiven, exactly: up to eight ordinary spaces, tabs, carriage
+returns or newlines at each END of the key. Everything else is refused and
+this page is what you get for it &mdash; whitespace in the MIDDLE, a longer
+run than that at either end, or any other kind of space character (a
+non-breaking space, an ideographic space, a vertical tab, a line separator).
+So do not go hunting only for a break in the middle: an invisible character
+at the end will land you here too.</p>
 </body>
 """
 
