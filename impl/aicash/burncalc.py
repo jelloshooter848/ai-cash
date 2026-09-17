@@ -22,6 +22,7 @@ __all__ = [
     "SEVEN_DAYS_MS",
     "compute_burn",
     "effective_policy",
+    "is_increase",
     "validate_notice",
     "validate_policy",
 ]
@@ -130,10 +131,20 @@ def effective_policy(
     return current
 
 
-def _is_increase(current: BurnPolicy, next_: BurnPolicy) -> bool:
+def is_increase(current: BurnPolicy, next_: BurnPolicy) -> bool:
     """§7.3 / component req 3: an "increase" is any change that can raise
     the burn for some sum — rate_ppm up, cap_mc up, or exempt_below_mc
-    down. Anything else is a decrease."""
+    down. Anything else is a decrease.
+
+    Public because the notice rule it decides is asymmetric and callers
+    have to branch on it BEFORE they can validate anything: §7.3 requires
+    seven days' notice for an increase and permits a decrease immediately,
+    so a mint configuration has to know which kind of change it is holding
+    to know whether an announcement time is even required of it
+    (``validate_notice`` needs an ``announced_at``; a decrease does not).
+    Deriving that by calling ``validate_notice`` twice and watching which
+    call raises would make the answer a side effect of an error path.
+    """
     return (
         next_.rate_ppm > current.rate_ppm
         or next_.cap_mc > current.cap_mc
@@ -168,7 +179,7 @@ def validate_notice(
             raise PolicyError(
                 f"max_lock_expiry_ms must be >= 0, got {max_lock_expiry_ms}"
             )
-    if not _is_increase(current, next_):
+    if not is_increase(current, next_):
         return  # decreases are exempt: immediate effect is allowed
     required_ms = max(SEVEN_DAYS_MS, max_lock_expiry_ms or 0)
     notice_ms = effective_at - announced_at

@@ -45,6 +45,7 @@ import http.client
 import json
 import os
 import sqlite3
+import ssl
 import uuid
 from urllib.parse import urlsplit
 
@@ -121,21 +122,68 @@ class InsufficientFunds(Exception):
 
 
 class MintClient:
-    """Thin JSON-over-HTTP client for a C06 mint.
+    """Thin JSON-over-HTTP(S) client for a C06 mint.
 
     Sends §3.3 canonical JSON bytes so that a retried request is
     byte-identical to the original (idempotency-key replay requires it).
     Never sends credentials of any kind — Layer 0 has none (L2, §3.7) —
     and never logs.
+
+    Scheme: ``http`` and ``https`` are both accepted, and ``https`` is what
+    a public deployment gets.  L17 scopes TLS to deployment rather than to
+    mint code, and DEPLOYMENT.md §4 turns that into a *mandatory*
+    TLS-terminating reverse proxy in front of a loopback-bound mint — so
+    the address an operator hands a client is an ``https://`` one.  This
+    client used to refuse exactly that, which meant a mint deployed the way
+    this project's own guide requires could not be reached by this
+    project's own client (found 2026-09-16 by outside review).  "TLS lives
+    in deployment" is a statement about where the *server* terminates it,
+    never a licence for the client to refuse to speak it.
+
+    Default port follows the scheme (80 / 443).  TLS uses
+    ``ssl.create_default_context()``, built once per client and reused:
+    certificate chain AND hostname verification on, system trust store,
+    no opt-out — §14's "token captured in transit" row is only true if
+    the client actually checks who it is talking to, and a token is a
+    bearer password (L8).  A verification
+    failure surfaces as ``MintUnavailable`` carrying the exception TYPE
+    only, like every other transport failure here.
+
+    ``base_url`` is an origin: scheme, host, optional port.  A non-empty
+    path is refused rather than silently dropped — every route below is
+    absolute (``/v3/exchange``), so a mint published under a path prefix
+    would otherwise be quietly requested at the proxy's root.
     """
 
     def __init__(self, base_url: str, timeout: float = 30.0):
         parts = urlsplit(base_url)
-        if parts.scheme != "http" or parts.hostname is None:
-            raise ValueError("base_url must look like http://host:port")
+        if parts.scheme not in ("http", "https") or parts.hostname is None:
+            raise ValueError(
+                "base_url must look like http://host:port or https://host"
+            )
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError(
+                "base_url must be a bare origin (scheme://host[:port]);"
+                " this client requests absolute /v3/... routes"
+            )
+        self._scheme = parts.scheme
         self._host = parts.hostname
-        self._port = parts.port or 80
+        self._port = parts.port or (443 if parts.scheme == "https" else 80)
         self._timeout = timeout
+        # Built on first https request and reused: the default context
+        # parses the whole system CA bundle (~180 KB here), and a
+        # payment-heavy client issues a request per exchange/status/
+        # descriptor call.  One context per client is byte-for-byte the
+        # same security as one per request, paid once.
+        self._ssl_context: ssl.SSLContext | None = None
+
+    def _tls_context(self) -> ssl.SSLContext:
+        if self._ssl_context is None:
+            # Chain AND hostname verification, system trust store, no
+            # opt-out.  Deliberately not a parameter: see the class
+            # docstring and §14's "token captured in transit" row.
+            self._ssl_context = ssl.create_default_context()
+        return self._ssl_context
 
     # -- transport seam (tests may subclass to instrument / inject faults) --
 
@@ -146,9 +194,17 @@ class MintClient:
         body: bytes | None,
         extra_headers: dict | None = None,
     ) -> tuple[int, bytes]:
-        conn = http.client.HTTPConnection(
-            self._host, self._port, timeout=self._timeout
-        )
+        if self._scheme == "https":
+            conn = http.client.HTTPSConnection(
+                self._host,
+                self._port,
+                timeout=self._timeout,
+                context=self._tls_context(),
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self._timeout
+            )
         try:
             headers = {"Content-Type": "application/json"} if body else {}
             if extra_headers:

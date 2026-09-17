@@ -21,7 +21,23 @@ Secret hygiene (code-inspection requirements):
 
 Clock discipline (L17): the clock is injected, and ``now`` is captured
 exactly once per exchange call so every lock in a batch is evaluated
-against the same instant.
+against the same instant — and, since a mint may have a §7.3 change
+notice outstanding, so is the burn policy: the SAME ``now`` selects it
+through ``burncalc.effective_policy``. §3.3 step 1 says the burn is
+computed "per the mint's published burn policy (§7.3)", and §7.3 says an
+announced ``burn_policy_next`` is in force from its ``effective_at``; the
+published policy at the instant of a call is therefore the one this
+ledger must charge at that instant, not the one it was built with. A
+ledger holding a single frozen policy disagreed with every client the
+moment a scheduled change took effect (every reference client already
+selects through ``effective_policy``), so a plain receive failed
+``amount_mismatch`` fleet-wide — found by outside review 2026-09-16.
+The selection rule has exactly one public entry point,
+``Ledger.effective_burn_policy(now)``: ``exchange`` prices through it, and
+so must any mint-side caller that pre-computes a burn before calling
+``exchange`` (C10's supervision profile does). Reading the private
+``_burn_policy`` instead is the same bug one layer up — the two sides
+agree until ``effective_at`` and then reject each other's arithmetic.
 """
 
 from __future__ import annotations
@@ -31,9 +47,20 @@ import sqlite3
 import threading
 from typing import Callable, NamedTuple
 
-from aicash.burncalc import BurnPolicy, compute_burn, validate_policy
+from aicash.burncalc import (
+    BurnPolicy,
+    compute_burn,
+    effective_policy,
+    validate_policy,
+)
 from aicash.lockeval import InputForm, Lock, LockError, evaluate, validate_lock
-from aicash.tokencodec import TokenError, b64u_decode, b64u_encode, ledger_key
+from aicash.tokencodec import (
+    MAX_AMOUNT_MC,
+    TokenError,
+    b64u_decode,
+    b64u_encode,
+    ledger_key,
+)
 
 __all__ = ["ExchangeRejected", "OutputSpec", "Ledger", "parse_output_wire"]
 
@@ -146,6 +173,87 @@ _ENTRY_COLS = (
     " lock_refund_hash, created_at, spent_at, claim_witness"
 )
 
+#: Inclusive bounds of SQLite's INTEGER storage class — a signed 64-bit
+#: value. Every number this module binds into a column (``amount_mc``,
+#: ``lock_expiry``, the two supply counters) has to live in here, because
+#: outside it ``conn.execute`` raises ``OverflowError`` — not a
+#: ``sqlite3.Error``, not an ``ExchangeRejected``, but a bare exception out
+#: of the driver that every ``except ExchangeRejected`` in the tree walks
+#: past. The maximum is C01's ``MAX_AMOUNT_MC`` and not a second literal:
+#: tokencodec already answers "how big can an amount be" with exactly this
+#: number and for exactly this reason (the column), so a repository with
+#: two spellings of it is a repository where one of them can be retuned
+#: alone. C10's ``_plain_int`` states the same pair for the supervision
+#: tables; these three are one bound with one cause.
+_SQLITE_INT_MIN = -(2 ** 63)
+_SQLITE_INT_MAX = MAX_AMOUNT_MC
+
+
+def _storable_int(v: object) -> bool:
+    """True for an integer this ledger can actually put in a column.
+
+    THE chokepoint for every caller-supplied number on its way into
+    sqlite, and stated as a bound on the VALUE rather than as a guard on
+    the one field a report happened to name.
+
+    A type check is not a validity check. ``_resolve_output`` checked
+    ``type(amount) is not int or amount <= 0`` and stopped there, and
+    Python's ``int`` is unbounded while SQLite's is not: nineteen nines
+    (9999999999999999999) is valid JSON, the correct type, and positive,
+    so it passed every guard on ``/admin/issue``, reached
+    ``conn.execute`` in ``_insert_entry`` and raised ``OverflowError``.
+    ``issue``'s ``except BaseException: rollback; raise`` re-raised it
+    into C06's blanket 500 handler, and the caller got a bare 500 with no
+    ``errors`` list — which §3.8 forbids: a value the mint refuses owes an
+    ENUMERATED reason.
+
+    Nobody noticed because the identical value through ``/v3/exchange``
+    was refused correctly, and refused by a DIFFERENT check: conservation
+    (inputs must equal outputs plus burn) cannot be satisfied by an amount
+    no entry can hold, so the route that had no bound was covered by
+    arithmetic that happens to also catch it. A check that covers a case
+    by accident is a check that stops covering it the moment the accident
+    changes — ``issue`` has no inputs and therefore no conservation, which
+    is exactly why it was the route that broke.
+
+    The reason is ``bad_format``: §3.8's vocabulary is ratified and has no
+    length- or range-specific entry, and "an integer larger than the mint
+    can store" is a malformed field rather than an internal fault. C01
+    says the same thing in its own vocabulary (``TokenError``) about the
+    same number, and C10's ``_plain_int`` says it about the supervision
+    columns.
+    """
+    # bool is excluded: type(True) is bool, not int — and a bool bound
+    # into an INTEGER column would silently become 0 or 1.
+    return type(v) is int and _SQLITE_INT_MIN <= v <= _SQLITE_INT_MAX
+
+
+def _validate_next(next_: object) -> tuple[BurnPolicy, int] | None:
+    """Normalize and validate a §7.3 change notice for the Ledger.
+
+    Accepts None or a 2-sequence ``(BurnPolicy, effective_at_ms)`` and
+    returns it as a tuple. A malformed notice is refused HERE, at
+    construction, rather than at the first exchange that would have to
+    select through it: a burn policy the ledger cannot evaluate is not a
+    payment-time error to discover under load.
+    """
+    if next_ is None:
+        return None
+    try:
+        policy, effective_at = next_
+    except (TypeError, ValueError):
+        raise ValueError(
+            "burn_policy_next must be None or a (BurnPolicy, effective_at)"
+            " pair, got %r" % (next_,)
+        ) from None
+    validate_policy(policy)
+    if type(effective_at) is not int or effective_at < 0:
+        raise ValueError(
+            "burn_policy_next effective_at must be a non-negative plain int"
+            " of milliseconds, got %r" % (effective_at,)
+        )
+    return (policy, effective_at)
+
 
 def _lock_from_row(row) -> Lock | None:
     """Reconstruct the Lock of an entries row (columns 3..5), or None."""
@@ -169,8 +277,10 @@ class Ledger:
         burn_policy: BurnPolicy,
         recovery_window_ms: int,
         max_lock_expiry_ms: int | None,
+        burn_policy_next: tuple[BurnPolicy, int] | None = None,
     ):
         validate_policy(burn_policy)
+        burn_policy_next = _validate_next(burn_policy_next)
         if db_path == ":memory:":
             raise ValueError(
                 "db_path ':memory:' is not supported: the Ledger (and the"
@@ -189,6 +299,7 @@ class Ledger:
         self._db_path = db_path
         self._clock = clock
         self._burn_policy = burn_policy
+        self._burn_policy_next = burn_policy_next
         self._recovery_window_ms = recovery_window_ms
         self._max_lock_expiry_ms = max_lock_expiry_ms
         self._local = threading.local()
@@ -208,8 +319,54 @@ class Ledger:
 
     @property
     def burn_policy(self) -> BurnPolicy:
-        """The §7.3 burn policy this ledger assesses (read-only)."""
+        """The §7.3 burn policy this ledger was CONFIGURED with (read-only).
+
+        This is the mint's published ``burn_policy`` descriptor field, and
+        it is what C06 checks its ``MintConfig`` against at boot — a
+        configuration value, fixed for the life of the object. It is NOT
+        necessarily the policy a call made right now would be charged: an
+        announced ``burn_policy_next`` supersedes it from its
+        ``effective_at`` onwards. Anything pricing a call must ask
+        ``effective_burn_policy(now)`` instead.
+        """
         return self._burn_policy
+
+    @property
+    def burn_policy_next(self) -> tuple[BurnPolicy, int] | None:
+        """The announced §7.3 change notice as ``(policy, effective_at)``,
+        or None (read-only). From ``effective_at`` onwards ``exchange``
+        assesses THIS policy; before it, ``burn_policy``."""
+        return self._burn_policy_next
+
+    def effective_burn_policy(self, now: int | None = None) -> BurnPolicy:
+        """The §7.3 policy ``exchange`` CHARGES at ``now`` (§3.3 step 1).
+
+        The one public answer to "what does this ledger cost at this
+        instant": ``burn_policy`` before an announced change, the
+        ``burn_policy_next`` policy from its ``effective_at`` onwards.
+        ``exchange`` itself prices every call through this method with the
+        single instant it captured, so a caller that budgets a batch
+        through it agrees with the conservation check by construction.
+
+        ``now`` defaults to a read of this ledger's own clock. Pass the
+        instant explicitly whenever the caller already has one for the
+        operation it is building — that is the only way a mint-side caller
+        and the exchange it is about to make can be certain they priced
+        the same instant. A caller that quotes in the last microseconds
+        before ``effective_at`` and calls after it still gets a clean
+        call-level ``amount_mismatch`` carrying ``expected_burn_mc``, not
+        a corrupted ledger; it can rebuild and retry.
+
+        Exposed because the alternative is what mint-side callers were
+        actually doing: reaching for the private ``_burn_policy`` (or
+        re-importing ``burncalc.effective_policy`` and re-assembling the
+        pair by hand) to pre-compute a burn, which silently drifts from
+        what ``exchange`` charges the day a change notice takes effect.
+        Do not reimplement the selection rule — call this.
+        """
+        if now is None:
+            now = self._clock()
+        return effective_policy(self._burn_policy, self._burn_policy_next, now)
 
     @property
     def recovery_window_ms(self) -> int:
@@ -220,6 +377,36 @@ class Ledger:
     def max_lock_expiry_ms(self) -> int | None:
         """The finite lock horizon (§8(b)), or None (read-only)."""
         return self._max_lock_expiry_ms
+
+    def adopt_burn_policy_next(self, next_: tuple[BurnPolicy, int]) -> None:
+        """Complete a ledger that was never told about a §7.3 change notice.
+
+        A BOOT-TIME reconciliation, not a setter. It is legal exactly once
+        and exactly when this ledger holds no notice at all: a ledger that
+        already has one keeps it, and the caller gets a ValueError rather
+        than a silent re-schedule. C06's ``MintServer`` calls it for the
+        hand-wired case — a ``MintConfig`` that publishes
+        ``burn_policy_next`` handed to a ``Ledger`` built without it — so
+        the mint cannot advertise a scheduled change it would then fail to
+        charge (``make_mint`` passes it to the constructor and never comes
+        here). Call it before serving; it is not synchronized against
+        in-flight exchanges.
+        """
+        normalized = _validate_next(next_)
+        if normalized is None:
+            raise ValueError(
+                "adopt_burn_policy_next needs a (BurnPolicy, effective_at)"
+                " pair; None would be a way to CLEAR an announced change,"
+                " which this method deliberately cannot do"
+            )
+        if self._burn_policy_next is not None:
+            raise ValueError(
+                "this Ledger already carries a burn_policy_next %r;"
+                " adopt_burn_policy_next completes a ledger that was never"
+                " told about a change notice, it never replaces one"
+                % (self._burn_policy_next,)
+            )
+        self._burn_policy_next = normalized
 
     # ------------------------------------------------------------------
     # connection plumbing
@@ -320,7 +507,13 @@ class Ledger:
             return None, None, None, "bad_format"
 
         amount = spec.amount_mc
-        if type(amount) is not int or amount <= 0:
+        if not _storable_int(amount) or amount <= 0:
+            # Bounded HERE, at the one place an output amount enters the
+            # ledger, so `issue` and `exchange` both get it rather than
+            # whichever route someone remembers to patch. See
+            # _storable_int: the upper bound is the column's, and an
+            # amount past it used to reach conn.execute and answer a bare
+            # 500 out of /admin/issue.
             return None, None, None, "bad_format"
 
         # Exactly one of secret_hash / secret (§3.3 output forms).
@@ -350,6 +543,16 @@ class Ledger:
             try:
                 lock = validate_lock(lock_obj)
             except LockError:
+                return key, amount, None, "bad_format"
+            if not _storable_int(lock.expiry):
+                # The SECOND caller-supplied number on an entries row, and
+                # the same defect one column across: C02's validate_lock
+                # pins expiry's FORM (a positive int of milliseconds) and
+                # says nothing about its size, so `{"expiry": 10**19}` is
+                # a valid §3.4 lock that raises OverflowError out of
+                # `_insert_entry` exactly as an oversized amount did.
+                # Found by sweeping this module for the shape rather than
+                # by a second report.
                 return key, amount, None, "bad_format"
             # Requirement 6 / §8(b): finite lock horizon when configured.
             if (
@@ -399,15 +602,40 @@ class Ledger:
             errors = []
             resolved = []
             seen: set = set()
+            # The THIRD number this call binds, and the one no per-value
+            # bound reaches: `cumulative_issued_mc + total`. Every amount
+            # can be individually storable and their SUM still not be —
+            # two outputs of _SQLITE_INT_MAX apiece bound a total of
+            # 2**64-2 into the supply UPDATE below and raised the same
+            # OverflowError, the same bare 500, from the same route. So
+            # the headroom is read once inside the transaction (BEGIN
+            # IMMEDIATE is already held, so no other writer can move it)
+            # and the batch is walked against it, which also names the
+            # index at which the ledger ran out of column — §3.8 wants an
+            # index, and "somewhere in this batch" is not one.
+            issued = conn.execute(
+                "SELECT cumulative_issued_mc FROM supply WHERE id = 1"
+            ).fetchone()[0]
+            running = issued
             for j, spec in enumerate(parsed):
                 key, amount, lock, reason = self._resolve_output(
                     conn, spec, now, seen
                 )
+                if reason is None and running > _SQLITE_INT_MAX - amount:
+                    # Not a statement about this amount on its own (it
+                    # passed _storable_int) but about this mint: the
+                    # supply counter cannot record it. `bad_format` for
+                    # the same reason _storable_int gives — §3.8's
+                    # vocabulary is ratified, carries no range reason, and
+                    # an enumerated reason at the right index beats a bare
+                    # 500 by the whole of §3.8.
+                    reason = "bad_format"
                 if reason is not None:
                     errors.append(
                         {"index": j, "kind": "output", "reason": reason}
                     )
                 else:
+                    running += amount
                     resolved.append((key, amount, lock))
             if errors:
                 conn.execute("ROLLBACK")
@@ -562,7 +790,14 @@ class Ledger:
             and all(a is not None for a in out_amounts)
         ):
             sum_in = sum(in_amounts)
-            burn = compute_burn(sum_in, self._burn_policy)
+            # §3.3 step 1 / §7.3: the policy in force AT THIS CALL'S
+            # clock. `now` is the single instant `exchange` captured for
+            # this call (requirement 8) and carried into the transaction,
+            # the same one every lock in the batch was evaluated against —
+            # so one call is priced under exactly one policy, and a
+            # scheduled change flips for the ledger at the instant it flips
+            # for every client reading the descriptor.
+            burn = compute_burn(sum_in, self.effective_burn_policy(now))
             if sum_in != sum(out_amounts) + burn:
                 # The rejection detail includes the burn the mint computed
                 # (public information — it follows from the published §7.3

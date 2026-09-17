@@ -13,6 +13,7 @@ from aicash.burncalc import (
     PolicyError,
     compute_burn,
     effective_policy,
+    is_increase,
     validate_notice,
     validate_policy,
 )
@@ -233,6 +234,62 @@ class TestEffectivePolicy(unittest.TestCase):
         cur = policy()
         self.assertEqual(effective_policy(cur, None, 0), cur)
         self.assertEqual(effective_policy(cur, None, 10**15), cur)
+
+
+class TestIsIncreaseIsPublic(unittest.TestCase):
+    """B4 (supporting): the increase/decrease predicate is part of the
+    module's surface, because §7.3's notice rule is asymmetric.
+
+    A configuration holding a `burn_policy_next` has to know which kind of
+    change it is BEFORE it can validate anything: an increase needs an
+    announcement time (and at least 7 days, or max_lock_expiry_ms), a
+    decrease needs neither and may be immediate. C06's MintConfig branches
+    on exactly this; when the predicate was private the only way to ask was
+    to call validate_notice with a made-up announced_at and read the answer
+    off whether it raised.
+    """
+
+    def test_it_is_exported(self):
+        import aicash.burncalc as burncalc
+
+        self.assertIn("is_increase", burncalc.__all__)
+        self.assertIs(burncalc.is_increase, is_increase)
+
+    def test_each_raising_axis_is_an_increase(self):
+        base = policy(rate_ppm=500, cap_mc=1000, exempt_below_mc=20)
+        self.assertTrue(is_increase(base, policy(
+            rate_ppm=600, cap_mc=1000, exempt_below_mc=20)))
+        self.assertTrue(is_increase(base, policy(
+            rate_ppm=500, cap_mc=1001, exempt_below_mc=20)))
+        self.assertTrue(is_increase(base, policy(
+            rate_ppm=500, cap_mc=1000, exempt_below_mc=19)))
+
+    def test_nothing_else_is(self):
+        base = policy(rate_ppm=500, cap_mc=1000, exempt_below_mc=20)
+        self.assertFalse(is_increase(base, base))
+        self.assertFalse(is_increase(base, policy(
+            rate_ppm=499, cap_mc=999, exempt_below_mc=21)))
+
+    def test_the_predicate_agrees_with_what_validate_notice_enforces(self):
+        """The two must never part company: whatever is_increase calls an
+        increase is exactly what validate_notice demands notice for."""
+        axes = (
+            ("rate_ppm", 500, 600),
+            ("cap_mc", 1000, 2000),
+            ("exempt_below_mc", 20, 15),
+            ("rate_ppm", 600, 500),
+            ("cap_mc", 2000, 1000),
+            ("exempt_below_mc", 15, 20),
+        )
+        for field, a, b in axes:
+            cur = policy(**{field: a})
+            nxt = policy(**{field: b})
+            with self.subTest(field=field, a=a, b=b):
+                if is_increase(cur, nxt):
+                    with self.assertRaises(PolicyError):
+                        validate_notice(cur, nxt, 0, 0, None)
+                else:
+                    validate_notice(cur, nxt, 0, 0, None)  # no notice owed
 
 
 class TestNoFloats(unittest.TestCase):

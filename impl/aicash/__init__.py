@@ -70,6 +70,7 @@ from aicash.escrow import (
     QuorumNotMet,
     RevealInvalid,
     compute_deadlines,
+    milestone_schedule,
     rung_composition,
 )
 from aicash.channels import (
@@ -97,8 +98,11 @@ from aicash.lockeval import LockError
 from aicash.mintapi import (
     ADMIN_ISSUANCE_DISABLED,
     ADMIN_ISSUANCE_OPEN,
+    FRAMING_REASONS,
+    FramingVerdict,
     MintConfig,
     MintServer,
+    framing_verdict,
     make_mint,
 )
 from aicash.receipts import (
@@ -138,6 +142,10 @@ __all__ = [
     "MintConfig", "MintServer", "make_mint", "Ledger", "OutputSpec",
     "ADMIN_ISSUANCE_DISABLED", "ADMIN_ISSUANCE_OPEN",
     "ExchangeRejected", "SupervisionServer",
+    # the ONE request-framing rule every HTTP server in this repository
+    # asks — exported because it is shared, not because a mint needs it
+    # spelled from the root (see aicash.mintapi.__all__)
+    "framing_verdict", "FramingVerdict", "FRAMING_REASONS",
     # Ledger.exchange raises this one out of a corrupt lock row (see docstring)
     "LockError",
     # client + its exceptions (error handling is part of the integration surface)
@@ -153,6 +161,12 @@ __all__ = [
     # layer 2 — escrow
     "EscrowPayer", "EscrowPayee", "Arbiter", "FundingInfo",
     "CommitThenAccept", "compute_deadlines", "rung_composition",
+    # `milestone_schedule` joined the surface when verify_funding started
+    # REQUIRING the payee's own offer: an integrator that must pass
+    # `milestones=` needs the helper that reads one without importing
+    # `aicash.escrow` directly (README: "you should not need to read
+    # implementation source to integrate").
+    "milestone_schedule",
     "EscrowError", "DeadlineError", "FundingInvalid", "QuorumNotMet", "RevealInvalid", "LateReveal",
     # layer 2 — records / envelope
     "make_receipt", "verify_receipt", "make_dispute_record", "verify_dispute",

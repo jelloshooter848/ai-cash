@@ -147,8 +147,10 @@ print(
     f"({N} arbiters x 2 milestones x ({len(RUNG_SET)} rungs + 1 fee))"
 )
 
-payee = EscrowPayee(client, MINT_ID, panel_pubs)
-fee_acct = EscrowPayee(client, MINT_ID, panel_pubs)  # the panel's fee account
+payee = EscrowPayee(client, MINT_ID, panel_pubs, milestones,
+                    settlement_margin_ms=MARGIN)
+fee_acct = EscrowPayee(client, MINT_ID, panel_pubs, milestones,  # the panel's fee account
+                       settlement_margin_ms=MARGIN)
 payee_hashes = payee.generate_output_hashes(attestations)  # kinds=("rung",)
 payee_hashes.update(fee_acct.generate_output_hashes(attestations, kinds=("fee",)))
 
@@ -278,10 +280,14 @@ print("\n--- attack demo: payer funds rung 2 with a self-invented preimage ---")
 JOB2 = "job-atk-" + uuid.uuid4().hex[:8]
 solo = Arbiter("arb-solo")  # k=1, n=1 degenerate panel
 atk_atts = solo.attest_rungs(JOB2, 1, [1000, 1000, 1000])
-payee2 = EscrowPayee(client, MINT_ID, {"arb-solo": solo.public})
+T_ATK = expiries[2] + 200_000
+# The attack job is its OWN offer: one milestone, its own deadlines.
+atk_offer = [{"m": 1, "evidence_deadline": T_ATK - 400_000,
+              "decision_deadline": T_ATK - GRACE - MARGIN}]
+payee2 = EscrowPayee(client, MINT_ID, {"arb-solo": solo.public}, atk_offer,
+                     settlement_margin_ms=MARGIN)
 hashes2 = payee2.generate_output_hashes(atk_atts)
 
-T_ATK = expiries[2] + 200_000
 mallory_preimage = new_secret()          # the payer's OWN invention
 mallory_refund = new_secret()
 outputs2, records2 = [], []

@@ -85,10 +85,13 @@ One Python process. Concretely, when you run the launcher you get:
   start if either changes, because §4.1 makes the baseline the definition of
   the unit and changing it silently reprices every outstanding credit.
 
-- **Optionally, a loopback operator console** (`--console-port`, default 8080),
-  a separate HTTP server that holds the admin token server-side and proxies to
-  the mint. **Set `--console-port 0` in production**, or reach it only over an
-  SSH tunnel.
+- **Optionally, a loopback operator console** (`--console-port`), a separate
+  HTTP server that holds the admin token server-side and proxies to the mint.
+  **It is OFF unless you ask for it**: `--console-port 0` is the default and
+  `--console-port 8080` starts one. It used to default to 8080, which meant an
+  operator who read the old "turn it off in production" line as advice rather
+  than as an instruction was running it without deciding to. If you do start
+  one, reach it only over an SSH tunnel.
 
   The console authenticates: on startup it prints one URL carrying a
   capability key (`http://127.0.0.1:<port>/?k=…`), generated fresh each start
@@ -261,6 +264,31 @@ interface is equivalent to publishing your users' money.
 The proxy is carrying four jobs: TLS, rate limiting (§5), request-size and
 timeout bounds in front of a stdlib HTTP server, and keeping `/admin/issue` off
 the internet.
+
+**The address you hand out is the `https://` one.** That sounds too obvious to
+write down, and it is written down because it was not true: `MintClient`
+(`impl/aicash/wallet.py`) refused every scheme but `http`, so a mint deployed
+exactly as this section requires could not be reached by this project's own
+client — the guide and the client disagreed, and the guide was right. The
+client now accepts `http` and `https`, defaults the port from the scheme
+(80/443), and verifies the certificate chain **and** hostname against the
+system trust store with no opt-out. Two consequences for you:
+
+- The base URL is a bare **origin** — `https://mint.example.org`, or
+  `https://mint.example.org:8443` if you moved the port. Not a path: every
+  route the client issues is absolute (`/v3/exchange`), so a mint published
+  under a path prefix (`https://example.org/mint/`) is refused at construction
+  rather than quietly requested at your proxy's root. If you want a prefix,
+  give the mint its own name instead.
+- A certificate your clients' trust store does not accept is, to them,
+  indistinguishable from the mint being down: they raise `MintUnavailable`
+  carrying the exception type and nothing else. A self-signed certificate on a
+  public mint is therefore not "TLS with a warning" — it is an outage. Use a
+  real one; §4.1 and §4.2 both do.
+
+`http://127.0.0.1:<port>` is still accepted, because that is what a local
+operator on the mint host, the GUI in `gui/`, and the tests all speak. It is
+the loopback address, not a deployment address.
 
 ### 4.1 Caddy (shortest path, with one caveat that is not cosmetic)
 
@@ -1247,6 +1275,16 @@ it.
 - [ ] Mint listening on `127.0.0.1` only; `ss -ltnp` confirms it (§4)
 - [ ] TLS terminates at the proxy; port 8787 firewalled; `/admin/` returns 404
       from outside (§4)
+- [ ] The address you publish to clients is the `https://` origin, and a real
+      client reaches it from a machine that is **not** the mint host —
+      `PYTHONPATH=impl python3 -c 'from aicash.wallet import MintClient;
+      print(MintClient("https://mint.example.org").descriptor()["mint_id"])'`
+      must print your `mint_id`. `curl` succeeding is not the same check:
+      curl and the client need not share a trust store (they do when Python
+      is linked against the same OpenSSL, and do not when it ships certifi
+      or uses a platform store, as on macOS and Windows), and a certificate
+      your users' store rejects reads to them as downtime, not as a
+      warning (§4)
 - [ ] Proxy config actually loads: `nginx -t` / `caddy validate` run, not
       assumed — neither config in §4 was syntax-checked when it was written (§4)
 - [ ] Certificate **renewal** proven, not just issuance: `certbot renew

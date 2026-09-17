@@ -11,6 +11,9 @@ import random
 import unittest
 
 from aicash.tokencodec import (
+    MAX_AMOUNT_DIGITS,
+    MAX_AMOUNT_MC,
+    MAX_JSON_DEPTH,
     MINT_ID_RE,
     Token,
     TokenError,
@@ -416,6 +419,408 @@ class TestMintIdRe(unittest.TestCase):
             self.assertIsNone(MINT_ID_RE.fullmatch(bad), bad)
             with self.assertRaises(TokenError):
                 format_token(bad, 5, secret)
+
+
+class TestAmountIsBounded(unittest.TestCase):
+    """D2, as a class rather than as the one field it was reported in.
+
+    ``_AMOUNT_RE`` used to be an UNBOUNDED digit run and ``parse_token``
+    called ``int()`` on whatever matched. Past CPython's int/str conversion
+    limit (``sys.set_int_max_str_digits``, 4300 digits by default) ``int()``
+    raises a BARE ``ValueError`` — not this module's ``TokenError`` — so it
+    escaped every ``except TokenError`` in the tree and surfaced as an
+    unenumerated HTTP 500. The first fix widened the exception handling at
+    one JSON reader, which covered the output ``amount_mc`` the reporter
+    happened to write down; the SAME digits one field over, in an input
+    token's amount, went straight back to the 500. Fixed here instead,
+    where the type discipline breaks, so every caller of this parser — both
+    servers, the wallet, escrow, receipts, swap — is covered at once.
+    """
+
+    SECRET = KNOWN_SECRET_B64U
+
+    def amount_token(self, amount_str):
+        return "aicash:v3:mint-a:%s:%s" % (amount_str, self.SECRET)
+
+    def test_the_reported_digits_and_every_length_around_them(self):
+        """The literal (5,000 digits) and its neighbourhood. 4,299 already
+        gave a clean refusal before the fix and must still; 4,301 and up did
+        not. All of them are now the same answer, and the length at which
+        the behaviour changes is this module's bound, not the
+        interpreter's."""
+        for digits in (1, 18, MAX_AMOUNT_DIGITS, MAX_AMOUNT_DIGITS + 1,
+                       100, 4_299, 4_300, 4_301, 5_000, 10_000, 100_000):
+            with self.subTest(digits=digits):
+                token = self.amount_token("9" * digits)
+                if digits <= MAX_AMOUNT_DIGITS:
+                    # Short enough to be a number; may still be too LARGE.
+                    try:
+                        parsed = parse_token(token)
+                    except TokenError:
+                        self.assertGreater(int("9" * digits), MAX_AMOUNT_MC)
+                        continue
+                    self.assertLessEqual(parsed.amount_mc, MAX_AMOUNT_MC)
+                    continue
+                with self.assertRaises(TokenError) as caught:
+                    parse_token(token)
+                self.assertEqual(caught.exception.reason, "bad_format")
+
+    def test_nothing_but_token_error_escapes_any_entry_point(self):
+        """THE class assertion: no input, however shaped, gets a bare
+        ValueError out of this module. A bare ValueError is what made D2 a
+        500 instead of a §3.8 reason, and `TokenError` is itself a
+        ValueError subclass, so `except ValueError` at a caller was never
+        the thing that was missing — an error in THIS module's vocabulary
+        was."""
+        huge = "9" * 5_000
+        hostile_tokens = [
+            self.amount_token(huge),
+            self.amount_token("1" + huge),
+            self.amount_token("9" * 4_301),
+            self.amount_token("0" * 5_000),          # leading zeros too
+            "aicash:v3:" + "a" * 64 + ":%s:%s" % (huge, self.SECRET),
+            "aicash:v3:mint-a:%s:%s" % (huge, "!" * 43),
+        ]
+        for token in hostile_tokens:
+            with self.subTest(token=token[:40] + "..."):
+                try:
+                    parse_token(token)
+                except TokenError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - that IS the test
+                    self.fail("%s escaped parse_token: %s"
+                              % (type(exc).__name__, exc))
+        for name, amount in (("max+1", MAX_AMOUNT_MC + 1),
+                             ("10**25", 10 ** 25),
+                             ("10**5000", 10 ** 5_000),
+                             ("2**64", 2 ** 64),
+                             ("1<<20000", 1 << 20_000)):
+            with self.subTest(name):
+                try:
+                    format_token("mint-a", amount, KNOWN_SECRET)
+                except TokenError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self.fail("%s escaped format_token: %s"
+                              % (type(exc).__name__, exc))
+
+    def test_the_bound_is_the_ledgers_and_its_edges_are_exact(self):
+        """MAX_AMOUNT_MC is the largest value a signed 64-bit ledger column
+        holds. One below, and it itself, are ordinary amounts; one above is
+        malformed, because no mint could have issued it and no ledger could
+        hold it."""
+        self.assertEqual(MAX_AMOUNT_MC, (1 << 63) - 1)
+        self.assertEqual(MAX_AMOUNT_DIGITS, len(str(MAX_AMOUNT_MC)))
+        for good in (1, 2, MAX_AMOUNT_MC - 1, MAX_AMOUNT_MC):
+            with self.subTest(good=good):
+                self.assertEqual(
+                    parse_token(self.amount_token(str(good))).amount_mc, good
+                )
+        for bad in (MAX_AMOUNT_MC + 1, 1 << 63, 9_999_999_999_999_999_999):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TokenError):
+                    parse_token(self.amount_token(str(bad)))
+
+    def test_the_encoder_and_the_decoder_agree_on_the_bound(self):
+        """A bound enforced on only one side lets this module emit a token
+        it refuses to read back — and lets `"%d" %` raise the same bare
+        ValueError on the way out that `int()` raised on the way in."""
+        for amount in (1, MAX_AMOUNT_MC - 1, MAX_AMOUNT_MC):
+            self.assertEqual(
+                parse_token(
+                    format_token("mint-a", amount, KNOWN_SECRET)
+                ).amount_mc,
+                amount,
+            )
+        for name, amount in (("max+1", MAX_AMOUNT_MC + 1),
+                             ("2**64", 1 << 64),
+                             ("10**4301", 10 ** 4_301)):
+            with self.subTest(name):
+                with self.assertRaises(TokenError):
+                    format_token("mint-a", amount, KNOWN_SECRET)
+
+    def test_the_pattern_itself_cannot_hand_int_an_oversized_string(self):
+        """The defence is the PATTERN, not a check after the conversion.
+        A converter that is only reachable with inputs it can represent
+        cannot raise, so there is no exception left to forget to catch —
+        which is the difference between fixing this shape and catching it.
+        """
+        import aicash.tokencodec as mod
+
+        self.assertIsNone(mod._AMOUNT_RE.fullmatch("9" * (MAX_AMOUNT_DIGITS
+                                                          + 1)))
+        self.assertIsNotNone(mod._AMOUNT_RE.fullmatch("9" * MAX_AMOUNT_DIGITS))
+        # Every string the pattern accepts is one int() can convert without
+        # meeting any interpreter limit.
+        self.assertLess(MAX_AMOUNT_DIGITS, 4_300)
+
+
+class TestCanonicalJsonIntegersAreBounded(unittest.TestCase):
+    """The same conversion, arrow reversed — the sibling found by looking
+    for the shape rather than for the report.
+
+    ``_canon`` type-checked an int and then called ``str()`` on it, and
+    ``str(int)`` raises the SAME bare ValueError past the conversion limit
+    that ``int(str)`` does. Canonical JSON is the signing and digest form
+    (§3.3), so a bare ValueError there escapes into whatever is computing a
+    digest — in C06 that is `body_digest(body)` inside an `except
+    TokenError`, one field away from another 500.
+    """
+
+    def test_an_integer_too_large_to_render_is_a_token_error(self):
+        for name, value in (("10**5000", 10 ** 5_000),
+                            ("-10**5000", -(10 ** 5_000)),
+                            ("10**4301", 10 ** 4_301)):
+            with self.subTest(name):
+                with self.assertRaises(TokenError):
+                    canonical_json({"n": value})
+                with self.assertRaises(TokenError):
+                    body_digest({"n": value})
+
+    def test_a_value_the_renderer_can_still_print_is_left_alone(self):
+        """The DOMAIN is not this round's to narrow. §3.3 is ratified and
+        puts no bound on a JSON integer, and C06 pins a 4,299-digit
+        ``amount_mc`` as something the money rules get to judge rather than
+        the envelope parser — so an int64 bound here would be a normative
+        change made by the back door. Only the ERROR TYPE moved."""
+        for ok in (MAX_AMOUNT_MC + 1, -MAX_AMOUNT_MC - 2, 10 ** 25,
+                   10 ** 4_299):
+            with self.subTest(digits=len(str(ok))):
+                self.assertEqual(canonical_json({"n": ok}),
+                                 ('{"n":%d}' % ok).encode())
+
+    def test_the_guard_is_total_not_a_list_of_known_bad_values(self):
+        """Every way ``str()`` can refuse an int becomes TokenError, so
+        there is no second spelling to come back for — including the one
+        that appears when someone RAISES the interpreter's limit and the
+        boundary moves underneath this module."""
+        import sys
+
+        original = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, original)
+        sys.set_int_max_str_digits(640)  # the interpreter's floor
+        try:
+            with self.assertRaises(TokenError):
+                canonical_json({"n": 10 ** 700})
+            self.assertEqual(canonical_json({"n": 10 ** 600}),
+                             ('{"n":%d}' % 10 ** 600).encode())
+        finally:
+            sys.set_int_max_str_digits(original)
+
+    def test_every_integer_the_protocol_actually_carries_still_encodes(self):
+        """Regression guard on the bound itself: amounts, millisecond
+        timestamps, ppm rates, expiries and counters all fit."""
+        self.assertEqual(
+            canonical_json(
+                {"a": MAX_AMOUNT_MC, "b": -MAX_AMOUNT_MC - 1, "c": 0,
+                 "t": 1_756_000_000_000, "ppm": 10_000, "exp": 10 ** 15}
+            ),
+            b'{"a":9223372036854775807,"b":-9223372036854775808,"c":0,'
+            b'"exp":1000000000000000,"ppm":10000,"t":1756000000000}',
+        )
+
+    def test_nested_and_listed_integers_are_bounded_too(self):
+        """Not one call site: the check lives in the recursive renderer, so
+        a huge int is refused wherever it sits in the document."""
+        for name, doc in (("nested dict", {"a": {"b": [1, {"c": 10 ** 5_000}]}}),
+                          ("bare list", [10 ** 5_000]),
+                          ("list of lists", {"k": [[[10 ** 4_400]]]})):
+            with self.subTest(name):
+                with self.assertRaises(TokenError):
+                    canonical_json(doc)
+
+
+class TestCanonicalJsonRaisesOnlyTokenError(unittest.TestCase):
+    """The D2 class, stated as the property instead of as its instances.
+
+    D2's root cause was written down as "the pattern admitted values the
+    conversion could not represent, and the conversion raised an error type
+    the route does not catch". Every caller of this module guards
+    canonicalization with ``except TokenError`` — C06's exchange route does
+    it one line before computing a digest — so the property that actually
+    protects them is not "the reported value is refused" but "NOTHING that
+    leaves this function is anything other than a TokenError".
+
+    Two converters were still outside that property after the round that
+    closed the integer one, and both reproduced the identical original
+    symptom (HTTP 500, no enumerated reason) from an anonymous request:
+    ``str.encode`` raising ``UnicodeEncodeError`` on an unpaired surrogate,
+    and ``_canon``'s own Python recursion raising ``RecursionError`` on a
+    document a few hundred levels deep. Both are ``Exception`` and neither
+    is a ``TokenError``. These tests assert the property directly, so a
+    third converter cannot be found the same way twice.
+    """
+
+    def assert_only_token_error(self, doc, label):
+        with self.subTest(label):
+            try:
+                canonical_json(doc)
+            except TokenError:
+                pass
+            except BaseException as exc:  # noqa: B036 - that IS the assertion
+                self.fail("%s raised %s, not TokenError: %r"
+                          % (label, type(exc).__name__, exc))
+            else:
+                self.fail("%s was rendered; it should have been refused"
+                          % label)
+
+    # -- unpaired surrogates --------------------------------------------
+
+    def test_an_unpaired_surrogate_is_a_token_error_wherever_it_sits(self):
+        """Not one field: the renderer descends, so every position that can
+        hold a string is the same defect. The reporter's own example used
+        ``idempotency_key``; the fix must not be about that key."""
+        for label, doc in (
+            ("bare string", "\ud800"),
+            ("idempotency_key",
+             {"idempotency_key": "\ud800", "inputs": [], "outputs": []}),
+            ("an extra top-level field",
+             {"idempotency_key": "k", "inputs": [], "outputs": [],
+              "j": "\udfff"}),
+            ("an object KEY", {"\ud800": 1}),
+            ("inside a list", {"inputs": ["\ud800"]}),
+            ("nested three deep", {"a": {"b": [{"c": "\ud83d"}]}}),
+            ("low surrogate alone", "\udc00"),
+            ("the last surrogate code point", "\udfff"),
+            ("a surrogate pair written backwards", "\udc00\ud800"),
+            ("surrounded by ordinary text", "ok-\ud800-ok"),
+        ):
+            self.assert_only_token_error(doc, label)
+
+    def test_every_surrogate_code_point_is_refused(self):
+        """The whole block D800-DFFF, sampled across its range rather than
+        at the two ends someone happened to report."""
+        for cp in range(0xD800, 0xE000, 37):
+            self.assert_only_token_error(chr(cp), "U+%04X" % cp)
+
+    def test_a_legal_pair_is_not_refused(self):
+        """This is a rule about MALFORMED input, and it has to stay one.
+
+        A JSON document written with an escaped surrogate PAIR is decoded
+        by ``json.loads`` into the single astral code point it denotes, so
+        emoji, rare CJK and every other non-BMP character reach this module
+        as ordinary characters and must render unchanged.
+        """
+        for text in ("\U0001F600", "\U0001F4B0 paid", "\U00020BB7",
+                     "\U0010FFFF"):
+            with self.subTest(text.encode("unicode_escape")):
+                self.assertEqual(canonical_json(text),
+                                 ('"%s"' % text).encode("utf-8"))
+        parsed = json.loads('"\\ud83d\\ude00"')
+        self.assertEqual(parsed, "\U0001F600")
+        self.assertEqual(canonical_json(parsed), '"\U0001F600"'.encode("utf-8"))
+
+    def test_body_digest_refuses_the_same_documents(self):
+        """``body_digest`` is what C06 actually calls, and it is a different
+        function; a guard that only held on ``canonical_json`` would leave
+        the reported call path exactly as it was."""
+        with self.assertRaises(TokenError):
+            body_digest({"idempotency_key": "\ud800", "inputs": [],
+                         "outputs": []})
+        with self.assertRaises(TokenError):
+            body_digest({"a": [[["\udfff"]]]})
+
+    def test_the_refusal_says_what_is_wrong(self):
+        """§3.8 owes an enumerated reason, and TokenError carries one."""
+        with self.assertRaises(TokenError) as caught:
+            canonical_json("\ud800")
+        self.assertEqual(caught.exception.reason, "bad_format")
+        self.assertIn("surrogate", str(caught.exception))
+
+    # -- depth -----------------------------------------------------------
+
+    def nest(self, depth, kind):
+        doc = 1
+        for _ in range(depth):
+            doc = [doc] if kind == "list" else {"k": doc}
+        return doc
+
+    def test_a_document_deeper_than_the_bound_is_a_token_error(self):
+        """The reported window was 500-2000 levels: deep enough that
+        ``json.loads`` succeeds (so C06's body reader never sees it) and
+        deep enough that ``_canon``'s own recursion does not. Swept well
+        past both ends."""
+        for depth in (MAX_JSON_DEPTH + 1, 200, 500, 600, 1_000, 2_000,
+                      5_000):
+            for kind in ("list", "dict"):
+                self.assert_only_token_error(
+                    self.nest(depth, kind), "%s x%d" % (kind, depth)
+                )
+
+    def test_the_bound_is_deeper_than_anything_the_protocol_builds(self):
+        """The cost has to be nothing. The deepest document this system
+        canonicalizes is an exchange call — envelope, outputs list, an
+        output object, its lock — which is four."""
+        self.assertGreaterEqual(MAX_JSON_DEPTH, 32)
+        call = {"idempotency_key": "k", "inputs": ["aicash:v3:m:1:s"],
+                "outputs": [{"amount_mc": 1, "secret_hash": "h",
+                             "lock": {"preimage_hash": "p", "expiry": 1,
+                                      "refund_hash": "r"}}]}
+        self.assertIn(b'"amount_mc":1', canonical_json(call))
+        for depth in (1, 8, MAX_JSON_DEPTH - 1, MAX_JSON_DEPTH):
+            with self.subTest(depth=depth):
+                self.assertTrue(canonical_json(self.nest(depth, "list")))
+                self.assertTrue(canonical_json(self.nest(depth, "dict")))
+
+    def test_the_bound_does_not_move_with_the_stack_it_is_called_from(self):
+        """Why the depth is COUNTED rather than left to RecursionError.
+
+        The interpreter's limit is a budget shared with every frame already
+        on the stack, so a rule that fired only there would refuse a
+        document on one call path and render it on another — and the deep
+        call path is the ordinary one for a server. A counted bound gives
+        the same answer everywhere.
+        """
+        doc = self.nest(MAX_JSON_DEPTH, "list")
+        deep_doc = self.nest(MAX_JSON_DEPTH + 1, "list")
+        expected = canonical_json(doc)
+
+        def recurse(n):
+            if n:
+                return recurse(n - 1)
+            self.assertEqual(canonical_json(doc), expected)
+            with self.assertRaises(TokenError):
+                canonical_json(deep_doc)
+            return True
+
+        self.assertTrue(recurse(300))
+
+    def test_mixed_shapes_are_counted_the_same_way(self):
+        """Depth is depth: alternating containers, and a deep branch hidden
+        beside a shallow one, are both measured."""
+        doc = 1
+        for i in range(MAX_JSON_DEPTH + 40):
+            doc = [doc] if i % 2 else {"k": doc}
+        self.assert_only_token_error(doc, "alternating containers")
+        self.assert_only_token_error(
+            {"shallow": 1, "deep": self.nest(MAX_JSON_DEPTH + 5, "list")},
+            "a deep branch beside a shallow one",
+        )
+
+    # -- the property, over a corpus -------------------------------------
+
+    def test_no_document_in_the_corpus_escapes_as_another_exception(self):
+        """The assertion the last round needed and did not make: sweep the
+        hostile shapes together and require the TYPE, not the message."""
+        corpus = [
+            ("float", {"a": 1.5}),
+            ("nan", float("nan")),
+            ("bytes", b"raw"),
+            ("set", {1, 2}),
+            ("non-str key", {1: "a"}),
+            ("huge int", {"n": 10 ** 5_000}),
+            ("surrogate", "\ud800"),
+            ("surrogate key", {"\udfff": 1}),
+            ("deep list", self.nest(900, "list")),
+            ("deep dict", self.nest(900, "dict")),
+            ("deep and surrogate", self.nest(900, "list") + ["\ud800"]),
+            ("surrogate under a huge int",
+             {"a": {"b": ["\ud800", 10 ** 5_000]}}),
+            ("complex", 1j),
+            ("a class", TokenError),
+        ]
+        for label, doc in corpus:
+            self.assert_only_token_error(doc, label)
 
 
 class TestModuleHygiene(unittest.TestCase):

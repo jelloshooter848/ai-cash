@@ -73,6 +73,7 @@ __all__ = [
     "LateReveal",
     "FundingInfo",
     "compute_deadlines",
+    "milestone_schedule",
     "evidence_hash",
     "rung_composition",
     "Arbiter",
@@ -184,6 +185,39 @@ def compute_deadlines(
             "decision_deadline must be strictly after evidence_deadline"
         )
     return decision_deadline + grace_ms + settlement_margin
+
+
+def milestone_schedule(milestones) -> dict[int, tuple[int, int]]:
+    """Normalize an offer's milestone list into ``{m: (evidence_deadline,
+    decision_deadline)}``.
+
+    The argument is the SAME ``[{m, evidence_deadline, decision_deadline},
+    ...]`` list the payer passes to ``EscrowPayer.fund`` — it is the offer
+    both sides agreed to, so each side holds its own copy and neither has
+    to trust the other's.  Raises ``DeadlineError`` on a malformed or
+    duplicated entry.
+    """
+    out: dict[int, tuple[int, int]] = {}
+    for spec in milestones:
+        if not isinstance(spec, dict):
+            raise DeadlineError("each milestone must be a dict")
+        missing = {"m", "evidence_deadline", "decision_deadline"} - set(spec)
+        if missing:
+            raise DeadlineError(
+                "milestone entry is missing %s" % sorted(missing)
+            )
+        m = spec["m"]
+        if type(m) is not int or m < 0:
+            raise DeadlineError("milestone m must be a non-negative integer")
+        if m in out:
+            raise DeadlineError(f"duplicate milestone {m} in the schedule")
+        out[m] = (
+            _require_ms("evidence_deadline", spec["evidence_deadline"]),
+            _require_ms("decision_deadline", spec["decision_deadline"]),
+        )
+    if not out:
+        raise DeadlineError("the milestone schedule is empty")
+    return out
 
 
 def rung_composition(total_mc: int, denoms_desc) -> list[int]:
@@ -696,18 +730,12 @@ class EscrowPayer:
         max_batch = desc["limits"]["max_batch"]
 
         # Requirement 6: deadline ordering enforced at fund time.
-        known_m = set()
-        for spec in milestones:
-            m = spec["m"]
-            known_m.add(m)
+        schedule = milestone_schedule(milestones)
+        known_m = set(schedule)
+        for m, (evd, dec) in sorted(schedule.items()):
             if m not in expiries:
                 raise DeadlineError(f"no expiry given for milestone {m}")
-            min_expiry = compute_deadlines(
-                spec["evidence_deadline"],
-                spec["decision_deadline"],
-                grace_ms,
-                self._margin,
-            )
+            min_expiry = compute_deadlines(evd, dec, grace_ms, self._margin)
             if expiries[m] < min_expiry:
                 raise DeadlineError(
                     f"milestone {m} expiry {expiries[m]} is below the"
@@ -866,12 +894,38 @@ class EscrowPayer:
 class EscrowPayee:
     """The output-secret-holding side of one escrow job: the payee proper
     (rung outputs) or the panel's fee account (fee outputs — pass
-    ``kinds=("fee",)`` to ``generate_output_hashes``)."""
+    ``kinds=("fee",)`` to ``generate_output_hashes``).
 
-    def __init__(self, client, mint_id: str, arbiter_pubs: dict):
+    ``milestones`` is the offer's own ``[{m, evidence_deadline,
+    decision_deadline}, ...]`` schedule — the same list the payer passes to
+    ``EscrowPayer.fund``.  The payee received the offer, so it holds its
+    own copy, and ``verify_funding`` re-derives the §9.3 deadline ordering
+    from it instead of trusting the expiries the payer hands over (the
+    payer's ``fund`` arithmetic is the counterparty's own code; a payee
+    that trusts it can be funded with a lock that expires before the
+    decision deadline and lose the job).  ``settlement_margin_ms`` is the
+    settlement headroom THIS payee requires — a larger value than the
+    payer's is safe; it only refuses funding.
+
+    ``verify_funding`` refuses outright when no schedule is known: the
+    §9.3 check is mandatory and it cannot be run without the offer.
+    """
+
+    def __init__(
+        self,
+        client,
+        mint_id: str,
+        arbiter_pubs: dict,
+        milestones=None,
+        settlement_margin_ms: int = 60_000,
+    ):
         self._client = client
         self._mint_id = mint_id
         self._arbiter_pubs = dict(arbiter_pubs)
+        self._margin = _require_ms("settlement_margin", settlement_margin_ms, 1)
+        self._schedule = (
+            milestone_schedule(milestones) if milestones is not None else None
+        )
         self._secrets: dict[tuple, bytes] = {}  # (m, arbiter_id, rung) -> secret
         self._pinned: dict[tuple, dict] = {}
         self._verified = False
@@ -898,7 +952,9 @@ class EscrowPayee:
             out[key] = ledger_key(secret)
         return out
 
-    def verify_funding(self, info: FundingInfo | dict, attestations) -> None:
+    def verify_funding(
+        self, info: FundingInfo | dict, attestations, milestones=None
+    ) -> None:
         """The MANDATORY §9.3 pre-work check (requirement 2), complete.
 
         ``info`` is the payer's handoff: a FundingInfo, or its wire form —
@@ -907,26 +963,66 @@ class EscrowPayee:
         ``FundingInfo.from_dict``; a malformed wire dict raises
         ``EscrowError``).
 
+        ``milestones`` is the offer's schedule (``[{m, evidence_deadline,
+        decision_deadline}, ...]``), defaulting to the one this payee was
+        constructed with.  It is the payee's OWN copy of the agreement, not
+        anything the payer hands over, and without it the check cannot run
+        at all — calling with no schedule raises ``EscrowError`` rather
+        than passing a weaker check.  Every milestone in it must be funded
+        by this handoff, so a payee that agreed to staged funding passes
+        the milestones THIS stage covers.
+
         The checks:
 
         * every attestation signature verifies against its arbiter's key;
         * attested preimage hashes are pairwise distinct (fee/rung
           disjointness re-checked);
         * the funded output set matches the attested set exactly;
+        * the funding is COMPLETE against what we know independently:
+          every milestone of the offer we accepted is funded, and every
+          output this payee generated a secret for is among the funded
+          ones — a payer cannot shrink the job by pruning the attestation
+          list and the outputs together;
         * every output we hold a secret for is keyed by OUR hash;
         * on the ledger (batch ``/v3/status``): every output exists, is
           unspent, has the attested amount, the agreed expiry, and a lock
-          whose ``preimage_hash`` equals the attested value.
+          whose ``preimage_hash`` equals the attested value;
+        * every on-ledger lock expiry is at or after ``decision_deadline +
+          grace_ms + settlement_margin``, recomputed HERE from the payee's
+          own copy of the offer, the mint's own ``grace_ms``, and this
+          payee's required margin — never from the payer's expiries.
 
         Any failure raises ``FundingInvalid`` naming the offending rung.
         Without this check a payer can fund locks keyed to a preimage of
         its own invention and silently reconstruct refund-after-delivery
-        (§9.3, B3).  Nothing is pinned unless every check passes.
+        (§9.3, B3); without the ordering recomputation it can reconstruct
+        the same outcome with a conformant-looking lock that expires before
+        the arbiter's decision is due (B2).  Nothing is pinned unless every
+        check passes.
         """
+        if milestones is not None:
+            schedule = milestone_schedule(milestones)
+        elif self._schedule is not None:
+            schedule = self._schedule
+        else:
+            raise EscrowError(
+                "no milestone schedule — §9.3 requires the payee to check"
+                " the lock expiries against the offer's own decision"
+                " deadlines; pass milestones= (the offer's [{m,"
+                " evidence_deadline, decision_deadline}, ...]) to"
+                " EscrowPayee or to verify_funding"
+            )
         if isinstance(info, dict):
             info = FundingInfo.from_dict(info)
         if not isinstance(info, FundingInfo):
             raise EscrowError("info must be a FundingInfo or its wire dict")
+        if info.mint_id != self._mint_id:
+            # The ledger facts below come from OUR mint; a handoff naming
+            # another mint describes funding we are not looking at.
+            raise FundingInvalid(
+                f"funding names mint {info.mint_id!r}, not ours"
+                f" ({self._mint_id!r})"
+            )
         atts: dict[tuple, dict] = {}
         seen_hashes: set[str] = set()
         for a in attestations:
@@ -971,6 +1067,33 @@ class EscrowPayee:
             is_fee = rung == FEE_RUNG
             return (m, arb, is_fee, rung if isinstance(rung, int) else -1)
 
+        # COMPLETENESS, measured against what the payee knows on its own.
+        # The two set comparisons above only establish that the funded set
+        # matches the ATTESTATION LIST THE PAYER PRESENTED — both sides of
+        # that comparison come from the counterparty's handoff, so a payer
+        # that prunes the list it hands over (dropping a whole milestone,
+        # or some rungs of one) passes them with the pruned outputs simply
+        # never mentioned.  The payee would then start the job with no
+        # escrow behind the part that was dropped.  These two checks are
+        # the independent half: the offer's own milestone set, and the
+        # outputs this payee generated secrets for, must ALL be funded.
+        funded_milestones = {key[0] for key in outs}
+        for m in sorted(schedule):
+            if m not in funded_milestones:
+                raise FundingInvalid(
+                    "milestone of the offer we accepted is not funded at all"
+                    " — the handoff covers no output for it (§9.3 funding"
+                    " completeness)",
+                    m,
+                )
+        for key in sorted(self._secrets, key=_order):
+            if key not in outs:
+                raise FundingInvalid(
+                    "we hold an output secret for this rung and the handoff"
+                    " does not fund it (§9.3 funding completeness)",
+                    *key,
+                )
+
         ordered = sorted(outs, key=_order)
         for key in ordered:
             o, a = outs[key], atts[key]
@@ -980,6 +1103,14 @@ class EscrowPayee:
                 raise FundingInvalid(
                     "claimed lock hash differs from attestation", *key
                 )
+            if key[0] not in schedule:
+                raise FundingInvalid(
+                    "milestone is not in the offer we accepted — its"
+                    " deadline ordering cannot be checked",
+                    *key,
+                )
+            if key[0] not in info.expiries:
+                raise FundingInvalid("no expiry given for this milestone", *key)
             if o["expiry"] != info.expiries[key[0]]:
                 raise FundingInvalid("expiry differs from the schedule", *key)
             secret = self._secrets.get(key)
@@ -990,6 +1121,17 @@ class EscrowPayee:
 
         desc = self._client.descriptor()
         max_batch = desc["limits"]["max_batch"]
+        # The §9.3 ordering, recomputed by the payee from what it knows
+        # independently: the offer's own decision deadlines, the MINT's
+        # grace_ms, and the margin this payee requires.  The payer's
+        # arithmetic is the counterparty's own code and is not evidence of
+        # anything; only ``compute_deadlines`` — the one implementation
+        # both sides call — decides what is conformant.
+        grace_ms = desc["lock_params"]["grace_ms"]
+        min_expiry = {
+            m: compute_deadlines(evd, dec, grace_ms, self._margin)
+            for m, (evd, dec) in schedule.items()
+        }
         hashes = [outs[key]["secret_hash"] for key in ordered]
         results = _status_chunked(self._client, hashes, max_batch)
         pinned: dict[tuple, dict] = {}
@@ -1013,11 +1155,23 @@ class EscrowPayee:
                 )
             if lock.get("expiry") != info.expiries[key[0]]:
                 raise FundingInvalid("on-ledger expiry mismatch", *key)
+            expiry = lock.get("expiry")
+            if type(expiry) is not int:
+                raise FundingInvalid("on-ledger expiry is not an integer", *key)
+            if expiry < min_expiry[key[0]]:
+                raise FundingInvalid(
+                    f"lock expiry {expiry} is before the conformant minimum"
+                    f" {min_expiry[key[0]]} (decision_deadline + grace_ms +"
+                    " settlement_margin) — a conformant decision could be"
+                    " rendered after this lock has already opened the refund"
+                    " path (§9.3 deadline ordering)",
+                    *key,
+                )
             pinned[key] = {
                 "amount_mc": o["amount_mc"],
                 "secret_hash": o["secret_hash"],
                 "preimage_hash": atts[key]["preimage_hash"],
-                "expiry": o["expiry"],
+                "expiry": expiry,  # the ledger's value, not the payer's copy
             }
         # Pin only after EVERY check passed.
         self._pinned = pinned
@@ -1116,6 +1270,13 @@ class CommitThenAccept:
     ``expiry − grace_ms − redemption_margin`` — measured against the
     MINT's clock, never wall time — records the refusal, and raises
     ``LateReveal``; §10.2 treats it as a payer refusal.
+
+    The worker's own copy of the agreed terms (``agreed_amount_mc``,
+    ``agreed_expiry``, ``accept_by``) is held separately from the
+    ``amount_mc``/``expiry`` attributes ``payer_commit`` writes, and
+    ``worker_verify`` compares the ledger against the worker's copy only
+    — including the §9.4 ordering ``expiry >= accept_by + grace_ms +
+    redemption_margin``.
     """
 
     def __init__(
@@ -1124,6 +1285,9 @@ class CommitThenAccept:
         mint_id: str,
         redemption_margin_ms: int = 60_000,
         grace_ms: int | None = None,
+        agreed_amount_mc: int | None = None,
+        agreed_expiry: int | None = None,
+        accept_by: int | None = None,
     ):
         self._client = client
         self._mint_id = mint_id
@@ -1131,6 +1295,23 @@ class CommitThenAccept:
         self._grace_override = grace_ms
         # worker side
         self._worker_secret: bytes | None = None
+        # The WORKER's own copy of the agreed terms (§9.4).  Deliberately
+        # separate from the ``amount_mc``/``expiry`` attributes below,
+        # which ``payer_commit`` writes: checking the ledger against the
+        # payer's own numbers only proves the payer is self-consistent.
+        if agreed_amount_mc is not None and (
+            type(agreed_amount_mc) is not int or agreed_amount_mc <= 0
+        ):
+            raise EscrowError("agreed_amount_mc must be a positive integer")
+        self._agreed_amount_mc = agreed_amount_mc
+        self._agreed_expiry = (
+            None if agreed_expiry is None
+            else _require_ms("agreed_expiry", agreed_expiry, 1)
+        )
+        self._accept_by = (
+            None if accept_by is None else _require_ms("accept_by", accept_by, 1)
+        )
+        self._verified_amount_mc: int | None = None
         # payer side
         self._preimage: bytes | None = None
         self._refund_secret: bytes | None = None
@@ -1153,18 +1334,69 @@ class CommitThenAccept:
         self._worker_secret = new_secret()
         return ledger_key(self._worker_secret)
 
-    def worker_verify(self, amount_mc: int | None = None, expiry: int | None = None) -> None:
+    def worker_verify(
+        self,
+        amount_mc: int | None = None,
+        expiry: int | None = None,
+        accept_by: int | None = None,
+    ) -> None:
         """MANDATORY before working (§9.4): confirm the committed funds on
-        the ledger — present, unspent, agreed amount, agreed expiry,
-        locked.  Raises ``FundingInvalid`` otherwise (B6)."""
+        the ledger — present, unspent, the agreed amount, locked — AND
+        that the lock's expiry leaves the agreed acceptance window intact.
+
+        Every term compared here is the worker's own copy of the
+        agreement: ``amount_mc``, ``expiry`` and ``accept_by`` come from
+        this call or from the constructor, never from the ``amount_mc`` /
+        ``expiry`` attributes ``payer_commit`` writes onto this object.
+        Those are the counterparty's numbers; checking the ledger against
+        them proves only that the payer is consistent with itself.  A
+        worker that holds no terms of its own raises ``EscrowError``
+        rather than running that weaker check.
+
+        ``accept_by`` is the latest moment the parties agreed the payer
+        may accept delivery.  The §9.4 ordering — the analogue of the §9.3
+        deadline ordering, and the reason it is checked here rather than
+        assumed — is
+
+            ``expiry >= accept_by + grace_ms + redemption_margin``
+
+        recomputed from the worker's own ``accept_by``, the MINT's
+        ``grace_ms`` and this worker's margin, and compared against the
+        ON-LEDGER expiry.  Without it the payer's derived reveal deadline
+        (``expiry − grace_ms − redemption_margin``, §9.4) can fall before
+        the acceptance the worker agreed to: the worker verifies, does the
+        work, and finds the refund path already open.  The window is also
+        checked for being still live at verification time, so a worker
+        never starts on a commitment no conformant payer could still
+        accept.  ``expiry`` is optional — when held, the on-ledger value
+        must equal it exactly; the ordering check runs either way.
+
+        Raises ``FundingInvalid`` on any failure (B6).
+        """
         if self._worker_secret is None:
             raise EscrowError("call worker_hash() first")
-        amount = amount_mc if amount_mc is not None else self.amount_mc
-        expected_expiry = expiry if expiry is not None else self.expiry
-        if amount is None or expected_expiry is None:
-            raise EscrowError("agreed amount/expiry unknown")
+        amount = amount_mc if amount_mc is not None else self._agreed_amount_mc
+        if amount is None:
+            raise EscrowError(
+                "the worker holds no agreed amount of its own — §9.4"
+                " requires the ledger to be checked against the WORKER's"
+                " copy of the terms, not the payer's; pass amount_mc= to"
+                " worker_verify or agreed_amount_mc= to CommitThenAccept"
+            )
+        deadline = accept_by if accept_by is not None else self._accept_by
+        if deadline is None:
+            raise EscrowError(
+                "the worker holds no agreed acceptance deadline — without"
+                " it the committed expiry cannot be checked against"
+                " anything the worker knows, and a lock that expires"
+                " before acceptance is due would pass (§9.4 reveal"
+                " deadline); pass accept_by= to worker_verify or to"
+                " CommitThenAccept"
+            )
+        _require_ms("accept_by", deadline, 1)
+        expected_expiry = expiry if expiry is not None else self._agreed_expiry
         h = ledger_key(self._worker_secret)
-        _mt, results = self._client.status([h])
+        mint_time, results = self._client.status([h])
         res = results[0]
         if res.get("state") == "unknown":
             raise FundingInvalid("committed funds absent from the ledger")
@@ -1175,24 +1407,59 @@ class CommitThenAccept:
         lock = res.get("lock")
         if not isinstance(lock, dict):
             raise FundingInvalid("committed output is not locked")
-        if lock.get("expiry") != expected_expiry:
+        if expected_expiry is not None and lock.get("expiry") != expected_expiry:
             raise FundingInvalid("committed expiry differs from the agreement")
+        ledger_expiry = lock.get("expiry")
+        if type(ledger_expiry) is not int:
+            raise FundingInvalid("committed expiry is not an integer")
+        desc = self._client.descriptor()
+        grace = (
+            self._grace_override
+            if self._grace_override is not None
+            else desc["lock_params"]["grace_ms"]
+        )
+        min_expiry = deadline + grace + self._margin
+        if ledger_expiry < min_expiry:
+            raise FundingInvalid(
+                f"committed expiry {ledger_expiry} is before the conformant"
+                f" minimum {min_expiry} (accept_by + grace_ms +"
+                " redemption_margin) — the §9.4 reveal deadline for this"
+                " lock falls before the acceptance we agreed to, so the"
+                " refund path can open on delivered work"
+            )
+        reveal_by = ledger_expiry - grace - self._margin
+        if mint_time > reveal_by:
+            raise FundingInvalid(
+                f"the acceptance window is already closed: at mint_time"
+                f" {mint_time} the §9.4 reveal deadline for this lock"
+                f" ({reveal_by}) has passed, so no conformant payer can"
+                " still accept and the work could not be paid"
+            )
+        self._verified_amount_mc = amount
 
     def worker_redeem(self, preimage_b64u: str) -> int:
         """Claim with the worker's own secret + the revealed preimage,
         strictly before expiry (the mint enforces).  Returns the net."""
-        if self._worker_secret is None or self.amount_mc is None:
+        # The amount this worker VERIFIED on the ledger, when it has run
+        # the mandatory check; ``self.amount_mc`` is the payer's copy and
+        # only stands in for a session driven from one object.
+        amount = (
+            self._verified_amount_mc
+            if self._verified_amount_mc is not None
+            else self.amount_mc
+        )
+        if self._worker_secret is None or amount is None:
             raise EscrowError("nothing committed")
         preimage = b64u_decode(preimage_b64u, expect_len=32)
         desc = self._client.descriptor()
         policy = _policy_from_descriptor(desc)
-        burn = compute_burn(self.amount_mc, policy)
-        net = self.amount_mc - burn
+        burn = compute_burn(amount, policy)
+        net = amount - burn
         fresh = new_secret()
         inputs = [
             {
                 "token": format_token(
-                    self._mint_id, self.amount_mc, self._worker_secret
+                    self._mint_id, amount, self._worker_secret
                 ),
                 "witness": b64u_encode(preimage),
             }

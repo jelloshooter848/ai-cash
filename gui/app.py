@@ -36,9 +36,18 @@ behaviour. The pieces it does own are the ones a browser forces on you:
   * NONE OF THAT MAKES THIS SAFE TO EXPOSE. The cookie is a second lock on
     a door that should still not face the street. It is not a reason to
     relax the loopback bind, and there is no flag that relaxes it.
+  * ONE FRAMING RULE, AND IT IS NOT WRITTEN HERE. Where a request body
+    ends -- and therefore whether the connection can carry another request
+    afterwards -- is decided by ``aicash.mintapi.framing_verdict``, the
+    single rule every HTTP server in this repository imports. This file
+    applies it to EVERY request of EVERY method before any route runs, and
+    keeps only its own status codes and error envelope. See the import
+    below for why there is no local copy and why its absence is fatal.
   * NO TRACEBACK EVER REACHES THE PAGE. Every route returns JSON; failures
     return ``{"error": {"reason", "detail", "cause"}}`` with a detail a
-    non-expert can act on.
+    non-expert can act on. Not the exception's text either: an interpreter
+    message is a trace by another name, and one of them carried the digit
+    count of a number a caller chose.
   * A FAILURE SAYS WHY IT FAILED, AND ONLY WHAT IS KNOWN. ``cause`` is a
     machine reason from ONE closed set, shared verbatim with walletops.py
     and page.html (see CAUSES below). It is carried through from the layer
@@ -67,7 +76,9 @@ import base64
 import contextlib
 import errno
 import hmac
+import http.client
 import inspect
+import io
 import ipaddress
 import json
 import os
@@ -88,6 +99,117 @@ REPO = os.path.dirname(HERE)
 for _p in (HERE, os.path.join(REPO, "impl")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# ----------------------------------------------------------------------
+# THE ONE FRAMING RULE, IMPORTED, NEVER COPIED
+# ----------------------------------------------------------------------
+# How long a request body is, and whether the connection can carry another
+# request afterwards, is decided by ONE function for every HTTP server in
+# this repository: aicash.mintapi.framing_verdict. This file does not own
+# that question and does not answer it locally.
+#
+# Why it is imported instead of implemented here. The defect it closes was
+# reported once against the mint, fixed there, found to have been fixed for
+# a single SPELLING of one header name, and fixed again properly -- and
+# then an independent verifier pointed the same twenty-five spellings at
+# THIS server and found nineteen of them still working, on every POST route
+# and on every GET route, because the fix lived twenty feet away and this
+# file had no counterpart to it. A local copy is how that happens: two
+# rules on one protocol drift, and the half that drifts is the smuggleable
+# half. There is now one rule, one place, and a test that drives every
+# server in the repository with identical bytes and asserts they reach
+# identical framing decisions.
+#
+# THE IMPORT IS DELIBERATELY FATAL. There is no local fallback and no
+# "degraded framing" mode: a server that cannot tell where a request body
+# ends must not answer HTTP at all. Every other impl/ import in this file
+# is wrapped (see _Components) because gui/mintctl.py and gui/walletops.py
+# are separately-owned components whose absence is a 503 naming the file;
+# the framing rule is not a component, it is the protocol, and a 503 is
+# itself an HTTP response that would have to be framed.
+# FRAMING_REASONS is re-exported deliberately, not imported by accident:
+# it is the closed set of machine slugs a verdict can carry, and this
+# server prints one of them in its refusal. A caller (or a test) mapping
+# those exhaustively should read the set from here rather than grow a
+# second list of its own -- a second list is how this defect started.
+# ``_DeadlineRaw`` comes from the same module and for the same reason: it
+# is the mint's whole-request wall-clock deadline, the transport hardening
+# that stops a peer from resetting an IDLE timeout forever a byte at a
+# time. It is IMPORTED, not re-implemented, because a second copy of a
+# transport bound is exactly the shape of defect the paragraph above
+# describes -- four rounds of this project were spent carrying one
+# server's hardening to the next by hand, and each hand-carry left one
+# server behind. It is private to aicash.mintapi (a leading underscore)
+# and this file reads it anyway, deliberately: a private name shared by
+# one import is one implementation, and a public name copied into four
+# files is four. See Handler.setup below for what it is plugged into, and
+# TestTheDripIsBoundedByAWallClock for the test that asserts this file
+# defines no second copy of it.
+try:
+    from aicash.mintapi import (FRAMING_REASONS, _DeadlineRaw,
+                                framing_verdict)
+except Exception as _framing_import_error:   # pragma: no cover - see above
+    raise ImportError(
+        "gui/app.py cannot start: it needs aicash.mintapi.framing_verdict, "
+        "the single request-framing rule shared by every HTTP server in "
+        "this repository (the mint, the supervision profile, this GUI and "
+        "the operator console). It was not importable from "
+        + os.path.join(REPO, "impl") + " (" + repr(_framing_import_error)
+        + "). This file deliberately keeps NO local copy of that rule: a "
+        "second copy is exactly how the same smuggling defect came to be "
+        "fixed in one server and left open in three. Restore the export, "
+        "do not reimplement it here."
+    ) from _framing_import_error
+
+
+def framing_fields(verdict):
+    """The four contract fields, off whatever ``framing_verdict`` returns.
+
+    The shared rule's return TYPE is its owner's choice -- the pinned
+    contract says "an object or tuple carrying at least length, framed,
+    must_close, reason" -- so this reads the four fields without pinning
+    the shape, and nothing else in this file touches the verdict object.
+    It is an adapter, not a rule: it decides nothing about framing, it
+    only unpacks an answer someone else computed.
+
+      * ``length``     -- int | None; octets of body that can be trusted.
+                          ``None`` means no trustworthy statement of length
+                          exists, which is NOT the same as zero.
+      * ``framed``     -- False when the body cannot be framed at all.
+      * ``must_close`` -- True when the connection MUST be closed after
+                          answering, whatever the answer is. That covers
+                          both an unframable request and a framed one whose
+                          declared octets this caller has already said it
+                          will not read.
+      * ``reason``     -- short machine slug from FRAMING_REASONS, for THIS
+                          server's own vocabulary. It carries no HTTP
+                          status and no error envelope, because the rule's
+                          four callers use three different ones.
+    """
+    if hasattr(verdict, "framed"):       # an object, dataclass or NamedTuple
+        return (verdict.length, bool(verdict.framed),
+                bool(verdict.must_close), str(verdict.reason))
+    if isinstance(verdict, dict):
+        return (verdict["length"], bool(verdict["framed"]),
+                bool(verdict["must_close"]), str(verdict["reason"]))
+    length, framed, must_close, reason = verdict   # a plain tuple, in order
+    return length, bool(framed), bool(must_close), str(reason)
+
+
+#: What this server SAYS when the shared rule refuses to frame a request.
+#: The rule returns a machine slug and no HTTP vocabulary at all; the
+#: status code, the reason word and this sentence are this server's, and
+#: the mint and the console each write their own from the same slug.
+UNFRAMABLE_DETAIL = (
+    "This GUI could not determine where that request's body ends, so it "
+    "read none of it and closed the connection instead of guessing. The "
+    "usual cause is a chunked body: send the body with a Content-Length "
+    "header instead -- this server reads bodies by length and does not "
+    "decode chunked transfer encoding. A duplicated, misspelled or "
+    "unparseable Content-Length does the same thing. No field of this "
+    "request was looked at, so nothing this route would have wanted is "
+    "missing; the body was never read."
+)
 
 DEFAULT_PORT = 8799
 DEFAULT_WORKDIR = os.path.join(HERE, "var")
@@ -161,9 +283,112 @@ MINT_HTTP_TIMEOUT_S = 8.0
 # ever applied to routes that move no money; see _read_within().
 READ_DEADLINE_S = 12.0
 MAX_BODY_BYTES = 1 << 20
-# A whole-second deadline on one connection. Without it a client that sends
-# "Content-Length: 500" and then four bytes pins a handler thread forever.
+# THE IDLE BOUND ON ONE SOCKET CALL, and it is only that. socketserver
+# applies it to the accepted socket, so it is a per-syscall timeout: a
+# peer that sends -- or accepts -- one byte inside every window resets it
+# forever, and the comment that used to sit here ("without it a client
+# that sends Content-Length: 500 and then four bytes pins a handler thread
+# forever") was wrong in the one way that mattered: a client that sends
+# four bytes and then one more every two seconds pinned a handler thread
+# anyway.
+#
+# WHAT IT DOES NOT BOUND, said plainly here because two comments in this
+# file used to claim it did:
+#   * It does not bound a READ. REQUEST_DEADLINE_S does, through
+#     _DeadlineRaw, and it is the SMALLER of the two, so it is the
+#     operative bound on every read this server performs.
+#   * It does not bound an IDLE KEEP-ALIVE SOCKET between requests either.
+#     handle_one_request arms the deadline BEFORE the blocking read of the
+#     next request line, so a kept socket that goes quiet is closed at
+#     REQUEST_DEADLINE_S. MEASURED: a socket that took a 200 and then said
+#     nothing was answered 408 and closed at 10.0s, not at 30.
+#   * It does not bound a WRITE either, and that was the live hole. It is
+#     per sendall, so N pipelined responses drained slowly are N fresh
+#     windows: MEASURED at 200 seconds and still running on one socket
+#     carrying 2000 pipelined `GET /` with a peer reading ~10 KB/s.
+#     RESPONSE_BUDGET_S below is what bounds that, cumulatively, per
+#     CONNECTION -- which is the only scope a pipeline cannot multiply.
+#
+# What is left for it is the floor under both budgets: no single syscall
+# blocks longer than this even when a budget has more room than that left.
 REQUEST_TIMEOUT_S = 30
+# THE WALL-CLOCK BOUND ON ONE WHOLE REQUEST -- request line, headers and
+# body together -- enforced under the buffered reader by the mint's
+# _DeadlineRaw (see Handler.setup).
+#
+# WHY TEN SECONDS HERE WHERE THE MINT CHOSE THIRTY. The mint's budget is
+# sized against the ~77 KiB of a full max_batch exchange arriving over
+# whatever link a mint is reachable on, which is a real network. This
+# server has no network in its read phase at all: require_loopback()
+# refuses to bind anything the world can reach, so every request it will
+# ever read is written by a process on this same machine, and the largest
+# body it will read is MAX_BODY_BYTES. Ten seconds against a megabyte is a
+# floor of ~100 KiB/s, which loopback beats by three or four orders of
+# magnitude and which no drip comes close to.
+#
+# And the ceiling is not the socket's, it is the PAGE's. page.html aborts
+# its own fetch and shows its own message instead of whatever this server
+# determined, so a request whose READ alone outlasts that is a request
+# whose answer nothing will ever read. Half the page's patience for
+# getting the question in, half for answering it, is the split that keeps
+# every bound route below reachable.
+#
+# AND THE PAGE'S PATIENCE IS NOT ONE NUMBER, which the sentence that used
+# to stand here got wrong. page.html declares
+# `TIMEOUTS = {default: 20000, start: 90000, stop: 70000}`: nineteen of
+# the twenty-one routes abort at PAGE_ABORT_S, and /api/mint/start and
+# /api/mint/stop wait 90s and 70s because a supervised process transition
+# is slow to ANSWER, not slow to ASK -- their request bodies are a few
+# dozen bytes over loopback. So the budget is sized against the SHORTEST
+# of the three, which is the default, and the two longer ones are covered
+# a fortiori. The test reads all three out of page.html and pins the
+# budget against the minimum, so a page that shortens any of them fails
+# here rather than drifting.
+#
+# It is also what now bounds an idle keep-alive connection: the deadline is
+# armed in handle_one_request BEFORE the request line is read, so a peer
+# that connects and says nothing is closed at ten seconds rather than at
+# REQUEST_TIMEOUT_S. Ten is comfortably above the page's 4s poll interval,
+# which is the only legitimate thing that waits on an idle socket here.
+REQUEST_DEADLINE_S = 10.0
+# THE WALL-CLOCK BOUND ON THE WRITE SIDE OF ONE CONNECTION -- cumulative
+# seconds spent inside socket writes, across every response this
+# connection sends, enforced by _BudgetedWriter.
+#
+# WHY CUMULATIVE AND WHY PER CONNECTION, because both halves are the
+# finding. `timeout` above is per sendall, so it is a window and not a
+# budget, and a pipeline multiplies windows: MEASURED against a live
+# serve(), one socket carrying 2000 pipelined `GET /` with a valid session
+# cookie (226 KB of request) and a peer draining ~10 KB/s -- inside the
+# 30s window, so every sendall made progress -- held its handler thread
+# and its fd past 200 SECONDS and 2,006,461 delivered bytes before the
+# measurement was capped. Unauthenticated, 4000 pipelined 401s held 20.0s.
+# GuiServer is a ThreadingHTTPServer with no connection or thread cap, so
+# N such sockets are N parked threads, and the cost to mount it is one
+# socket and a slow reader.
+#
+# A per-RESPONSE budget would not have closed it: the peer chooses how
+# many responses it queues, so any per-response bound is multiplied by a
+# number the peer picks. The budget therefore belongs to the connection,
+# and it counts time spent IN a write rather than wall time since the
+# connection opened -- because the page's own connection is long-lived on
+# purpose (a 4-second poll reusing one socket) and must never be torn down
+# for being old. A connection that is answering normally spends
+# microseconds here: the writes go into the loopback socket buffer.
+#
+# TEN SECONDS for the same reason the read side gets ten: half the page's
+# shortest patience for getting the answer out, the other half having been
+# spent getting the question in. The operator page is ~261 KiB, so ten
+# seconds is a floor of ~26 KiB/s against a browser on this same machine,
+# which loopback beats by orders of magnitude.
+#
+# WHAT A PEER SEES WHEN IT RUNS OUT: nothing more. The budget expires
+# inside a write, `_send` turns that into a closed connection rather than
+# an exception, and no second response is composed onto a socket that
+# already carries a partial one. There is no way to report it -- the
+# report would be another write, on the socket that just proved it cannot
+# take one.
+RESPONSE_BUDGET_S = 10.0
 # JSON numbers above 2**53 stop being exact in a browser, and the mint has
 # its own bounds anyway; refuse them here with a sentence instead of
 # relaying the mint's 500.
@@ -176,6 +401,21 @@ RECIPIENT_NAME_MAX = 64
 # message than a component exception would; MintControl re-checks it, and the
 # mint itself is the authority.
 MINT_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+# THE BASELINE GOES ON A COMMAND LINE. /api/mint/start passes this value
+# to MintControl.start, which spawns run_mint.py with `--model-class
+# <value>` in its argv -- so an unbounded string here is an unbounded
+# argv entry in a child process, and a five-thousand-character one was
+# accepted and really spawned. §4.1 makes this field the DEFINITION of
+# the unit and immutable for the life of a mint_id, which is a strong
+# argument for a short, deliberate, printable name and none at all for a
+# kilobyte of anything. 128 is far above every real value (`baseline-v1`
+# is eleven characters) and far below anything that can strain an argv.
+# Control characters are refused outright: they cannot be meant, they
+# cannot be read back off a terminal, and they would ride into the
+# child's command line and into the descriptor this mint serves forever.
+BASELINE_MAX = 128
+BASELINE_RE = re.compile(
+    r"^[\x21-\x7e][\x20-\x7e]{0,%d}$" % (BASELINE_MAX - 1))
 
 
 #: THE closed failure-cause vocabulary, identical in gui/walletops.py.
@@ -320,6 +560,26 @@ SESSION_COOKIE = "aicash_gui_session"
 # window and a re-exchange after a restart; the oldest is dropped rather
 # than letting a long-running process accumulate credentials forever.
 MAX_SESSIONS = 32
+
+
+#: The longest a message this file did NOT write may be when it leaves in
+#: a response body. Everything this server composes itself is a sentence
+#: and fits; what does not fit is a message from somewhere else with a
+#: caller's own input quoted inside it -- an exception's text, a
+#: component's relayed complaint, the base class's echo of a 64 KiB
+#: request line. A money server should not reflect a kilobyte of whatever
+#: it was sent back out of an error body, so a relayed message is cut and
+#: says that it was cut. 1000 is far above every real message here (the
+#: longest this file composes is under 500) and far below an amplifier.
+_RELAYED_DETAIL_MAX = 1000
+
+
+def _bounded(text: str, limit: int = _RELAYED_DETAIL_MAX) -> str:
+    """Cut a message this file did not compose. See _RELAYED_DETAIL_MAX."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " (truncated)"
 
 
 class GuiError(Exception):
@@ -730,14 +990,18 @@ class _Components:
             cause = clean_cause(getattr(exc, "cause", None))
             if cause == "mint_unreachable" and self.mint_running() is False:
                 cause = "mint_stopped"
-            return GuiError(400, self._reason(reason), str(detail) or str(exc),
-                            cause)
+            # _bounded: the component's sentence may quote what the caller
+            # sent it (a token string, a payee label), and a relayed
+            # message is not this file's to vouch for the length of.
+            return GuiError(400, self._reason(reason),
+                            _bounded(str(detail) or str(exc)), cause)
         mint_err = getattr(self._mintctl_mod, "MintControlError", None)
         if mint_err is not None and isinstance(exc, mint_err):
-            return GuiError(400, "mint_control", str(exc) or type(exc).__name__)
+            return GuiError(400, "mint_control",
+                            _bounded(str(exc) or type(exc).__name__))
         return GuiError(
             500, "component_error",
-            f"{what} raised {type(exc).__name__}: {exc}")
+            _bounded(f"{what} raised {type(exc).__name__}: {exc}"))
 
     def call(self, what: str, fn, *args, **kwargs):
         try:
@@ -809,22 +1073,56 @@ def _as_int(value, default=None):
         return default
 
 
-_DIGITS_RE = re.compile(r"[+-]?[0-9]+")
+#: A whole number a caller may state as a STRING, bounded in both shape
+#: and LENGTH. The length half is the fix: the old pattern was
+#: ``[+-]?[0-9]+``, which bounds the shape and nothing else, so a caller
+#: could send five thousand digits and ``int()`` raised CPython's
+#: int/str conversion ValueError (4300 digits) straight out of the route
+#: and onto the blanket handler -- a 500 whose body carried the
+#: interpreter's own message, including the digit count the caller chose,
+#: and a traceback on this process's stderr. Live on /api/mint/issue for
+#: both of its numeric fields and on /api/mint/start for four of its own.
+#: Nineteen digits is above every bound any route here enforces
+#: (MAX_AMOUNT_MC is sixteen, a port is five, a count is three), so
+#: nothing a caller can legitimately mean is refused by the length cap;
+#: what it refuses is a number that was never going to be accepted and
+#: only ever chose how expensively it would be rejected.
+_DIGITS_RE = re.compile(r"[+-]?[0-9]{1,19}")
 
 
 def _strict_int(value, default=None):
-    """Strict int for CALLER INPUT. Anything that is not exactly a whole
-    number is ``default`` (which the callers turn into a 400), never a
-    truncation: an amount of 12.7 is a mistake, not twelve."""
-    if isinstance(value, bool) or value is None:
+    """Strict int for CALLER INPUT. Never raises, for any input.
+
+    ``default`` is the answer when the field is ABSENT and nothing else.
+    Anything a caller actually sent that is not exactly a whole number is
+    ``None``, which every caller turns into a 400 -- never a truncation
+    (an amount of 12.7 is a mistake, not twelve) and never a silent
+    substitution of the route's default. Those are different answers and
+    this used to give the same one to both: ``{"count": "9" * 5000}``
+    would have issued ONE token rather than saying no, which on a route
+    that creates money is the wrong way round.
+
+    The string branch is bounded in length as well as in shape; see
+    _DIGITS_RE. A Python ``int`` that arrived already parsed (JSON
+    numbers become ints before this is called) is returned whatever its
+    magnitude -- the routes' own range checks refuse it with a sentence,
+    and no conversion happens here that could raise. A 5,000-DIGIT JSON
+    number literal never reaches this function at all: json.loads raises
+    ValueError on it and _parse_body answers ``bad_json``.
+    """
+    if value is None:
         return default
+    if isinstance(value, bool):
+        # Present, and not a number. `True` is an int to Python and is not
+        # one to anybody sending JSON.
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value) if value.is_integer() else default
+        return int(value) if value.is_integer() else None
     if isinstance(value, str) and _DIGITS_RE.fullmatch(value.strip()):
         return int(value.strip())
-    return default
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -1197,12 +1495,60 @@ class Api:
                 502, "mint_unreachable",
                 f"Could not reach the mint at {base}: {exc}",
                 "mint_unreachable") from None
+        except http.client.HTTPException as exc:
+            # THE OTHER HALF OF THE CONSOLE'S EXCEPT TUPLE, and it was left
+            # behind when RecursionError was copied out of it. The tuple at
+            # mint_console.py:1252 is (OSError, ValueError, RecursionError,
+            # http.client.HTTPException) and every member is there for ONE
+            # stated reason: whatever is listening on the mint port is not
+            # necessarily the mint. http.client.HTTPException is NOT an
+            # OSError -- it is a plain Exception -- so with only the three
+            # clauses above, four shapes of reply from a rogue process on
+            # that port walked out of here into the blanket handler in
+            # _handle and became a bare 500 with a traceback on the
+            # operator's terminal, on /api/mint/descriptor,
+            # /api/token/status and /api/mint/issue:
+            #
+            #   * BadStatusLine      -- `GARBAGE\r\n\r\n` on the socket;
+            #   * LineTooLong        -- a 200 KB header line;
+            #   * HTTPException      -- "got more than 100 headers";
+            #   * IncompleteRead     -- raised by `response.read()` INSIDE
+            #     the with-block above, which is why the read is in this
+            #     try and not after it: a declared length the peer never
+            #     finished sending.
+            #
+            # bad_mint_response and not mint_unreachable: octets came back.
+            # Something on that port took the request and answered it with
+            # bytes this server cannot read as HTTP, and on the issue route
+            # that difference is money -- "could not reach the mint" reads
+            # as "nothing was created", which this process cannot know.
+            #
+            # ORDER MATTERS AND IS DELIBERATE. http.client.RemoteDisconnected
+            # inherits from BOTH ConnectionResetError and BadStatusLine, so
+            # it is caught by the OSError clause ABOVE this one and keeps
+            # the mint_unreachable it has always had. That is the honest
+            # word for it: the peer closed with no answer at all.
+            raise GuiError(
+                502, "bad_mint_response",
+                f"The mint port at {base} answered with something this GUI "
+                f"could not read as an HTTP response "
+                f"({type(exc).__name__}), so what it did with the request "
+                f"is undetermined.", "unknown") from None
         try:
             obj = json.loads(payload or b"{}")
-        except ValueError:
+        except (UnicodeDecodeError, ValueError, RecursionError):
             # It ANSWERED -- badly. Saying "the mint did not answer" here
             # would contradict this very sentence, and this server has no
             # idea what the mint did with the request, so: undetermined.
+            #
+            # RecursionError for the same reason the console catches it on
+            # its own client socket: whatever is listening on the mint port
+            # is not necessarily the mint, and a nested-array reply deep
+            # enough to blow the C parser's stack is a stack overflow
+            # reached from another process. Uncaught it is not a
+            # bad_mint_response at all -- it is a bare 500 out of the
+            # blanket handler, blaming this GUI for what the thing on the
+            # mint port sent.
             raise GuiError(
                 502, "bad_mint_response",
                 f"The mint answered http {status} with something that is "
@@ -1227,6 +1573,19 @@ class Api:
                 400, "bad_request",
                 "Baseline model class cannot be empty. baseline-v1 is the "
                 "usual value.")
+        if not BASELINE_RE.fullmatch(baseline):
+            # This string becomes an argv entry in a spawned mint (see
+            # BASELINE_MAX) and, under §4.1, the permanent definition of
+            # what one millicredit means for that mint_id. Both of those
+            # are reasons to know its shape before the subprocess exists,
+            # not after.
+            raise GuiError(
+                400, "bad_request",
+                f"Baseline model class must be 1 to {BASELINE_MAX} printable "
+                f"characters with no control characters and no leading "
+                f"space; it is passed to the mint on its command line and, "
+                f"once that mint has issued a token, it can never be "
+                f"changed. baseline-v1 is the usual value.")
         port = _strict_int(body.get("port"))
         if port is None or not 1 <= port <= 65535:
             raise GuiError(400, "bad_request",
@@ -1280,7 +1639,17 @@ class Api:
         return self.mint_status()
 
     def route_mint_logs(self, query, _body) -> dict:
-        lines = _strict_int(query.get("lines"), 200) or 200
+        # `or 200` used to stand here, which meant an unusable ?lines=
+        # silently became the default -- including a five-thousand-digit
+        # one, whose only other outcome was an interpreter ValueError out
+        # of _strict_int. A number nobody can honour is refused in a
+        # sentence; an ABSENT ?lines= is still the default, because not
+        # asking is not the same as asking for nonsense.
+        lines = _strict_int(query.get("lines"), 200)
+        if lines is None:
+            raise GuiError(400, "bad_request",
+                           "lines must be a whole number; 1 to 2000 are "
+                           "honoured and anything outside that is clamped.")
         lines = max(1, min(lines, 2000))
         control = self.components.mint()
         raw = self.components.call("MintControl.logs", control.logs, lines=lines)
@@ -2546,6 +2915,79 @@ each time and is never written down anywhere.</p>
 """
 
 
+class _BudgetedWriter(io.BufferedIOBase):
+    """The handler's write side, under a CUMULATIVE wall-clock budget.
+
+    THE MIRROR OF ``_DeadlineRaw``, ONE DIRECTION OVER, and it exists
+    because the round that installed the read-side deadline left the write
+    side with the exact defect it had just closed. ``Handler.timeout`` is
+    applied by socketserver to the whole socket, so it bounds one
+    ``sendall`` -- and a peer that accepts a few kilobytes inside every
+    window gets a fresh window for every response. MEASURED against a live
+    ``serve()``: one socket, 2000 pipelined ``GET /`` with a valid session
+    cookie, peer draining ~10 KB/s, handler thread and fd still held at
+    200 seconds and 2,006,461 bytes when the measurement was capped.
+
+    WHY THIS IS NOT THE MINT'S CLASS, and it is a real difference rather
+    than a second copy of the same thing. ``_DeadlineRaw`` bounds ONE
+    REQUEST's reads against an absolute instant, and it is imported from
+    ``aicash.mintapi`` precisely so this file grows no second wall clock
+    for that. This bounds a CONNECTION's writes against an accumulated
+    total, which is a different quantity for a different reason: the peer
+    chooses how many responses it queues, so any per-response bound is
+    multiplied by a number the peer picks, while the page's own connection
+    is long-lived on purpose and must not be torn down for being old. What
+    the two share is the rule that a window is not a budget, and nothing
+    else. It defines no read method at all, which is the property the
+    no-second-copy test asserts.
+
+    Time spent is charged whether the write succeeded or failed, and the
+    idle timeout is restored afterwards so the read side is never left
+    running under whatever sliver of the write budget remained.
+
+    ``time.monotonic`` here is transport bookkeeping and nothing else: no
+    value computed in this class is ever served, signed or persisted.
+    """
+
+    def __init__(self, sock, handler):
+        self._sock = sock
+        self._handler = handler
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        # socketserver's own _SocketWriter offers this; wsgiref and
+        # anything else that asks the response stream for a descriptor
+        # would get an UnsupportedOperation without it.
+        return self._sock.fileno()
+
+    def write(self, payload):
+        handler = self._handler
+        idle = handler.timeout
+        budget = handler.write_budget
+        if budget is None:
+            window = idle
+        else:
+            left = budget - handler.write_spent
+            if left <= 0:
+                # Raised BEFORE the syscall, so an exhausted budget cannot
+                # buy one more window by trying. TimeoutError is an
+                # OSError, which is what _send turns into a closed
+                # connection rather than a second response.
+                raise TimeoutError("response budget exhausted")
+            window = left if idle is None else min(idle, left)
+        self._sock.settimeout(window)
+        started = time.monotonic()
+        try:
+            self._sock.sendall(payload)
+        finally:
+            handler.write_spent += time.monotonic() - started
+            self._sock.settimeout(idle)
+        with memoryview(payload) as view:
+            return view.nbytes
+
+
 class Handler(BaseHTTPRequestHandler):
     api: Api = None            # set by serve()
     auth: _Auth = None         # set by serve(); None fails every request shut
@@ -2554,18 +2996,135 @@ class Handler(BaseHTTPRequestHandler):
     # (_authorize, on a good key) and emitted by _send. A class-level
     # default matters: send_error() can answer before _handle() runs.
     _set_cookie = None
+    #: Whether a FINAL response (>= 200) has already gone out for the
+    #: request being handled. Read by the handle_one_request backstop,
+    #: which must never write a second response onto a socket that already
+    #: carries one -- that is the desync everything in this file exists to
+    #: prevent. A 1xx does NOT set it: an interim status is not an answer,
+    #: and counting it as one is how the console's own backstop became
+    #: suppressible (mint_console.py, `_send`). Class-level default because
+    #: send_error() can answer before handle_one_request assigns it.
+    _answered = False
     server_version = "aicash-gui"
     sys_version = ""
-    # A deadline on one connection. Without it, a client that announces
-    # "Content-Length: 500" and then sends four bytes holds a handler
-    # thread for as long as it likes, and enough of those exhaust the
-    # server with no request ever completing.
+    # THE IDLE BOUND ON ONE RECV, and nothing more. socketserver's
+    # StreamRequestHandler.setup() applies it to the accepted socket, so
+    # every recv gets its own fresh window and a peer that sends ONE BYTE
+    # inside every window resets it forever. Measured on this server
+    # before request_timeout below existed: one byte every two seconds
+    # into the header block, no credential, no complete request line, held
+    # a handler thread and a file descriptor past 100 seconds and would
+    # have held it indefinitely -- and GuiServer is a ThreadingHTTPServer,
+    # which caps neither connections nor threads, so N such sockets are N
+    # parked threads.
+    #
+    # WHAT IT STILL DOES, now that a budget stands on either side of it.
+    # It is the ceiling on ONE syscall and nothing else: no single recv and
+    # no single sendall blocks longer than this, even when the budget
+    # governing that side has more room than that left. It is the
+    # pre-existing value and it is deliberately the LARGEST of the three,
+    # so it never pre-empts a budget.
+    #
+    # IT IS NOT THE BOUND ON A WRITE. That sentence stood here, and on a
+    # blocked write it was false in exactly the way this round was convened
+    # to remove: per sendall is a window, and a pipeline of responses
+    # drained slowly is as many fresh windows as the peer cares to queue --
+    # measured at 200 seconds and still running. write_budget below is the
+    # bound, it is cumulative, and it belongs to the connection.
+    #
+    # IT IS NOT THE BOUND ON ANY READ EITHER, and the ordering is the
+    # opposite of the mint's on purpose: the mint's deadline is LONGER than
+    # its idle timeout, so both bind, whereas here the deadline is shorter
+    # and is always the operative one on the read side, including the wait
+    # for the next request line on an idle keep-alive socket. That is the
+    # intended division of labour and TestTheDripIsBoundedByAWallClock
+    # asserts it on live sockets, so a later edit cannot quietly invert it
+    # and leave the header phase covered by an idle timeout again.
     timeout = REQUEST_TIMEOUT_S
+    # THE WALL-CLOCK BOUND ON ONE WHOLE REQUEST. Armed in
+    # handle_one_request, enforced by _DeadlineRaw on every recv. A class
+    # attribute rather than module state so a deployment -- or a test that
+    # has to watch a drip die -- overrides it by subclassing.
+    request_timeout = REQUEST_DEADLINE_S
+    #: Absolute monotonic instant this request must be read by. None
+    #: between requests, and a class-level default because setup() runs
+    #: before handle_one_request assigns it.
+    request_deadline: float | None = None
+    #: THE WRITE-SIDE BUDGET, in cumulative seconds spent inside socket
+    #: writes for the whole CONNECTION. A class attribute for the same
+    #: reason request_timeout is one: a deployment -- or a test that has to
+    #: watch a slow drain die -- overrides it by subclassing rather than by
+    #: reaching into module state. None disables it, which nothing shipped
+    #: does; it exists so a test can prove the budget is what ends the
+    #: connection by removing it and watching the hold return.
+    write_budget: float | None = RESPONSE_BUDGET_S
+    #: Seconds this connection has already spent inside socket writes.
+    #: Reset in setup(), which runs once per connection and not once per
+    #: request -- per request is the scope a pipeline multiplies.
+    write_spent = 0.0
     # HTTP/1.1 so the page's 4-second poll reuses one connection instead of
     # opening three. Every response here carries an exact Content-Length,
     # and any path that answers without draining a request body closes the
     # connection rather than leave the next read misaligned.
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        """Put a wall clock under BOTH sides of this connection.
+
+        The read side gets the mint's deadline; the write side gets this
+        file's cumulative budget. Neither side of a socket is bounded by a
+        per-syscall timeout, and this round found that out twice: once on
+        the read side, and once, after the read side was fixed, on the
+        write side that a comment claimed ``timeout`` covered.
+
+        socketserver has just made ``rfile = connection.makefile('rb',
+        rbufsize)``. This swaps in the same buffered reader over
+        ``_DeadlineRaw``, which gives every recv the SMALLER of the idle
+        timeout and the time left on ``request_deadline`` and raises
+        before the syscall once that is gone.
+
+        UNDER the BufferedReader and not around it, which is the whole
+        trick and the reason this is imported rather than re-derived:
+        BufferedReader's own loops -- ``readline`` over the header block,
+        ``read(n)`` over a body -- come back through ``readinto`` for
+        every refill, so each refill re-checks the clock. Wrapping the
+        BufferedReader instead would have set one timeout for one
+        blocking read and bounded nothing. It is also the only position
+        that covers the HEADER phase as well as the body, and the header
+        phase is where the measured drip lived: no credential, no route,
+        no framing decision yet, and a thread held past 100 seconds.
+
+        Closing the original reader only drops its socket refcount -- it
+        does not close the fd -- so connection.close() stays honest.
+
+        A TimeoutError raised from down there is a socket.timeout, which
+        BaseHTTPRequestHandler.handle_one_request already turns into a
+        silent close for the header phase, and which _read_body_bytes
+        already catches (it catches OSError, and TimeoutError is one) and
+        turns into this server's own framed 400 for the body phase. So
+        nothing new has to be caught for this to be answered properly.
+        """
+        super().setup()
+        original = self.rfile
+        self.rfile = io.BufferedReader(
+            _DeadlineRaw(self.connection, self),
+            io.DEFAULT_BUFFER_SIZE if self.rbufsize <= 0 else self.rbufsize)
+        original.close()
+        # AND THE SAME TREATMENT ON THE WAY OUT. socketserver has also just
+        # made the write side (a _SocketWriter, whose write() is one
+        # sendall under the socket's own timeout). _BudgetedWriter charges
+        # every write against one cumulative per-connection budget, which
+        # is the only scope a pipeline of responses cannot multiply. Here
+        # and not in handle_one_request BECAUSE the budget is the
+        # connection's: setup() runs once per connection, and resetting
+        # write_spent per request would hand the peer the multiplier back.
+        outgoing = self.wfile
+        self.wfile = _BudgetedWriter(self.connection, self)
+        self.write_spent = 0.0
+        try:
+            outgoing.close()
+        except OSError:                 # pragma: no cover - already gone
+            pass
 
     def log_message(self, *args):
         """Silent by design: a request line can carry a token in a query
@@ -2601,10 +3160,27 @@ class Handler(BaseHTTPRequestHandler):
         return text
 
     def _send(self, code: int, payload: bytes, ctype: str):
+        # A RESPONSE THIS SERVER WILL NOT FRAME MUST SAY SO ON THE WIRE.
+        # protocol_version is HTTP/1.1, so a peer that reads a complete
+        # Content-Length and sees no Connection header is entitled to send
+        # another request down the same socket -- and every path here that
+        # answers a request whose body it declined to read has already set
+        # close_connection. Announcing it turns a silent EOF into the one
+        # thing an intermediary can act on, which is the whole difference
+        # between hanging up and desynchronising.
+        will_close = bool(self.close_connection)
+        if code >= 200:
+            # A final response. See _answered: 1xx is deliberately not one,
+            # and nothing in this file sends 1xx through here anyway.
+            self._answered = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         if code != 204:  # a 204 has no body by definition
             self.send_header("Content-Length", str(len(payload)))
+        if will_close:
+            # send_header("Connection", "close") also sets close_connection,
+            # which it already is; this is the announcement, not the switch.
+            self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
         if self._set_cookie:
             self.send_header("Set-Cookie", self._set_cookie)
@@ -2617,17 +3193,97 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'none'; script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
             "img-src 'self' data:; base-uri 'none'; form-action 'none'")
-        self.end_headers()
-        if self.command != "HEAD":
-            try:
+        # EVERY OCTET THIS SERVER PUTS ON THE SOCKET GOES THROUGH HERE, and
+        # a failure putting it there is a fact about the PEER, not a bug in
+        # this file. end_headers() is where the header block is flushed and
+        # the line below is where the body goes, so both are inside the
+        # same clause.
+        #
+        # WHAT THIS REPLACED, and it was measured. The two-exception clause
+        # that used to sit on the body write alone let a write TIMEOUT --
+        # a peer that stopped reading -- escape into _handle's blanket
+        # `except Exception`, which printed a traceback on the operator's
+        # terminal and then composed a 500 onto a socket that already
+        # carried a partial response. That is a second response after a
+        # first, which is the desync everything in this file exists to
+        # prevent, and it bought the peer a second full window: 65.0
+        # seconds of hold on a 400-deep pipeline where the first write had
+        # already spent one.
+        #
+        # _answered is already True (set above, before send_response), so
+        # the backstops upstream will not try to answer either. There is
+        # nothing to report to and nothing to report: the report would be
+        # another write, on the socket that just proved it cannot take one.
+        try:
+            self.end_headers()
+            if getattr(self, "command", None) != "HEAD":
+                # getattr: send_error() can reach here before parse_request
+                # has set `command`, and an AttributeError between
+                # end_headers() and the write is a declared Content-Length
+                # with no body after it -- a client reading by length then
+                # waits for octets that are never coming.
                 self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+        except OSError:
+            # BrokenPipeError, ConnectionResetError and TimeoutError (the
+            # exhausted write budget) are all OSError, and all three mean
+            # the same thing here: this socket will not carry the rest of
+            # this response, so it carries nothing further at all.
+            self.close_connection = True
+
+    def _refuse_transport(self, code: int, reason: str, detail: str) -> None:
+        """Answer a request that never became a call, and hang up.
+
+        ONE PLACE, so the refusals below cannot drift into four spellings
+        of "close and answer 400". This is the mint's funnel
+        (impl/aicash/mintapi.py, ``_Handler._refuse_transport``), carried
+        here for the reason the mint wrote down when it added it: three
+        hand-written refusal sites in two methods is the shape this round
+        exists to remove, and this file had exactly that -- two sites, each
+        spelling ``close_connection = True`` and then ``_error`` by hand,
+        with a third and a fourth about to be added by this round.
+
+        THE THREE THINGS EVERY TRANSPORT REFUSAL NEEDS, and the reason they
+        belong together rather than at each site:
+
+        * ``close_connection``. Nothing here was dispatched, so nothing
+          here knows where the next request line would start.
+        * A version that can carry a status line. ``parse_request`` sets
+          ``request_version`` to HTTP/0.9 before it reads anything, and in
+          0.9 ``send_response``, ``send_header`` and ``end_headers`` are
+          all no-ops -- so a refusal composed while that is still the
+          version goes out as a NAKED BODY with no status line at all,
+          which is the precise defect this round is closing. Every refusal
+          that reaches here is a refusal this server could not attribute to
+          a version, so all of them are answered in HTTP/1.1.
+        * ``requestline`` and ``command``, which ``send_response`` ->
+          ``log_request`` and ``_send`` read. A refusal that fires before
+          ``parse_request`` set them would raise AttributeError inside the
+          error path, and an AttributeError inside an error path is
+          answered with nothing at all.
+        """
+        self.close_connection = True
+        if getattr(self, "requestline", None) is None:
+            self.requestline = ""
+        if not getattr(self, "command", None):
+            # _send asks whether this was a HEAD. "Not HEAD" is the answer
+            # that emits the body about to be framed.
+            self.command = ""
+        if getattr(self, "request_version", "HTTP/0.9") == "HTTP/0.9":
+            self.request_version = "HTTP/1.1"
+        self._error(code, reason, detail)
 
     def _json(self, code: int, obj):
         try:
             text = json.dumps(obj, default=str)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # RecursionError is the third member of the family, here for
+            # the same reason it is on the two readers: the encoder
+            # recurses too. This is the last place in the file that could
+            # turn a bad document into NO RESPONSE AT ALL -- _json is what
+            # the blanket handler in _handle calls to report a failure, so
+            # an exception raised HERE has nowhere left to be reported and
+            # leaves the handler with the request unanswered. The fallback
+            # below encodes a fixed, flat dict, which cannot raise.
             code, text = 500, json.dumps(
                 {"error": {"reason": "bad_component_response",
                            "cause": "unknown",
@@ -2831,37 +3487,115 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _read_body(self) -> dict:
-        # A chunked body has no Content-Length, so the length-based read
-        # below would take it as an empty body and every field would then
-        # look absent -- pointing the caller at the first field the route
-        # validates instead of at the real problem, which is that nothing
-        # was read.  page.html is unaffected (browsers set Content-Length),
-        # but the readme invites direct API use, and an HTTP client that
-        # chunks by default deserves the true answer rather than bad_name.
-        if self.headers.get("Transfer-Encoding"):
-            raise GuiError(
-                400, "chunked_body",
-                "This GUI reads request bodies by Content-Length and does "
-                "not decode chunked transfer encoding, so nothing was read "
-                "from this request. Send the body with a Content-Length "
-                "header. Any field this route would have wanted looks "
-                "absent because the body was discarded, not because you "
-                "omitted it.")
-        length = _as_int(self.headers.get("Content-Length"), 0) or 0
+    def _read_body_bytes(self, length) -> bytes:
+        """Read exactly the octets the SHARED framing rule vouched for.
+
+        ``length`` comes from ``framing_verdict`` in ``_handle`` and from
+        nowhere else. This method does not look at a header, does not ask
+        whether one is spelled ``Transfer-Encoding``, and does not compute
+        a length of its own -- it did all three, and that is precisely the
+        defect: ``headers.get("Transfer-Encoding")`` is a question about
+        ONE SPELLING, and nineteen other spellings walked past it (a
+        space before the colon, an underscore, a dot, no separator at all,
+        a second Content-Length, a ``+`` sign) and were read as a body of
+        zero octets by ``_as_int(self.headers.get("Content-Length"), 0)``.
+        The unread octets then stayed on a keep-alive socket and were
+        framed as the next request line: one request in, two responses
+        out. The mint met the same defect first and closed it by deriving
+        the verdict from the length it can COMPUTE rather than from a
+        header it can NAME; this server now imports that rule instead of
+        having an opinion.
+
+        ``length is None`` is "there is no trustworthy statement of how
+        long this body is", which is NOT "the body is empty". That
+        distinction is the one the old reader collapsed, and collapsing it
+        is how a dropped or rewritten framing header became a silent zero.
+
+        THIS METHOD STOPS AT THE OCTETS, and the split is the point.
+        Everything it can refuse is a statement about the WIRE -- no
+        trustworthy length, more octets than this server will read, fewer
+        octets than the peer declared -- and every one of those leaves the
+        stream unframed, so every one of them costs the connection. What
+        the octets MEAN is _parse_body's question, it is asked after the
+        body is off the wire and the socket is framed again, and it costs
+        nothing. Reading and parsing in one method is what made a
+        malformed document close a connection that had nothing wrong with
+        it: the caller never reached its own ``drained = True``.
+        """
+        if length is None:
+            # A body-bearing request with no length this server can trust.
+            # Nothing is read -- _handle has already marked the connection
+            # to close, so the octets that were never read cannot frame
+            # anything.
+            raise GuiError(400, "unframable_request", UNFRAMABLE_DETAIL)
         if length > MAX_BODY_BYTES:
             raise GuiError(413, "too_large",
                            "That request body is too large for this GUI.")
         if length <= 0:
-            return {}
+            return b""
         try:
             raw = self.rfile.read(length)
         except OSError as exc:
             raise GuiError(400, "bad_request",
                            f"The request body did not arrive ({exc}).") from None
+        if len(raw) != length:
+            # Short read: the peer half-closed or died mid-body. Without
+            # this the truncated bytes either parsed as a shorter valid
+            # document -- accepting a call the caller never finished
+            # sending -- or surfaced as a confusing bad_json. Either way
+            # the stream is desynchronised and the connection does not
+            # survive it; _handle leaves close_connection set because the
+            # body never came off the wire.
+            raise GuiError(400, "bad_request",
+                           "The request body stopped short of the length it "
+                           "declared, so none of it was used.")
+        return raw
+
+    def _parse_body(self, raw: bytes) -> dict:
+        """What the octets MEAN. Called only after they are off the wire.
+
+        Nothing this method refuses is a framing failure, and nothing it
+        refuses closes the connection: by the time it runs, _handle has
+        already marked the stream drained and handed the socket back. That
+        is not a local opinion -- it is the call the mint
+        (impl/aicash/mintapi.py, "the connection survives"), the
+        supervision profile and the operator console all make for this
+        exact input, and this server used to be the one that disagreed
+        while its comment claimed it did not.
+        """
         try:
             obj = json.loads(raw or b"{}")
-        except ValueError:
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # json.loads says "no" in three ways and only ONE was caught.
+            # ValueError is the documented one (JSONDecodeError, and the
+            # bare ValueError CPython raises past its int/str digit limit,
+            # so `{"amount_mc": <5000 digits>}` lands here);
+            # UnicodeDecodeError is a ValueError and is named for the
+            # reader. RecursionError is the one that was not caught, and
+            # it is not a ValueError at all: `[[[[...` about ten thousand
+            # deep is a body well inside MAX_BODY_BYTES that blows the C
+            # parser's stack, and it escaped this clause to the blanket
+            # handler in _handle -- a 500 "internal_error" on every POST
+            # route of this server for a body that is simply malformed.
+            # The mint (aicash/mintapi.py), the supervision server and the
+            # operator console all widened this exact clause; nobody asked
+            # whether this reader had the same gap, and it did.
+            #
+            # All three are permanently bad bytes and none of them is
+            # this server failing. The body was fully read, so unlike the
+            # refusals in _read_body_bytes the stream is still framed and
+            # the connection does not have to die for it -- and now it does
+            # not. This sentence was here a round before the code did it:
+            # the parse lived inside the reader, so it raised BEFORE
+            # _handle's `drained = True`, and the finally clause closed the
+            # socket on every bad_json, including a body with an exact
+            # Content-Length and nothing left on the wire. A pipelined
+            # request behind it was discarded unanswered. Measured against
+            # all four servers, the mint and the supervision profile answer
+            # both requests on one connection; the console keeps the
+            # decision too (it hangs up regardless, because it never sets
+            # protocol_version and so answers HTTP/1.0). This server was
+            # alone, and the comment was the only place that said so.
             raise GuiError(400, "bad_json",
                            "The request body was not valid JSON.") from None
         if not isinstance(obj, dict):
@@ -2869,14 +3603,457 @@ class Handler(BaseHTTPRequestHandler):
                            "The request body must be a JSON object.")
         return obj
 
+    # -- lifecycle ------------------------------------------------------
+    def handle_one_request(self):
+        """No request leaves this server with no answer at all.
+
+        THE COVERAGE BOUNDARY OF THE BLANKET HANDLER, which is the thing
+        the last round enumerated around rather than through. _handle's
+        `try` starts AFTER the HTTP/0.9 refusal, AFTER
+        framing_fields(framing_verdict(...)) and AFTER the path and query
+        parsing, and -- being a try -- it does not cover its own `except`
+        and `finally` clauses either, where _error -> _json -> _send is
+        what writes to the socket. An exception in any of those places
+        leaves socketserver's handle_error to print a traceback and the
+        caller reading ZERO bytes: no status line, socket dropped. That is
+        the one outcome this round's bar names outright, and it is worse
+        than a 500, which is at least an answer a caller can act on.
+
+        Both sibling servers already have this hook for exactly that
+        reason (mint_console.py, impl/aicash/mintapi.py); this one did not,
+        and nothing in the enumeration asked why. It is a backstop and not
+        a licence: an exception arriving here is a bug in this file, and
+        the 500 says so rather than pretending the request was refused on
+        its merits.
+
+        What it does NOT claim is that nothing happened. /api/mint/issue
+        asks the mint to create money; an exception on the way back is
+        money that may exist. The sentence says the outcome is
+        undetermined, which is the same honesty rule the rest of this file
+        is written to.
+        """
+        self._answered = False
+        # Armed BEFORE the request line is read, which is what makes this
+        # whole-request rather than body-only, and what bounds a peer that
+        # connects and then says nothing at all.
+        #
+        # AND IT IS WHAT BOUNDS AN IDLE KEEP-ALIVE SOCKET TOO. The comment
+        # that used to stand here said the opposite -- that idle time
+        # between requests was governed by `timeout` alone -- and it was
+        # false, because `handle()` re-enters this method and the line
+        # below arms the deadline BEFORE the blocking read that waits for
+        # the next request line. MEASURED: a socket that took a 200 and
+        # then went silent was answered and closed at 10.0s, not 30. Ten
+        # seconds is comfortably above page.html's fastest poll (four
+        # seconds), which is the only legitimate thing that waits on an
+        # idle socket here. The disarm in the finally is still right -- a
+        # deadline left armed is state from a finished request -- but it is
+        # not what makes the next request's budget whole; the re-arm above
+        # is.
+        self.request_deadline = time.monotonic() + self.request_timeout
+        try:
+            super().handle_one_request()
+            self._answer_an_unfinished_request()
+        except OSError:
+            # A reset peer, a broken pipe, a timeout: the socket is gone,
+            # so there is nowhere to answer and nothing failed here.
+            self.close_connection = True
+        except Exception:                       # noqa: BLE001 -- see above
+            traceback.print_exc()
+            self.close_connection = True
+            if self._answered:
+                # A status line is already on the wire. A second response
+                # behind it is the desync, not the cure.
+                return
+            try:
+                self._error(
+                    500, "internal_error",
+                    "Something inside this GUI failed while answering that "
+                    "request, and it failed outside the part of it that "
+                    "knows how to describe a failure. Nothing was retried "
+                    "and nothing was assumed, and this server cannot tell "
+                    "whether the request took effect. The full detail, "
+                    "including which line failed, is on the terminal "
+                    "running app.py.")
+            except Exception:                   # noqa: BLE001
+                # The last resort failed too (a dead socket, most likely).
+                # There is nothing further to try and nothing to report to:
+                # swallowing it here at least keeps socketserver from
+                # printing a second traceback for the same request.
+                traceback.print_exc()
+        finally:
+            # Disarmed however this request ended. A deadline left armed
+            # would be spent by the NEXT request on a keep-alive socket,
+            # which would cut short a perfectly good one.
+            self.request_deadline = None
+
+    def _answer_an_unfinished_request(self) -> None:
+        """A request that ran out of clock is still answered.
+
+        THE LAST TWO SHAPES ON THIS SERVER THAT GOT NO STATUS LINE, and
+        both of them are a peer that began a request and never finished
+        it. MEASURED before this method existed, on all twenty-one routes:
+
+            GET /api/mint/status HTTP/1.1            (no CRLF, ever)
+            GET /api/mint/status HTTP/1.1\r\nHost: x\r\n  (no blank line)
+
+        ZERO BYTES in both cases, socket dropped at the deadline. The
+        read side was doing its job -- the thread and the fd came back at
+        ten seconds -- but the caller was told nothing, and "nothing" is
+        the one outcome this round's bar names outright. It is the same
+        answer whether that caller is a broken script, a proxy that died
+        mid-request, or a drip.
+
+        WHY THE BASE CLASS CANNOT DO IT. ``BaseHTTPRequestHandler``
+        wraps its whole request in ``except TimeoutError: close and
+        return`` -- silently, by design, because in the general case a
+        timed-out socket may be gone. Here it is usually not gone: a peer
+        dripping a header block is a peer still connected and still
+        reading, and 408 is the status RFC 7231 §6.5.7 defines for
+        precisely this ("the server did not receive a complete request
+        message within the time that it was prepared to wait") and which
+        it says to send with ``Connection: close``.
+
+        WHY IT IS SAFE TO ANSWER AN IDLE KEEP-ALIVE SOCKET THIS WAY, which
+        is the other thing that lands here. The deadline is armed before
+        the wait for the next request line, so a kept socket that goes
+        quiet for ten seconds gets this 408 instead of a silent close. A
+        408 with ``Connection: close`` on an idle persistent connection is
+        the ordinary, specified thing for a server to send, and it is
+        strictly more than the silent close it replaces: a client learns
+        that the connection is finished instead of inferring it from an
+        EOF. page.html polls every four seconds, so its own connection
+        never reaches this.
+
+        AND IF THE PEER REALLY IS GONE, the write fails and ``_send``
+        turns that into a closed connection with no traceback. Trying
+        costs one failed syscall; not trying costs every caller that was
+        still there an answer.
+        """
+        if self._answered:
+            return
+        deadline = self.request_deadline
+        if deadline is None or time.monotonic() < deadline:
+            # Not the clock: an EOF, a refusal already sent, a request
+            # answered on its merits. Nothing to add.
+            return
+        self._refuse_transport(
+            408, "request_timeout",
+            "This GUI reads one whole request -- request line, headers and "
+            "body together -- inside a fixed wall-clock budget, and that "
+            "budget ran out before the request was complete. Nothing was "
+            "dispatched, nothing took effect, and the connection is "
+            "closed. Send the request again in one piece.")
+
+    def parse_request(self) -> bool:
+        """Two transport decisions this server was making alone, taken here.
+
+        ``parse_request`` and not the top of ``_handle`` because this is
+        the one hook every request passes through -- including the methods
+        this file implements no ``do_*`` for, which the base class answers
+        501 from inside ``handle_one_request`` without any of this file
+        running at all. Returning False is the base class's own "stop, do
+        not dispatch" signal, so a refusal below is the complete answer to
+        that request. It is the mint's hook, for the mint's reason
+        (impl/aicash/mintapi.py, ``_Handler.parse_request``), and the
+        console's too.
+
+        ONE EMPTY LINE IN FRONT OF THE REQUEST. RFC 7230 §3.5 says a
+        server SHOULD ignore at least one empty line received before the
+        request line. The base class does not: an empty request line makes
+        ``words`` empty and ``parse_request`` return False with NOTHING
+        WRITTEN and the socket dropped. Measured on this server, on all
+        twenty-one routes, with a valid session cookie:
+        ``\r\nGET /api/mint/status HTTP/1.1\r\nHost: ...\r\n\r\n``
+        -- a perfectly well-formed request with one stray CRLF in front of
+        it, which is exactly what a client that terminated its last body
+        with an extra CRLF emits -- came back as ZERO BYTES and a closed
+        socket. The mint and the supervision profile answer it 200; this
+        server and the console silently discarded it. That is the "no
+        answer at all" class, on a shape the standard blesses, and it is
+        one of the three cells where four servers disagreed on identical
+        bytes.
+
+        THE CONSOLE'S HALF OF THAT CELL IS CLOSED TOO, as of 2026-09-17,
+        and a report written earlier in this round saying it was not is
+        stale: mint_console.py carries this block with its own 414 guard.
+        All four servers now answer one leading empty line. They do NOT
+        all answer the SECOND one the same way, and the paragraph below
+        says what each does, because a cross-server table nobody re-reads
+        is how the stale claim happened in the first place.
+
+        One line, not a loop: "at least one" is what the RFC asks for, and
+        a loop would let a peer hold a thread by trickling CRLFs -- though
+        now only until ``request_deadline`` expires, because this read
+        happens under the same wall clock as every other.
+
+        AND THE SECOND EMPTY LINE IS ANSWERED, not dropped, which is where
+        this file now goes past the mint on the same bytes and does so
+        deliberately. Two or three leading empty lines used to fall through
+        to the base class, whose ``parse_request`` finds no words in an
+        empty request line and returns False with NOTHING WRITTEN and the
+        socket dropped: measured at zero bytes on all twenty-one routes.
+        Declining to tolerate a second empty line is the right decision;
+        declining to SAY SO is the "no answer at all" class again, one
+        shape over. So the count stays at one and the refusal is a framed
+        400 with a length and ``Connection: close``.
+
+        WHERE THE FOUR SERVERS STAND ON THE SECOND EMPTY LINE, measured
+        2026-09-17, because this is now a cell they do not agree on and a
+        reader is owed the table rather than the half of it this file
+        implements:
+
+            mint / supervision   tolerate one, then silently discard
+            operator console     tolerate a bounded RUN
+                                 (MAX_LEADING_EMPTY_LINES), framed 400
+                                 past the cap
+            this server          tolerate one, framed 400 past it
+
+        All three of those ANSWER the shape the RFC blesses and none of
+        them can be held by a CRLF trickle. They differ only in how many
+        stray lines they forgive before refusing, and this file takes the
+        strictest of the three: it is never more permissive than a sibling,
+        so nothing reaches a route here that would not reach one there. The
+        rule belongs in aicash.mintapi so all four move together, and impl/
+        was not this round's to edit -- that is a real piece of unfinished
+        work and it is written here rather than left to be rediscovered.
+
+        A REQUEST TARGET THIS SERVER COULD NEVER ROUTE. RFC 7230 §5.3
+        gives a request target four forms. This server routes on
+        ``self.path`` verbatim, so only origin-form (``/api/...``) has
+        ever matched a route: absolute-form
+        (``http://127.0.0.1:8799/api/wallet/list``), asterisk-form
+        (``*``) and a bare relative path (``api/wallet/list``) never have
+        and never could. Being unroutable was never the problem. Answering
+        404 and then INVITING ANOTHER REQUEST on the same connection is
+        the part that was wrong, and this server was the only one of the
+        four that did it -- the mint and the supervision profile answer
+        400 and hang up, the console answers and hangs up. Measured, on
+        all three target forms, with a valid session cookie.
+
+        §5.3.2 says an origin server that accepts absolute-form must
+        ignore ``Host`` and route on the target's own authority; this
+        server does neither, so a request still addressed the way it would
+        be addressed to a proxy is a request whose two statements of
+        "which server is this for" this hop has not resolved -- and
+        ``_host_ok`` reads the one it is not routing on. That is the
+        framing disagreement one field over, so it is answered once and
+        the socket goes. Asterisk-form is refused with the rest rather
+        than exempted: it is defined for ``OPTIONS`` alone, no route here
+        answers ``OPTIONS``, and it was answered 404 on a REUSED
+        connection like the others.
+
+        THE VERSION CHECK IS DELIBERATELY NOT MOVED UP HERE, and the order
+        matters. ``_handle`` refuses HTTP/0.9 -- where ``send_response``,
+        ``send_header`` and ``end_headers`` are all no-ops and any answer
+        composed goes out as a naked body. If the target check below ran
+        for a 0.9 request line it would compose its own refusal into those
+        no-ops and emit exactly the naked body the 0.9 guard exists
+        against. So a 0.9 request line falls through untouched and is
+        refused as ``bad_version`` by ``_handle`` -- which is the mint's
+        precedence too (it takes the version first and the target second)
+        and therefore the same answer from both servers on the same bytes.
+        """
+        if self.raw_requestline in (b"\r\n", b"\n", b"\r"):
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                # ``handle_one_request``'s own guard, repeated because this
+                # read is ours. The fields set first are the ones
+                # ``send_error`` reads to frame its answer.
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(414)
+                return False
+            if not self.raw_requestline:
+                # EOF after the empty line. Nothing to answer, and nobody
+                # left to answer it to.
+                self.close_connection = True
+                return False
+            if self.raw_requestline in (b"\r\n", b"\n", b"\r"):
+                # A SECOND empty line, and the count stops at one. The
+                # base class would answer this with nothing at all -- see
+                # the docstring -- so it is answered here instead.
+                self._refuse_transport(
+                    400, "bad_request_line",
+                    "This GUI ignores one empty line before a request "
+                    "line, which is what RFC 7230 3.5 asks of it, and "
+                    "stops there: a server that skips empty lines in a "
+                    "loop can be held by a peer that sends nothing else. "
+                    "The second empty line is where a request line was "
+                    "expected. Nothing was dispatched and the connection "
+                    "is closed.")
+                return False
+        if not super().parse_request():
+            # Malformed request line, unsupported version, too many or too
+            # long headers: the base class has already answered, through
+            # this file's ``send_error`` override, which is what puts a
+            # status line and a length on it.
+            return False
+        if self.request_version == "HTTP/0.9":
+            # See the docstring: ``_handle`` owns this one, and answering
+            # anything here would answer it nakedly.
+            return True
+        if not self.path.startswith("/"):
+            self._refuse_transport(
+                400, "bad_request_target",
+                "This GUI answers origin-form request targets only -- a "
+                "path beginning with '/'. An absolute-form target "
+                "(http://host/path), an asterisk target (*) or a bare "
+                "relative path names no route here and never could, and "
+                "an absolute-form target states a destination host that "
+                "this server does not route on, which is a question about "
+                "where the request was going that this hop cannot answer. "
+                "Nothing was dispatched and the connection is closed.")
+            return False
+        return True
+
+    def handle_expect_100(self):
+        """An interim 100 is a PROMISE to read a body. Do not make one
+        this server has already decided to refuse.
+
+        THE ONE PATH THAT ANSWERS BEFORE THE FRAMING GATE.
+        `handle_expect_100` is called from
+        BaseHTTPRequestHandler.parse_request, and only when
+        protocol_version is at least HTTP/1.1. MEASURED, not assumed: this
+        server sets it, and so do impl/aicash/mintapi.py and the
+        supervision profile that inherits its handler, so the hook is live
+        on three of the four servers here; only the console leaves
+        protocol_version alone, answers HTTP/1.0, and never reaches it.
+        The console neutralised its copy anyway and has a test for it --
+        against the day someone sets protocol_version -- and nothing
+        carried that across to the two servers where it was already live.
+        Measured before this override, a `POST /api/wallet/pay` carrying
+        `Expect: 100-continue` together with `Transfer-Encoding: chunked`
+        (or a duplicated Content-Length) got
+
+            HTTP/1.1 100 Continue\r\n\r\n
+
+        -- a bare status line with no headers, inviting the peer to send a
+        body this server had already decided it would not frame -- and only
+        then the 400 and the hang-up. No desync followed, because the
+        refusal and the close follow immediately. It is still a response
+        emitted by a path that bypasses the gate the rest of this file is
+        built around -- and a live hook nobody sends the header to is
+        exactly how it survived two rounds of framing work here: 58
+        spellings at 55 routes, 3,190 cells, and not one of them carried
+        an Expect header.
+
+        So the gate is asked FIRST, from the same shared rule and with the
+        same caller fact _handle passes it, and the interim answer is sent
+        only for a request this server will actually read a body for.
+        Refusing here returns False, which makes parse_request return False
+        and handle_one_request stop: one response, then the close.
+        """
+        length, framed, _must_close, reason = framing_fields(
+            framing_verdict(self.headers,
+                            body_expected=self.command == "POST"))
+        if not framed:
+            self.close_connection = True
+            self._error(400, "unframable_request",
+                        f"{UNFRAMABLE_DETAIL} (framing: {reason})",
+                        "unknown")
+            return False
+        if length is not None and length > MAX_BODY_BYTES:
+            # The same refusal _read_body_bytes would give, given a
+            # hundred-continue earlier. Saying it now costs the caller one
+            # round trip instead of a megabyte of body nobody will read.
+            self.close_connection = True
+            self._error(413, "too_large",
+                        "That request body is too large for this GUI.")
+            return False
+        return super().handle_expect_100()
+
     # -- dispatch -------------------------------------------------------
     def _handle(self, method: str):
+        """Every request this server answers, of every method, starts here.
+
+        THE FRAMING GATE IS THE FIRST THING AND IT IS NOT METHOD-SPECIFIC.
+        An independent verifier found the GET routes of this server
+        smuggleable precisely because the previous author assumed only a
+        POST can carry a body: a GET with a declared Content-Length and a
+        second request in its body was answered, the body was never read,
+        and the octets left behind were framed as the next request line --
+        two responses out of one request, on a socket the server then
+        went on reusing. So the verdict is taken here, once, before
+        authorisation, before dispatch, before any route name is looked
+        up, and it is taken for GET and HEAD and OPTIONS and PUT exactly
+        as for POST. A method this file answers tomorrow inherits it by
+        existing.
+
+        The rule itself is not here and must not be: see framing_verdict.
+        """
         # A body we never read would leave the next request on a reused
         # connection misaligned, so any path that skips it closes instead.
         drained = False
         # One connection can carry many requests; nothing from the last one
         # may survive into this one.
         self._set_cookie = None
+        # What the BASE CLASS decided about reuse from the request line and
+        # the Connection header, before this method touched anything. A
+        # body read off the wire re-frames the socket, but it does not undo
+        # a `Connection: close` the client asked for.
+        peer_keeps_alive = not self.close_connection
+
+        if self.request_version == "HTTP/0.9":
+            # THE OTHER WAY TO EMIT A RESPONSE WITH NO STATUS LINE, found
+            # sweeping for the shape of the one in send_error(). HTTP/0.9
+            # has no status line and no headers, so send_response(),
+            # send_header() and end_headers() are all no-ops -- every
+            # answer this server composed for a 0.9 request went out as a
+            # naked body, JSON error envelopes included. Nothing that
+            # speaks to this GUI speaks 0.9 (it is a page, a browser and
+            # an fetch()), and a money server that answers in a protocol
+            # with no framing is a money server whose answers cannot be
+            # told from trailing octets. So it is refused, in HTTP/1.1,
+            # with a length, and the socket goes.
+            return self._refuse_transport(
+                400, "bad_version",
+                "This GUI answers HTTP/1.0 and HTTP/1.1. A request line "
+                "with no version on it is HTTP/0.9, which has no status "
+                "line, no headers and no way to state how long an answer "
+                "is -- so there is no honest way to answer one here.")
+
+        # WHETHER THIS FILE IS ABOUT TO READ A BODY -- the one caller fact
+        # the shared rule needs. It is NOT a guess about which HTTP methods
+        # may carry a body; that guess is exactly what left the GET routes
+        # smuggleable. It is a fact about the dispatch below:
+        # `_read_body_bytes` is called on the POST branch and on no
+        # other. The rule uses it only to decide what an ABSENT
+        # Content-Length means. On a body
+        # about to be read, "no Content-Length" is not "no body", it is "no
+        # statement" -- and no statement is what every mangled, dropped or
+        # front-end-rewritten framing header degrades into by the time this
+        # parser sees it. On every other method the routes read nothing, so
+        # an absent length is the ordinary case for every conforming client
+        # and means zero octets; refusing there would cost keep-alive on
+        # every well-formed GET and buy nothing. A GET that DECLARES a body
+        # is a different thing entirely, and the rule closes on it.
+        body_expected = method == "POST"
+        length, framed, must_close, reason = framing_fields(
+            framing_verdict(self.headers, body_expected=body_expected))
+        if must_close or length:
+            # must_close: unframable, or framed octets this caller has
+            # already said it will not read. `length`: octets on the wire
+            # that nothing has read YET -- a POST that goes on to read its
+            # body whole puts the connection back a few lines down. Set
+            # NOW, not in a `finally` that runs after the response headers
+            # are already on the socket: that is what made the old teardown
+            # a silent hang-up with no `Connection: close` for a peer to
+            # act on.
+            self.close_connection = True
+        if not framed:
+            # THE ONE VERDICT THAT IS SAFE WHICHEVER WAY ANOTHER HOP
+            # RESOLVES IT. The rule returns no status code and no envelope
+            # -- its four callers use three different vocabularies -- so
+            # the 400, the reason word and the sentence are this server's
+            # own; only the machine slug is the rule's, and it is passed
+            # through so a caller driving the API directly can tell a
+            # chunked body from a duplicated length.
+            return self._error(400, "unframable_request",
+                               f"{UNFRAMABLE_DETAIL} (framing: {reason})",
+                               "unknown")
+
         raw_path, _, raw_query = self.path.partition("?")
         path = urllib.parse.unquote(raw_path).rstrip("/") or "/"
         query = {k: v[-1] for k, v in urllib.parse.parse_qs(raw_query).items()}
@@ -2911,25 +4088,75 @@ class Handler(BaseHTTPRequestHandler):
                         f"{method}.")
                 return self._error(404, "not_found", f"No API route {path}.")
             if method == "POST":
-                body = self._read_body()
+                raw = self._read_body_bytes(length)
                 drained = True
+                if peer_keeps_alive and not must_close:
+                    # The body is off the wire in its entirety, so the
+                    # stream is framed again and the socket is reusable --
+                    # unless the peer asked to close, or the shared rule
+                    # said this request's connection must not be reused
+                    # whatever else happens.
+                    self.close_connection = False
+                # AND THE PARSE COMES AFTER THAT, deliberately. Whether the
+                # octets are JSON, whether they are an object, whether a
+                # route likes them: none of that is a fact about the
+                # stream, so none of it may take the connection down. Doing
+                # the parse inside the reader put it BEFORE these two
+                # lines, which is how `bad_json` -- and only bad_json,
+                # never a route's own refusal of a valid document -- hung
+                # up on a socket that was perfectly well framed.
+                body = self._parse_body(raw)
             else:
                 body = {}
             result = getattr(self.api, name)(query, body)
             return self._json(200, result)
         except GuiError as exc:
             return self._error(exc.status, exc.reason, exc.detail, exc.cause)
-        except Exception as exc:
-            # The whole point of this clause: the operator gets one sentence,
-            # never a stack trace, and the trace goes to this process's stderr
-            # where it belongs.
+        except Exception:
+            # The whole point of this clause: the operator gets one
+            # sentence, never a stack trace, and the trace goes to this
+            # process's stderr where it belongs.
+            #
+            # AND NOT THE EXCEPTION'S OWN TEXT EITHER. An interpreter
+            # message is a traceback by another name and it quotes
+            # whatever the caller sent: a five-thousand-digit amount_mc
+            # landed here as
+            # "Exceeds the limit (4300 digits) for integer string
+            # conversion: value has 5000 digits; use
+            # sys.set_int_max_str_digits()...", which told the operator
+            # nothing, told an attacker the interpreter's configuration,
+            # and echoed the caller's own input back out of a money
+            # server. The trace goes to this process's stderr, where it
+            # belongs and where the operator can read it; the page gets one
+            # sentence and no interpreter vocabulary at all.
             traceback.print_exc()
+            if self._answered:
+                # A STATUS LINE IS ALREADY ON THE WIRE, so a 500 behind it
+                # is not a cure, it is the desync. This clause used to
+                # answer unconditionally and never read this flag -- only
+                # the outer backstop in handle_one_request did -- so a
+                # response that failed PART WAY THROUGH ITS OWN WRITE got a
+                # second, complete response appended to the partial one,
+                # and the attempt bought the peer another whole write
+                # window on a socket that had just proved it would not take
+                # one (measured: 65.0s of hold on a 400-deep pipeline where
+                # 30 of it was this recovery). _send now turns a failed
+                # write into a closed connection by itself, so this is the
+                # second lock and not the first.
+                self.close_connection = True
+                return None
             return self._error(
                 500, "internal_error",
-                f"{type(exc).__name__}: {exc}. The full detail is in the "
-                f"terminal running app.py.")
+                "Something inside this GUI failed while answering that "
+                "request, and it was not a failure this server knows how "
+                "to describe. Nothing was retried and nothing was assumed. "
+                "The full detail, including which line failed, is on the "
+                "terminal running app.py.")
         finally:
-            if method not in ("GET", "HEAD") and not drained:
+            if not drained and (length or must_close):
+                # A declared body nothing read. Already set above; repeated
+                # here because the POST path CLEARS it on a whole read and
+                # an exception can land between that read and this line.
                 self.close_connection = True
 
     def _serve_page(self):
@@ -2982,16 +4209,50 @@ class Handler(BaseHTTPRequestHandler):
         cannot parse, a method with no handler, an over-long header block.
         Its default body is HTML; the contract here says every failure is
         {"error": {"reason", "detail"}}.
+
+        AND IT STILL GETS A STATUS LINE. ``parse_request`` sets
+        ``request_version`` to HTTP/0.9 BEFORE it tries to read the request
+        line, and in HTTP/0.9 ``send_response``, ``send_header`` and
+        ``end_headers`` are all no-ops -- so for an unparseable request
+        line this override used to write its JSON body to the socket RAW,
+        with no status line and no headers of any kind. On a pipelined
+        connection that landed appended past the previous response's
+        declared Content-Length: on the wire, a bodiless-protocol response
+        glued onto the end of a well-formed one, which is the same
+        trailing-octet primitive the framing rule exists to close, arriving
+        from the other direction. A client reading by Content-Length is
+        handed the first response and then a tail of bytes that are not
+        part of it.
+
+        So a failure this server cannot attribute to a version is answered
+        in HTTP/1.1: a status line, a Content-Length, ``Connection: close``,
+        and then the socket goes. A peer that really did speak HTTP/0.9
+        gets a response it may not parse -- but it has just been refused
+        and hung up on, and every other server on the internet answers it
+        the same way. The alternative, which is what was here, is bytes
+        with no framing at all.
         """
-        self.close_connection = True
+        # The close, the version and the two fields send_response reads
+        # are _refuse_transport's, not this method's: this is the base
+        # class's transport refusal arriving through the library's own
+        # hook, and it is the same kind of answer as the four below it.
+        # Spelling them here as well is how a fifth spelling of "close and
+        # answer" gets into a file that is removing exactly that.
         short, long = self.responses.get(
             code, ("error", "The request could not be handled."))
         detail = explain or long
         if message and message != short:
             detail = f"{message}. {detail}"
+        # The base class's message for an unparseable request line is
+        # "Bad request syntax (%r)" % the request line, and a request line
+        # is allowed to be 64 KiB. Unbounded, that is 64 KiB of the
+        # caller's own bytes reflected out of a money server's error body.
+        # The first 200 characters say which request failed; the rest only
+        # says it at greater length.
+        detail = _bounded(detail, 200)
         try:
-            self._error(int(code), _Components._reason(message or short),
-                        str(detail))
+            self._refuse_transport(
+                int(code), _Components._reason(message or short), detail)
         except Exception:  # the socket is already gone; nothing to report to
             pass
 

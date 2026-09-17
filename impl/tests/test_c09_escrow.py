@@ -166,8 +166,13 @@ class EscrowTest(unittest.TestCase):
             expiries[m] = expiry
             for a in arbs:
                 attestations.extend(a.attest_rungs(job_id, m, rungs, fee_mc=fee_mc))
-        payee = EscrowPayee(client, MINT_ID, pubs)
-        fee_acct = EscrowPayee(client, MINT_ID, pubs)
+        # Both secret holders keep their OWN copy of the offer's milestone
+        # schedule — verify_funding re-derives the §9.3 deadline ordering
+        # from it rather than from the payer's handoff.
+        payee = EscrowPayee(client, MINT_ID, pubs, milestones,
+                            settlement_margin_ms=MARGIN)
+        fee_acct = EscrowPayee(client, MINT_ID, pubs, milestones,
+                               settlement_margin_ms=MARGIN)
         hashes = dict(payee.generate_output_hashes(attestations))
         hashes.update(fee_acct.generate_output_hashes(attestations, kinds=("fee",)))
         token = self.issue_token(mint, funding_mc)
@@ -326,6 +331,102 @@ class EscrowTest(unittest.TestCase):
                 {1: expiry - 1},  # one ms below the conformant minimum
             )
 
+    def test_b2_payee_rechecks_deadline_ordering_independently(self):
+        """B2 (regression): the payee re-derives T_m >= decision_deadline +
+        grace_ms + settlement_margin from the OFFER IT HOLDS, so a payer
+        that funds a lock expiring before the decision is due is caught by
+        verify_funding — before any work.  Trusting the payer's handed-over
+        expiries (self-consistent with the ledger, but arithmetic done by
+        the counterparty) reconstructs refund-after-delivery through the
+        very check that is supposed to prevent it."""
+        mint = self.start_mint()
+        client = self.client(mint)
+        arb = Arbiter("solo")
+        pubs = {"solo": arb.public}
+        evd, dec, honest_expiry = self.deadlines(1)
+        # The offer BOTH sides agreed to.
+        offer = [{"m": 1, "evidence_deadline": evd, "decision_deadline": dec}]
+
+        def fund_short(job_id: str):
+            """A payer that funds one ms before the agreed decision
+            deadline.  Its own fund() ordering check passes: the check is
+            over the deadlines the PAYER supplies, and the payer supplies
+            an earlier, invented decision deadline."""
+            atts = arb.attest_rungs(job_id, 1, [400])
+            holder = EscrowPayee(client, MINT_ID, pubs, offer,
+                                 settlement_margin_ms=MARGIN)
+            hashes = holder.generate_output_hashes(atts)
+            payer = EscrowPayer(
+                client, MINT_ID, [self.issue_token(mint, 500)],
+                settlement_margin_ms=MARGIN, arbiter_pubs=pubs,
+            )
+            short = dec - 1  # expires BEFORE the decision is even due
+            fake_dec = short - GRACE - MARGIN
+            self.assertGreater(fake_dec, evd)
+            self.assertEqual(compute_deadlines(evd, fake_dec, GRACE, MARGIN), short)
+            info = payer.fund(
+                job_id,
+                [{"m": 1, "evidence_deadline": evd,
+                  "decision_deadline": fake_dec}],
+                atts, hashes, {1: short},
+            )
+            self.assertLess(info.expiries[1], dec)  # the whole attack
+            return payer, holder, atts, info
+
+        # The handed-over info is perfectly self-consistent with the ledger
+        # — and still refused, naming the offending milestone and rung.
+        payer, payee, atts, info = fund_short("f1")
+        with self.assertRaises(FundingInvalid) as ctx:
+            payee.verify_funding(info, atts)
+        self.assertEqual(ctx.exception.milestone, 1)
+        self.assertEqual(ctx.exception.rung, 0)
+        self.assertIn("conformant minimum", str(ctx.exception))
+        self.assertIn(str(honest_expiry), str(ctx.exception))
+        # Nothing is pinned, so redemption stays refused (mandatory check).
+        with self.assertRaises(EscrowError):
+            payee.redeem(1, [])
+
+        # The schedule is not optional: a payee that never received the
+        # offer cannot run the §9.3 check, and says so instead of passing.
+        blind = EscrowPayee(client, MINT_ID, pubs)
+        blind._secrets = dict(payee._secrets)
+        with self.assertRaises(EscrowError) as ctx:
+            blind.verify_funding(info, atts)
+        self.assertIn("milestone schedule", str(ctx.exception))
+        # Passing the offer at call time works the same way.
+        with self.assertRaises(FundingInvalid):
+            blind.verify_funding(info, atts, milestones=offer)
+
+        # Load-bearing: the payee that skips the check does the work and
+        # holds nothing.  The arbiter releases conformantly, exactly at the
+        # decision deadline — and the lock has already opened the refund
+        # path, so the payer takes the whole job back.
+        payer2, payee2, atts2, _info2 = fund_short("f1b")
+        mint.clock.set(dec)
+        v = arb.vote("f1b", 1, {"e": 1}, "release")
+        r = arb.reveal("f1b", 1, 1, votes=[v])
+        with self.assertRaises(MintRejected) as mctx:
+            payee2.redeem(1, [r], allow_unverified=True)
+        self.assertIn(
+            {"index": 0, "kind": "input", "reason": "lock_expired"},
+            mctx.exception.errors,
+        )
+        self.assertEqual(payee2.balance(), 0)
+        self.assertEqual(payer2.refund_expired(1), 396)  # 400 − 4 burn
+
+        # The margin is the PAYEE's own requirement: a payee that needs
+        # more settlement headroom than the payer allowed refuses funding
+        # that is conformant at the payer's margin.
+        job = self.make_job(mint, "f1c", [arb], {1: [400]}, funding_mc=500,
+                            verify=False)
+        strict = EscrowPayee(client, MINT_ID, pubs, job.milestones,
+                             settlement_margin_ms=MARGIN + 1)
+        strict._secrets = dict(job.payee._secrets)
+        with self.assertRaises(FundingInvalid) as ctx:
+            strict.verify_funding(job.info, job.attestations)
+        self.assertIn("conformant minimum", str(ctx.exception))
+        job.payee.verify_funding(job.info, job.attestations)  # at MARGIN: fine
+
     # ------------------------------------------------------------------
     # B3 — the self-invented-preimage attack
     # ------------------------------------------------------------------
@@ -341,9 +442,11 @@ class EscrowTest(unittest.TestCase):
         arb = Arbiter("solo")
         pubs = {"solo": arb.public}
         atts = arb.attest_rungs("b3", 1, [100, 100, 100])
-        payee = EscrowPayee(client, MINT_ID, pubs)
+        evd, dec, expiry = self.deadlines(1)
+        offer = [{"m": 1, "evidence_deadline": evd, "decision_deadline": dec}]
+        payee = EscrowPayee(client, MINT_ID, pubs, offer,
+                            settlement_margin_ms=MARGIN)
         hashes = payee.generate_output_hashes(atts)
-        _evd, _dec, expiry = self.deadlines(1)
 
         # The ATTACKER funds manually: rung 2 locked to its own preimage.
         attacker_preimage = new_secret()
@@ -541,8 +644,12 @@ class EscrowTest(unittest.TestCase):
         )
         client = self.client(mint)
         pubs2 = {"solo2": evil_arb.public}
-        payee2 = EscrowPayee(client, MINT_ID, pubs2)
-        fee2 = EscrowPayee(client, MINT_ID, pubs2)
+        evd0, dec0, _exp0 = self.deadlines(1)
+        offer2 = [{"m": 1, "evidence_deadline": evd0, "decision_deadline": dec0}]
+        payee2 = EscrowPayee(client, MINT_ID, pubs2, offer2,
+                             settlement_margin_ms=MARGIN)
+        fee2 = EscrowPayee(client, MINT_ID, pubs2, offer2,
+                           settlement_margin_ms=MARGIN)
         hashes2 = dict(payee2.generate_output_hashes(atts + [evil_fee]))
         hashes2.update(
             fee2.generate_output_hashes(atts + [evil_fee], kinds=("fee",))
@@ -578,8 +685,13 @@ class EscrowTest(unittest.TestCase):
         mint = self.start_mint()
         client = self.client(mint)
 
-        # Happy path.
-        cta = CommitThenAccept(client, MINT_ID, redemption_margin_ms=MARGIN)
+        # Happy path.  The worker holds its OWN copy of the agreed terms:
+        # amount, expiry, and the moment acceptance is due by.
+        cta = CommitThenAccept(
+            client, MINT_ID, redemption_margin_ms=MARGIN,
+            agreed_amount_mc=500, agreed_expiry=T0 + HOUR,
+            accept_by=T0 + 30 * MIN,
+        )
         wh = cta.worker_hash()
         cta.payer_commit(wh, 500, T0 + HOUR, [self.issue_token(mint, 600)])
         cta.worker_verify()  # committed funds confirmed before work starts
@@ -616,7 +728,90 @@ class EscrowTest(unittest.TestCase):
         cta3 = CommitThenAccept(client, MINT_ID, redemption_margin_ms=MARGIN)
         cta3.worker_hash()
         with self.assertRaises(FundingInvalid):
-            cta3.worker_verify(amount_mc=500, expiry=T0 + 3 * HOUR)
+            cta3.worker_verify(
+                amount_mc=500, expiry=T0 + 3 * HOUR, accept_by=T0 + 2 * HOUR
+            )
+
+    def test_b6_worker_rechecks_the_acceptance_window(self):
+        """B6 (regression, the §9.4 analogue of F1): worker_verify checks
+        the committed lock against the WORKER's own terms and re-derives
+        the §9.4 ordering — expiry >= accept_by + grace_ms +
+        redemption_margin — from them.  Before, it compared the ledger
+        only against the attributes payer_commit had just written on the
+        same object (so the check reduced to 'the payer agrees with
+        itself') and performed no expiry-ordering check at all, leaving a
+        worker free to verify, do the work, and find the commitment
+        expiring before any conformant acceptance could arrive."""
+        mint = self.start_mint()
+        client = self.client(mint)
+        # The agreement: 500 mc, acceptance due by T0 + 1h.
+        accept_by = T0 + HOUR
+        conformant = accept_by + GRACE + MARGIN  # the minimum honest expiry
+
+        # The payer commits a lock expiring exactly when acceptance is due:
+        # its own §9.4 reveal deadline is GRACE + MARGIN BEFORE that.
+        short = CommitThenAccept(
+            client, MINT_ID, redemption_margin_ms=MARGIN,
+            agreed_amount_mc=500, accept_by=accept_by,
+        )
+        wh = short.worker_hash()
+        short.payer_commit(wh, 500, accept_by, [self.issue_token(mint, 600)])
+        with self.assertRaises(FundingInvalid) as ctx:
+            short.worker_verify()
+        self.assertIn("conformant minimum", str(ctx.exception))
+        self.assertIn(str(conformant), str(ctx.exception))
+
+        # Load-bearing: without the ordering check every other check passes
+        # — a worker that simply took the payer's framing (accept_by = the
+        # payer's own derived reveal deadline) verifies happily ...
+        negligent = short.reveal_deadline()
+        self.assertLess(negligent, accept_by)  # the whole point
+        short.worker_verify(accept_by=negligent)
+        # ... and at the acceptance moment it agreed to, there is no
+        # payment path left: a conformant acceptance is already late, and
+        # the payer takes the funds back at expiry.
+        mint.clock.set(accept_by)
+        with self.assertRaises(LateReveal):
+            short.payer_reveal()
+        self.assertEqual(short.payer_refund(), 495)  # 500 − 5 burn
+
+        # The terms are the worker's own: payer_commit writing amount_mc
+        # and expiry onto this object is not a substitute for them.
+        mint2 = self.start_mint()
+        client2 = self.client(mint2)
+        blind = CommitThenAccept(client2, MINT_ID, redemption_margin_ms=MARGIN)
+        wh2 = blind.worker_hash()
+        blind.payer_commit(wh2, 500, conformant, [self.issue_token(mint2, 600)])
+        self.assertEqual(blind.amount_mc, 500)  # the PAYER's copy is set ...
+        with self.assertRaises(EscrowError) as ctx:  # ... and is not used
+            blind.worker_verify()
+        self.assertIn("agreed amount", str(ctx.exception))
+        with self.assertRaises(EscrowError) as ctx:
+            blind.worker_verify(amount_mc=500)
+        self.assertIn("acceptance deadline", str(ctx.exception))
+        # With the worker's own terms supplied, the honest commitment
+        # verifies and the session completes.
+        blind.worker_verify(amount_mc=500, expiry=conformant,
+                            accept_by=accept_by)
+        self.assertEqual(blind.worker_redeem(blind.payer_reveal()), 495)
+
+        # The window must also still be open when the worker verifies: a
+        # commitment whose reveal deadline has passed can no longer be
+        # accepted conformantly, so work must not start on it.
+        late = CommitThenAccept(
+            client2, MINT_ID, redemption_margin_ms=MARGIN,
+            agreed_amount_mc=500, agreed_expiry=conformant,
+            accept_by=accept_by,
+        )
+        wh3 = late.worker_hash()
+        late.payer_commit(wh3, 500, conformant, [self.issue_token(mint2, 600)])
+        late.worker_verify()  # fine while the window is open
+        mint2.clock.set(late.reveal_deadline() + 1)
+        with self.assertRaises(FundingInvalid) as ctx:
+            late.worker_verify()
+        self.assertIn("acceptance window is already closed", str(ctx.exception))
+        with self.assertRaises(LateReveal):  # and indeed it is
+            late.payer_reveal()
 
     # ------------------------------------------------------------------
     # B7 — k-of-n arithmetic and vote binding
@@ -730,7 +925,8 @@ class EscrowTest(unittest.TestCase):
         client = self.client(mint)
 
         def fresh_payee() -> EscrowPayee:
-            p = EscrowPayee(client, MINT_ID, pubs)
+            p = EscrowPayee(client, MINT_ID, pubs, job.milestones,
+                            settlement_margin_ms=MARGIN)
             p._secrets = dict(job.payee._secrets)  # same holder, fresh state
             return p
 
@@ -769,6 +965,34 @@ class EscrowTest(unittest.TestCase):
                 dataclasses.replace(job.info, expiries=wrong), job.attestations
             )
 
+        # An expiry the handoff simply omits: a named refusal, not a
+        # KeyError out of the mandatory check.
+        gone = {k: v for k, v in job.info.expiries.items() if k != 2}
+        with self.assertRaises(FundingInvalid) as ctx:
+            fresh_payee().verify_funding(
+                dataclasses.replace(job.info, expiries=gone), job.attestations
+            )
+        self.assertEqual(ctx.exception.milestone, 2)
+        self.assertIn("no expiry", str(ctx.exception))
+
+        # A milestone the payee never agreed to: it holds no deadlines for
+        # it, so it cannot check the §9.3 ordering and refuses to pretend.
+        partial = EscrowPayee(client, MINT_ID, pubs, job.milestones[:1],
+                              settlement_margin_ms=MARGIN)
+        partial._secrets = dict(job.payee._secrets)
+        with self.assertRaises(FundingInvalid) as ctx:
+            partial.verify_funding(job.info, job.attestations)
+        self.assertEqual(ctx.exception.milestone, 2)
+        self.assertIn("offer", str(ctx.exception))
+
+        # A handoff naming a different mint than the one we just queried.
+        with self.assertRaises(FundingInvalid) as ctx:
+            fresh_payee().verify_funding(
+                dataclasses.replace(job.info, mint_id="othermint"),
+                job.attestations,
+            )
+        self.assertIn("othermint", str(ctx.exception))
+
         # A spent output: refund milestone 1, then re-verify.
         mint.clock.set(job.expiries[1])
         job.payer.refund_expired(1)
@@ -776,6 +1000,98 @@ class EscrowTest(unittest.TestCase):
             fresh_payee().verify_funding(job.info, job.attestations)
         self.assertEqual(ctx.exception.milestone, 1)
         self.assertIn("spent", str(ctx.exception))
+
+    def test_verify_funding_refuses_a_pruned_handoff(self):
+        """F1 sibling (regression): the funded set is checked for
+        COMPLETENESS against what the payee knows on its own — the offer's
+        milestone list and the outputs it generated secrets for — not just
+        against the attestation list the payer chose to present.  A payer
+        that prunes BOTH sides of the handoff in step (funding one
+        milestone of two, or two rungs of three, and handing over only the
+        matching attestations) otherwise passes every other check, and the
+        payee starts the job with no escrow behind the dropped part."""
+        mint = self.start_mint()
+        client = self.client(mint)
+        arb = Arbiter("solo")
+        pubs = {"solo": arb.public}
+        evd1, dec1, exp1 = self.deadlines(1)
+        evd2, dec2, exp2 = self.deadlines(2)
+        m1 = {"m": 1, "evidence_deadline": evd1, "decision_deadline": dec1}
+        m2 = {"m": 2, "evidence_deadline": evd2, "decision_deadline": dec2}
+
+        # -- milestone-level pruning: the offer has two, the payer funds one.
+        offer = [m1, m2]
+        atts1 = arb.attest_rungs("prune", 1, [100, 100])
+        atts2 = arb.attest_rungs("prune", 2, [100])
+        payee = EscrowPayee(client, MINT_ID, pubs, offer,
+                            settlement_margin_ms=MARGIN)
+        hashes = payee.generate_output_hashes(atts1 + atts2)
+        payer = EscrowPayer(
+            client, MINT_ID, [self.issue_token(mint, 400)],
+            settlement_margin_ms=MARGIN, arbiter_pubs=pubs,
+        )
+        # Real, honest, on-ledger funding — of milestone 1 only.
+        info1 = payer.fund("prune", [m1], atts1, hashes, {1: exp1})
+        with self.assertRaises(FundingInvalid) as ctx:
+            payee.verify_funding(info1, atts1)
+        self.assertEqual(ctx.exception.milestone, 2)
+        self.assertIn("not funded", str(ctx.exception))
+        with self.assertRaises(EscrowError):
+            payee.redeem(1, [])  # nothing pinned: the job cannot start
+
+        # Load-bearing, and not a blanket refusal of partial funding: the
+        # SAME handoff passes for a payee whose own offer is milestone 1
+        # (every other check — signatures, hashes, ledger state, §9.3
+        # ordering — is satisfied by it), which is what made the pruned
+        # version sail through before.
+        one_m = EscrowPayee(client, MINT_ID, pubs, [m1],
+                            settlement_margin_ms=MARGIN)
+        one_m._secrets = {k: v for k, v in payee._secrets.items() if k[0] == 1}
+        one_m.verify_funding(info1, atts1)
+
+        # -- rung-level pruning: three rungs attested and hashed, two funded.
+        atts3 = arb.attest_rungs("rungs", 1, [100, 100, 100])
+        payee3 = EscrowPayee(client, MINT_ID, pubs, [m1],
+                             settlement_margin_ms=MARGIN)
+        hashes3 = payee3.generate_output_hashes(atts3)
+        payer3 = EscrowPayer(
+            client, MINT_ID, [self.issue_token(mint, 400)],
+            settlement_margin_ms=MARGIN, arbiter_pubs=pubs,
+        )
+        info3 = payer3.fund("rungs", [m1], atts3[:2], hashes3, {1: exp1})
+        with self.assertRaises(FundingInvalid) as ctx:
+            payee3.verify_funding(info3, atts3[:2])
+        self.assertEqual((ctx.exception.milestone, ctx.exception.rung), (1, 2))
+        self.assertIn("not fund", str(ctx.exception))
+
+        # Load-bearing again: a payee that only ever generated the two
+        # funded secrets accepts the identical handoff.
+        two_rungs = EscrowPayee(client, MINT_ID, pubs, [m1],
+                                settlement_margin_ms=MARGIN)
+        two_rungs._secrets = {
+            k: v for k, v in payee3._secrets.items() if k[2] != 2
+        }
+        two_rungs.verify_funding(info3, atts3[:2])
+
+        # -- the panel's fee account is covered the same way: its fee
+        # output dropped from the funding is a named refusal, not silence.
+        atts4 = arb.attest_rungs("fees", 1, [100], fee_mc=50)
+        payee4 = EscrowPayee(client, MINT_ID, pubs, [m1],
+                             settlement_margin_ms=MARGIN)
+        fee4 = EscrowPayee(client, MINT_ID, pubs, [m1],
+                           settlement_margin_ms=MARGIN)
+        hashes4 = dict(payee4.generate_output_hashes(atts4))
+        hashes4.update(fee4.generate_output_hashes(atts4, kinds=("fee",)))
+        rung_only = [a for a in atts4 if a["rung"] != "fee"]
+        payer4 = EscrowPayer(
+            client, MINT_ID, [self.issue_token(mint, 400)],
+            settlement_margin_ms=MARGIN, arbiter_pubs=pubs,
+        )
+        info4 = payer4.fund("fees", [m1], rung_only, hashes4, {1: exp1})
+        payee4.verify_funding(info4, rung_only)  # the payee's rungs are funded
+        with self.assertRaises(FundingInvalid) as ctx:
+            fee4.verify_funding(info4, rung_only)
+        self.assertEqual(ctx.exception.rung, "fee")
 
     # ------------------------------------------------------------------
     # wire form — FundingInfo.to_dict / from_dict (§9.3 handoff)

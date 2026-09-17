@@ -31,6 +31,8 @@ Three kinds of test, because this component has three kinds of claim.
 
 Run:  cd <repo> && python3 -m unittest gui.test_app -v
 """
+import email.parser
+import ast
 import errno
 import http.client
 import http.server
@@ -5030,6 +5032,28 @@ class TestTheStatesNextDoor(unittest.TestCase):
 # level, a workdir that really has never been touched, a supervision file
 # really left behind by a mint this GUI never started.
 # ======================================================================
+def page_timeouts_ms() -> dict:
+    """EVERY fetch deadline page.html declares, not only the default.
+
+    The round that sized this server's read budget argued it from "the
+    page aborts at 20s", which is true of nineteen of the twenty-one
+    routes and false of two: page.html declares
+    ``{default: 20000, start: 90000, stop: 70000}`` and gives
+    /api/mint/start and /api/mint/stop their own longer patience because a
+    supervised process transition is slow to ANSWER. The premise a budget
+    is argued from has to be the whole object, so this reads the whole
+    object and the pin below takes the SMALLEST of them.
+    """
+    with open(os.path.join(REPO, "gui", "page.html")) as handle:
+        source = handle.read()
+    match = re.search(r"TIMEOUTS\s*=\s*\{([^}]*)\}", source)
+    assert match, "page.html no longer declares TIMEOUTS"
+    found = dict((name, int(value)) for name, value
+                 in re.findall(r"(\w+)\s*:\s*(\d+)", match.group(1)))
+    assert found, "page.html's TIMEOUTS declares no numbers"
+    return found
+
+
 def page_abort_ms() -> int:
     """page.html's OWN default fetch deadline, read out of page.html.
 
@@ -5225,10 +5249,34 @@ class TestTokenLookupIsAReading(RealMintCase):
         self.assertNotEqual(first["result"]["state"], second["result"]["state"])
 
     def test_two_readings_are_two_moments(self):
+        """Two lookups of one key are two datable readings, not one fact.
+
+        Polled on a MONOTONIC deadline rather than slept through. The old
+        form was ``time.sleep(1.1)`` against a stamp with one-second
+        granularity -- a hundred milliseconds of margin, on a wall clock
+        that this test does not own. Any backward step of that size (an
+        ntp correction, a suspended laptop, a VM clock resync) made the
+        second reading land in the same second as the first and failed the
+        last assertion. It failed once in a full run and passed
+        twenty-five times in isolation, which is what a hundred
+        milliseconds of margin looks like from the outside.
+
+        Nothing here is weakened: all three assertions below are the
+        original ones. What changed is that the test waits for the
+        property it is about -- a reading taken in a later second -- and
+        gives up on a monotonic clock, which no wall-clock step can move.
+        On an ordinary run it finishes sooner than the old sleep did.
+        """
         token = self.issued_token()
         one = self.ok(self.lookup(token), "first")
-        time.sleep(1.1)
-        two = self.ok(self.lookup(token), "second")
+        deadline = time.monotonic() + 30.0
+        two = one
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            two = self.ok(self.lookup(token), "second")
+            if (two["observed_at_ms"] > one["observed_at_ms"]
+                    and two["result"]["as_of"] != one["result"]["as_of"]):
+                break
         self.assertEqual(one["result"]["state"], two["result"]["state"])
         self.assertLess(one["observed_at_ms"], two["observed_at_ms"])
         self.assertNotEqual(one["result"]["as_of"], two["result"]["as_of"])
@@ -6217,3 +6265,3749 @@ class TestTheRecoveryPanelDoesNotPointAtARowThatIsNotThere(unittest.TestCase):
     def test_a_server_that_named_no_operation_is_unchanged(self):
         """The pre-existing branch keeps its own sentence."""
         self.assertIn("names no operation", self.out["unnamed"])
+
+
+# ======================================================================
+# ONE FRAMING RULE, FOR EVERY SERVER IN THIS REPOSITORY
+#
+# The history this section exists because of: a request-framing defect was
+# reported against the mint by an outside reviewer, fixed there, found to
+# have been fixed for ONE SPELLING of one header name, and fixed again
+# properly -- and then an independent verifier pointed the same
+# twenty-five spellings at THIS server, which nobody had swept, and found
+# nineteen of them still working on every POST route and all twenty-five
+# on every GET route. The GET routes were worse than the POST ones because
+# they had no guard of any kind: a GET carrying a declared Content-Length
+# and a body was answered, its body was never read, and the octets left
+# behind were framed as the NEXT request line -- two responses out of one
+# request, on a socket this server then went on reusing.
+#
+# What closed it is not a third copy of the fix. gui/app.py imports
+# aicash.mintapi.framing_verdict, the single rule every server in this
+# repository asks, and applies it to every request of every method before
+# any route runs. These tests drive raw sockets because a phantom response
+# is invisible to http.client: the library reads one response and hands
+# back the first one, and the whole defect is what is on the wire after
+# it.
+# ======================================================================
+#: A whole, valid request, sent as the BODY of the request above it. If
+#: this server leaves it on the wire, a keep-alive peer or a pipelining
+#: proxy frames it as the next request line and this server answers it --
+#: which is the entire defect, and the only way to see it is to count what
+#: comes back off a raw socket. It asks for a route no target below asks
+#: for, so its answer is unmistakable if it ever appears.
+SMUGGLED = b"GET /api/mint/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+
+#: What the fake MintControl's log route says, and nothing else does.
+SMUGGLED_MARK = b"mint line 0"
+
+FRAMING_SPELLINGS = tuple(
+    line % {"n": len(SMUGGLED)} for line in (
+        # The transfer coding, spelled every way a hop rewrites a name.
+        "Transfer-Encoding: chunked",
+        "transfer-encoding: chunked",
+        "TRANSFER-ENCODING: chunked",
+        "Transfer_Encoding: chunked",
+        "Transfer.Encoding: chunked",
+        "TransferEncoding: chunked",
+        "Transfer--Encoding: chunked",
+        "Transfer__Encoding: chunked",
+        "Transfer0Encoding: chunked",
+        "Transfer|Encoding: chunked",
+        "Transfer-Encoding : chunked",        # space before the colon
+        "Transfer-Encoding\t: chunked",       # tab before the colon
+        "transfer-encoding: CHUNKED",
+        "Transfer-Encoding: CHUNKED, identity",
+        # The length, spelled every way two parties compute differently.
+        "Content-Length: 5\r\nContent-Length: %(n)d",   # the CL.CL pair
+        "Content-Length: +%(n)d",             # int() takes a sign, HTTP does not
+        "Content-Length: %(n)d_0",            # PEP 515, not 1*DIGIT
+        "Content-Length:  %(n)d ",            # surrounding OWS int() eats
+        "Content-Length: %(n)d\x0b",          # Python whitespace, not HTTP's
+        "Content-Length: 0%(n)d",             # a leading zero
+        "Content_Length: %(n)d",
+        "Content.Length: %(n)d",
+        "ContentLength: %(n)d",
+        "Content-Length : %(n)d",             # space before the colon
+        "Content-Length: %(n)d, 5",           # a list, not a number
+    )
+)
+
+
+def framing_verdict_for(spelling, cookie, body_expected):
+    """What the SHARED rule says about the header block a test just sent.
+
+    Tests assert this server's wire behaviour against the rule's verdict
+    rather than against a list of spellings the test author thinks are
+    bad. A list of bad spellings is what was wrong the last two times; a
+    test carrying its own copy of one would be the same mistake in the
+    test file.
+    """
+    block = ("Host: 127.0.0.1\r\nCookie: %s\r\n"
+             "Content-Type: application/json\r\n%s\r\n\r\n"
+             % (cookie, spelling))
+    parsed = email.parser.Parser().parsestr(block, headersonly=True)
+    return gui_app.framing_verdict(parsed, body_expected=body_expected)
+
+
+def code_only(path):
+    """A Python file with its comments and docstrings removed.
+
+    So a test about what the CODE does is not answered by prose. This
+    file's own explanation of the defect necessarily quotes the
+    expression the defect was made of, and a naive substring search over
+    the whole source finds the explanation and calls it a relapse.
+    """
+    with open(path, "rb") as handle:
+        tokens = list(tokenize.tokenize(handle.readline))
+    kept = []
+    statement_start = True
+    for tok in tokens:
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
+                        tokenize.DEDENT, tokenize.ENCODING):
+            if tok.type in (tokenize.NEWLINE, tokenize.NL):
+                statement_start = True
+            continue
+        if tok.type == tokenize.STRING and statement_start:
+            continue                      # a docstring, or a bare string
+        statement_start = False
+        kept.append(tok.string)
+    return " ".join(kept)
+
+
+def framing_header_lookups(path):
+    """Every place a file ASKS a header block for a framing header name.
+
+    An ``ast`` walk rather than a substring search, because the one thing
+    that must not come back is a lookup -- ``headers.get("X")`` or
+    ``headers["X"]`` -- while WRITING a Content-Length onto a response is
+    exactly what a correct server does. The name is folded before it is
+    compared, so a lookup that comes back wearing an underscore or no
+    separator at all is found too.
+    """
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+
+    def mentions_headers(node):
+        return "headers" in ast.dump(node)
+
+    def is_framing_name(node):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            return False
+        folded = re.sub(r"[^a-z0-9]+", "", node.value.lower())
+        return folded in ("contentlength", "transferencoding")
+
+    found = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "get_all", "__getitem__")
+                and mentions_headers(node.func.value)):
+            for arg in node.args:
+                if is_framing_name(arg):
+                    found.append((node.lineno, arg.value))
+        if isinstance(node, ast.Subscript) and mentions_headers(node.value):
+            if is_framing_name(node.slice):
+                found.append((node.lineno, node.slice.value))
+    return found
+
+
+def raw_exchange(port, payload, wait=8.0):
+    """Send bytes, read until the server hangs up or stops talking.
+
+    Returns ``(data, closed)``: everything that came back, and whether the
+    server closed the connection itself. Both halves matter -- a phantom
+    response is extra DATA, and a connection kept open after a request
+    this server refused to frame is the socket the next one arrives on.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    try:
+        sock.sendall(payload)
+        sock.settimeout(wait)
+        data = b""
+        closed = False
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+        return data, closed
+    finally:
+        sock.close()
+
+
+def split_all_responses(raw, head_request=False):
+    """Split a socket dump into complete responses, BY THEIR OWN FRAMING.
+
+    Returns ``(responses, trailing)``. Anything that is not a status line
+    where a status line must be is not a response: it is the trailing
+    octets this round exists to make impossible, and it comes back in
+    ``trailing`` rather than being counted as an answer. That is what
+    caught the other half of this round's work -- a JSON error body
+    written with no status line and no headers, appended straight past the
+    previous response's declared Content-Length.
+    """
+    responses = []
+    rest = raw
+    while rest:
+        if not rest.startswith(b"HTTP/1."):
+            break
+        head, sep, body = rest.partition(b"\r\n\r\n")
+        if not sep:
+            break
+        length = None
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                try:
+                    length = int(value.strip())
+                except ValueError:                       # pragma: no cover
+                    length = None
+        if head_request:
+            length = 0
+        if length is None or len(body) < length:
+            responses.append(rest)
+            rest = b""
+            break
+        responses.append(head + sep + body[:length])
+        rest = body[length:]
+    return responses, rest
+
+
+def complete_responses(raw, head_request=False):
+    """How many responses on the wire are FULLY framed, not merely begun.
+
+    split_all_responses above counts a response whose body is shorter than
+    its own Content-Length as a response, because its job is to report
+    what arrived. This one is stricter on purpose: it is what the watching
+    helper below polls on, and a half-arrived response must not stop the
+    read early.
+    """
+    seen = 0
+    rest = raw
+    while rest.startswith(b"HTTP/1."):
+        head, sep, body = rest.partition(b"\r\n\r\n")
+        if not sep:
+            break
+        length = None
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                try:
+                    length = int(value.strip())
+                except ValueError:                       # pragma: no cover
+                    length = None
+        if head_request:
+            length = 0
+        if length is None or len(body) < length:
+            break
+        seen += 1
+        rest = body[length:]
+    return seen
+
+
+def exchange_and_watch(port, payload, expect=1, wait=8.0, linger=1.0,
+                       head_request=False, half_close=False):
+    """Send bytes, read until ``expect`` responses are COMPLETE, then watch.
+
+    Returns ``(responses, trailing, closed, data)`` like raw_exchange +
+    split_all_responses, but it does not spend the whole timeout on every
+    cell: the answers are read as fast as they arrive and the socket is
+    then watched for ``linger`` seconds more, which is what distinguishes
+    "this server kept the connection" from "this server had not hung up
+    yet". A test that asserts a socket LIVES has to wait for something
+    that never happens, so waiting less, deliberately, is the difference
+    between a four-cell sweep that costs one second and one that costs
+    half a minute.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    try:
+        sock.sendall(payload)
+        if half_close:
+            # "I have finished sending." The only way to produce a body
+            # that stops short of its declared length without waiting out
+            # the server's body-read timeout: the read returns what it has
+            # instead of blocking for octets that are never coming.
+            sock.shutdown(socket.SHUT_WR)
+        data = b""
+        closed = False
+        deadline = time.monotonic() + wait
+        while complete_responses(data, head_request) < expect:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+        end = time.monotonic() + linger
+        while not closed and time.monotonic() < end:
+            sock.settimeout(max(0.01, end - time.monotonic()))
+            try:
+                chunk = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+        responses, trailing = split_all_responses(data, head_request)
+        return responses, trailing, closed, data
+    finally:
+        sock.close()
+
+
+class TestFramingIsOneSharedRule(ServerCase):
+    """Twenty-five spellings, every method, every route, one rule."""
+
+    # Method, path, and whether a body is a smuggled request or filler.
+    TARGETS = (
+        ("GET", "/"),
+        ("GET", "/api/mint/status"),
+        ("GET", "/api/wallet/list"),
+        ("HEAD", "/"),
+        ("POST", "/api/wallet/create"),
+        ("POST", "/api/mint/issue"),
+        ("OPTIONS", "/api/mint/status"),
+        ("PUT", "/api/wallet/pay"),
+        ("DELETE", "/api/wallet/list"),
+    )
+
+    def build(self, method, path, spelling):
+        return ("%s %s HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Cookie: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "%s\r\n\r\n" % (method, path, self.cookie, spelling)
+                ).encode() + SMUGGLED
+
+    def test_the_framing_rule_is_imported_and_not_copied_here(self):
+        """A local copy is how this defect survived three fixes.
+
+        The rule lives in one module and every server in this repository
+        asks that module. If somebody ever "restores" a private copy to
+        gui/app.py -- the duplication note in the console's docstring was
+        written about the AUTHENTICATION design and does not cover
+        framing -- this fails before any of the wire tests do.
+        """
+        self.assertEqual(gui_app.framing_verdict.__module__, "aicash.mintapi")
+        # Comments and docstrings stripped: the explanation of this defect
+        # has to quote the expression the defect was made of.
+        path = os.path.join(REPO, "gui", "app.py")
+        code = code_only(path)
+        self.assertNotIn("def framing_verdict", code,
+                         "gui/app.py has grown its own copy of the rule")
+        self.assertNotIn("_FRAMING_CONFUSABLE", code)
+        # THE ONE QUESTION THE RULE EXISTS TO STOP ANYBODY ASKING: is this
+        # header spelled thus? It is not the question this server needs an
+        # answer to, and asking it is what left nineteen spellings working.
+        # Writing a Content-Length onto a RESPONSE is a different act and
+        # is not what this looks for; see framing_header_lookups.
+        self.assertEqual(
+            framing_header_lookups(path), [],
+            "gui/app.py asks a header block for a framing header by name "
+            "again -- that question has been wrong twice")
+        # The check has to be able to fail, so prove it on a file that
+        # really does ask.
+        probe = os.path.join(self.workdir, "asks.py")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("def f(self):\n"
+                         "    return self.headers.get('Transfer_Encoding')\n")
+        self.assertEqual([name for _line, name in framing_header_lookups(probe)],
+                         ["Transfer_Encoding"])
+
+    def test_no_spelling_on_any_method_leaves_a_phantom_response(self):
+        """The verifier's sweep, run against every route of every method.
+
+        One request in, exactly one response out, and nothing on the wire
+        after it. Before the shared rule was applied here this failed 142
+        times across these nine targets.
+        """
+        for method, path in self.TARGETS:
+            for spelling in FRAMING_SPELLINGS:
+                with self.subTest(method=method, path=path,
+                                  spelling=spelling):
+                    data, closed = raw_exchange(
+                        self.port, self.build(method, path, spelling))
+                    responses, trailing = split_all_responses(
+                        data, head_request=(method == "HEAD"))
+                    self.assertEqual(
+                        len(responses), 1,
+                        "%d responses for one request: %r"
+                        % (len(responses), data[:400]))
+                    self.assertEqual(
+                        trailing, b"",
+                        "octets after the response: %r" % trailing[:200])
+                    self.assertNotIn(
+                        SMUGGLED_MARK, data,
+                        "the smuggled request in the body was answered")
+                    verdict = framing_verdict_for(
+                        spelling, self.cookie, method == "POST")
+                    if verdict.must_close:
+                        self.assertTrue(
+                            closed,
+                            "the rule said close and the socket stayed up: "
+                            "%r" % (verdict,))
+                    if not verdict.framed:
+                        status, _headers, body = split_response(responses[0])
+                        self.assertEqual(status, 400)
+                        if method != "HEAD":   # a HEAD answer carries no body
+                            self.assertEqual(
+                                json.loads(body)["error"]["reason"],
+                                "unframable_request")
+
+    def test_a_get_that_declares_a_body_does_not_answer_what_is_in_it(self):
+        """The headline finding, on its own, in the plainest form.
+
+        A GET for the page, carrying a Content-Length and a whole second
+        request as its body. It used to return the page and then answer
+        the smuggled request out of the body, leaving two responses and
+        hundreds of bytes on one socket.
+        """
+        payload = ("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   "Cookie: %s\r\n"
+                   "Content-Length: %d\r\n\r\n"
+                   % (self.cookie, len(SMUGGLED))).encode() + SMUGGLED
+        data, closed = raw_exchange(self.port, payload)
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(len(responses), 1, "the smuggled request was answered")
+        self.assertEqual(trailing, b"")
+        self.assertTrue(closed)
+        self.assertIn(b"<!doctype html", responses[0].lower())
+        self.assertNotIn(SMUGGLED_MARK, data)
+        # And it SAYS it is closing, rather than hanging up silently on a
+        # peer that just read a complete Content-Length and is entitled to
+        # send another request.
+        status, headers, _body = split_response(responses[0])
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("connection"), "close")
+
+    def test_the_refusal_names_a_reason_from_the_shared_set(self):
+        """This server's envelope, the shared rule's machine reason.
+
+        The verdict carries no status code and no error shape -- its four
+        callers use three different vocabularies -- so the 400 and the
+        sentence are this file's. The slug is not, and a slug this server
+        prints that the rule does not define would mean the two have
+        drifted.
+        """
+        seen = set()
+        for spelling in FRAMING_SPELLINGS:
+            verdict = framing_verdict_for(spelling, self.cookie, True)
+            data, _closed = raw_exchange(
+                self.port, self.build("POST", "/api/wallet/create", spelling))
+            responses, trailing = split_all_responses(data)
+            self.assertEqual(trailing, b"")
+            self.assertEqual(len(responses), 1)
+            status, _headers, body = split_response(responses[0])
+            obj = json.loads(body)
+            if verdict.framed:
+                # The rule framed it, so this server read the body and
+                # refused it on its CONTENT, not on its framing. Nothing
+                # here is entitled to an opinion about that.
+                self.assertNotEqual(obj["error"]["reason"],
+                                    "unframable_request", spelling)
+                continue
+            self.assertEqual(status, 400, spelling)
+            self.assertEqual(obj["error"]["reason"], "unframable_request")
+            self.assertIn(obj["error"]["cause"], gui_app.CAUSES)
+            slug = obj["error"]["detail"].rsplit("(framing: ", 1)[1].rstrip(")")
+            self.assertEqual(slug, verdict.reason, spelling)
+            seen.add(slug)
+        self.assertGreaterEqual(len(seen), 3, "the sweep proved almost nothing")
+        self.assertTrue(
+            seen <= set(gui_app.FRAMING_REASONS),
+            "reasons this server prints that the shared rule does not "
+            "define: %s" % sorted(seen - set(gui_app.FRAMING_REASONS)))
+
+    def test_the_gui_and_the_mint_decide_identical_bytes_identically(self):
+        """One socket, one rule: the verdict, and what this server did.
+
+        Every spelling above is put through the shared rule directly and
+        through this server's wire behaviour, and the two must agree. This
+        is the property the round is for -- not "the GUI is fixed" but
+        "the GUI has no framing opinion of its own to be wrong about".
+        """
+        for method, path in (("GET", "/api/mint/status"),
+                             ("POST", "/api/wallet/create")):
+            for spelling in FRAMING_SPELLINGS:
+                with self.subTest(method=method, spelling=spelling):
+                    verdict = framing_verdict_for(
+                        spelling, self.cookie, method == "POST")
+                    data, closed = raw_exchange(
+                        self.port, self.build(method, path, spelling))
+                    responses, trailing = split_all_responses(data)
+                    self.assertEqual(trailing, b"")
+                    self.assertEqual(len(responses), 1)
+                    status, headers, body = split_response(responses[0])
+                    if not verdict.framed:
+                        self.assertEqual(status, 400)
+                        self.assertEqual(json.loads(body)["error"]["reason"],
+                                         "unframable_request")
+                        self.assertEqual(
+                            headers.get("connection"), "close",
+                            "an unframable request answered without saying "
+                            "the connection is going")
+                    else:
+                        # Framed: refused on its CONTENT if at all, never on
+                        # its framing. This server has no second opinion.
+                        if status >= 400:
+                            self.assertNotEqual(
+                                json.loads(body)["error"]["reason"],
+                                "unframable_request")
+                    # must_close is the RULE's decision, not this server's.
+                    if verdict.must_close:
+                        self.assertTrue(
+                            closed,
+                            "the rule said close and the socket stayed up: "
+                            "%r" % (verdict,))
+
+    def test_a_well_framed_request_still_keeps_its_connection(self):
+        """The fix must not be "close everything", on GET or on POST.
+
+        A page poll every four seconds over one socket is the reason this
+        server speaks HTTP/1.1 at all.
+        """
+        payload = (
+            "GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Cookie: %s\r\n\r\n"
+            "POST /api/wallet/create HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Cookie: %s\r\nContent-Type: application/json\r\n"
+            "Content-Length: 17\r\n\r\n{\"name\": \"carol\"}"
+            "GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Cookie: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            % (self.cookie, self.cookie, self.cookie)).encode()
+        data, closed = raw_exchange(self.port, payload)
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(trailing, b"")
+        self.assertEqual(len(responses), 3,
+                         "three pipelined requests, %d answers: %r"
+                         % (len(responses), data[:300]))
+        for response in responses:
+            status, _headers, _body = split_response(response)
+            self.assertEqual(status, 200)
+        self.assertTrue(closed)
+
+    def test_a_body_that_stops_short_of_its_length_is_not_used(self):
+        """A truncated body is a desynchronised stream, not a short call."""
+        payload = ("POST /api/wallet/create HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   "Cookie: %s\r\nContent-Type: application/json\r\n"
+                   "Content-Length: 400\r\n\r\n{\"name\": \"dave\"}"
+                   % self.cookie).encode()
+        old = gui_app.Handler.timeout
+        gui_app.Handler.timeout = 2
+        try:
+            data, closed = raw_exchange(self.port, payload, wait=12.0)
+        finally:
+            gui_app.Handler.timeout = old
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(trailing, b"")
+        self.assertEqual(len(responses), 1)
+        status, _headers, _body = split_response(responses[0])
+        self.assertGreaterEqual(status, 400)
+        self.assertTrue(closed)
+        self.assertNotIn("dave", [c[1] for c in FakeWalletOps.calls
+                                  if c and len(c) > 1])
+
+
+class TestNoResponseWithoutAStatusLine(ServerCase):
+    """A refusal is a response, or it is trailing octets. Nothing between.
+
+    CPython sets ``request_version`` to HTTP/0.9 before it tries to parse a
+    request line, and in HTTP/0.9 ``send_response``, ``send_header`` and
+    ``end_headers`` are all no-ops. This server's overridden ``send_error``
+    then wrote its JSON body raw -- no status line, no headers -- appended
+    past the previous response's declared Content-Length on a pipelined
+    connection. A client reading by Content-Length is handed a complete
+    response and then a tail of bytes that belong to nothing.
+    """
+
+    def test_an_unparseable_pipelined_request_line_gets_a_status_line(self):
+        payload = (b"GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   b"Cookie: " + self.cookie.encode() + b"\r\n\r\n"
+                   b"\x16\x03\x01garbage\r\n\r\n")
+        data, closed = raw_exchange(self.port, payload)
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(
+            trailing, b"",
+            "a body with no status line, appended past a Content-Length: %r"
+            % trailing[:200])
+        self.assertEqual(len(responses), 2,
+                         "expected an answer and a refusal, got %d: %r"
+                         % (len(responses), data[:300]))
+        first_status, _h, _b = split_response(responses[0])
+        self.assertEqual(first_status, 200)
+        status, headers, body = split_response(responses[1])
+        self.assertEqual(status, 400)
+        self.assertEqual(headers.get("connection"), "close")
+        obj = json.loads(body)
+        self.assertIn("error", obj)
+        self.assertIn(obj["error"]["cause"], gui_app.CAUSES)
+        self.assertTrue(closed)
+
+    def test_an_unparseable_first_request_line_is_also_a_response(self):
+        data, closed = raw_exchange(self.port, b"\x16\x03\x01garbage\r\n\r\n")
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(trailing, b"", "raw bytes with no status line")
+        self.assertEqual(len(responses), 1)
+        status, _headers, body = split_response(responses[0])
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
+        self.assertTrue(closed)
+
+    def test_an_http_0_9_request_is_refused_in_a_protocol_with_framing(self):
+        """The same shape as the send_error defect, one door along.
+
+        A request line with no version on it is HTTP/0.9, where
+        send_response, send_header and end_headers are all no-ops -- so
+        every answer this server composed for such a request, error
+        envelopes included, went out as a naked body with no status line
+        and no length. Nothing that speaks to this GUI speaks 0.9.
+        """
+        for payload in (b"GET /\r\nHost: 127.0.0.1\r\n\r\n",
+                        b"GET /api/mint/status\r\n\r\n"):
+            with self.subTest(payload=payload):
+                data, closed = raw_exchange(self.port, payload)
+                responses, trailing = split_all_responses(data)
+                self.assertEqual(trailing, b"",
+                                 "a naked body with no status line: %r"
+                                 % trailing[:120])
+                self.assertEqual(len(responses), 1, repr(data[:200]))
+                status, headers, body = split_response(responses[0])
+                self.assertEqual(status, 400)
+                self.assertIn("content-length", headers)
+                self.assertIn("error", json.loads(body))
+                self.assertTrue(closed)
+
+    def test_a_refusal_does_not_echo_a_kilobyte_of_the_request_line(self):
+        """The base class quotes the request line; a request line is 64 KiB."""
+        payload = b"GET /" + b"A" * 20000 + b" NOTHTTP\r\n\r\n"
+        data, _closed = raw_exchange(self.port, payload)
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(trailing, b"")
+        self.assertEqual(len(responses), 1)
+        _status, _headers, body = split_response(responses[0])
+        self.assertLess(len(body), 1024,
+                        "the caller's own bytes reflected at length")
+
+
+class TestNumbersAreBoundedNotJustShaped(ServerCase):
+    """A guard that bounds SHAPE and not LENGTH is not a guard.
+
+    ``[+-]?[0-9]+`` accepts five thousand digits, and ``int()`` on five
+    thousand digits raises CPython's int/str conversion ValueError -- out
+    of the route, onto the blanket handler, and into a 500 whose body
+    carried the interpreter's own message and the digit count the caller
+    chose. Live on /api/mint/issue for both its numeric fields and on
+    /api/mint/start for four of its own.
+    """
+
+    HUGE = "9" * 5000
+
+    def setUp(self):
+        super().setUp()
+        # The fake controller is per CLASS, so its record of what it was
+        # asked to do outlives one test. These tests are about what did
+        # NOT happen, so they start from an empty record.
+        self.control.started = []
+        self.control.stopped = []
+
+    def test_a_five_thousand_digit_number_is_a_sentence_not_a_500(self):
+        cases = (
+            ("/api/mint/issue", {"amount_mc": self.HUGE, "count": 1}),
+            ("/api/mint/issue", {"amount_mc": 10, "count": self.HUGE}),
+            ("/api/wallet/pay", {"name": "alice", "amount_mc": self.HUGE}),
+            ("/api/wallet/quote", {"name": "alice", "amount_mc": self.HUGE}),
+            ("/api/mint/stop", {"drain_seconds": self.HUGE}),
+        )
+        for field in ("port", "rate_ppm", "cap_mc", "exempt_below_mc"):
+            body = {"mint_id": "m", "baseline_model_class": "baseline-v1",
+                    "port": 9999, "rate_ppm": 0, "cap_mc": 0,
+                    "exempt_below_mc": 10}
+            body[field] = self.HUGE
+            cases += (("/api/mint/start", body),)
+        for path, body in cases:
+            with self.subTest(path=path, body=sorted(body)):
+                status, obj, raw = self.call("POST", path, body)
+                self.assertEqual(status, 400, raw[:300])
+                self.assert_envelope(status, obj, raw)
+                self.assertNotIn("digits", obj["error"]["detail"])
+                self.assertNotIn("ValueError", obj["error"]["detail"])
+        self.assertEqual(self.control.started, [])
+        self.assertEqual(self.control.stopped, [])
+
+    def test_a_giant_lines_query_is_refused_rather_than_defaulted(self):
+        status, obj, raw = self.call("GET", "/api/mint/logs?lines=" + self.HUGE)
+        self.assertEqual(status, 400, raw[:200])
+        self.assert_envelope(status, obj, raw)
+
+    def test_a_default_is_for_an_absent_field_not_a_nonsense_one(self):
+        """``count: "abc"`` used to issue ONE token instead of saying no.
+
+        On a route that creates money, substituting the route's own
+        default for a value the caller actually sent is the wrong way
+        round: absent is a request to use the default, nonsense is not.
+        """
+        for body, why in (({"amount_mc": 10, "count": "abc"}, "count"),
+                          ({"amount_mc": 10, "count": True}, "count"),
+                          ({"amount_mc": 10, "count": 2.5}, "count")):
+            with self.subTest(why=why, body=body):
+                status, obj, raw = self.call("POST", "/api/mint/issue", body)
+                self.assertEqual(status, 400, raw[:200])
+                self.assert_envelope(status, obj, raw)
+        status, obj, raw = self.call("POST", "/api/mint/stop",
+                                     {"drain_seconds": "abc"})
+        self.assertEqual(status, 400, raw[:200])
+        self.assertEqual(self.control.stopped, [])
+        # ...and an ABSENT field still gets the route's default.
+        status, _obj, raw = self.call("POST", "/api/mint/stop", {})
+        self.assertEqual(status, 200, raw[:200])
+        self.assertEqual(self.control.stopped, [10])
+
+    def test_a_relayed_message_cannot_amplify_what_the_caller_sent(self):
+        """A component's sentence may quote the caller; this file bounds it.
+
+        Not the same defect as the blanket handler, and found looking for
+        the same shape: a message this server did not compose, relayed
+        into a response body at whatever length it arrived.
+        """
+        FakeWalletOps.fail_with = FakeWalletOpsError(
+            "wallet_error", "x" * 40000, "unknown")
+        try:
+            status, obj, raw = self.call("POST", "/api/wallet/pay",
+                                         {"name": "alice", "amount_mc": 5})
+        finally:
+            FakeWalletOps.fail_with = None
+        self.assertEqual(status, 400, raw[:200])
+        self.assert_envelope(status, obj, raw)
+        self.assertLessEqual(len(obj["error"]["detail"]),
+                             gui_app._RELAYED_DETAIL_MAX + 20)
+        self.assertIn("truncated", obj["error"]["detail"])
+
+    def test_no_route_puts_an_interpreter_exception_into_a_body(self):
+        """The blanket handler is the last place a message can leak.
+
+        Any exception that reaches it is by definition one this server did
+        not plan for, so its text is the interpreter's -- and the
+        interpreter quotes whatever the caller sent.
+        """
+        marker = "SECRET-INTERPRETER-TEXT-9134"
+
+        class Boom(Exception):
+            pass
+
+        original = gui_app.Api.route_mint_status
+
+        def explode(self, _query, _body):
+            raise Boom(marker)
+
+        gui_app.Api.route_mint_status = explode
+        noise = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = noise          # the handler thread prints here
+        try:
+            status, obj, raw = self.call("GET", "/api/mint/status")
+        finally:
+            sys.stderr = saved
+            gui_app.Api.route_mint_status = original
+        self.assertEqual(status, 500)
+        self.assert_envelope(status, obj, raw)
+        text = raw.decode("utf-8", "replace")
+        self.assertNotIn(marker, text, "the exception's text reached the page")
+        self.assertNotIn("Boom", text, "the exception's TYPE reached the page")
+        self.assertIn("terminal running app.py", obj["error"]["detail"])
+        # ...and it is not lost: it goes where the operator can read it.
+        self.assertIn(marker, noise.getvalue())
+        self.assertIn("Traceback", noise.getvalue())
+
+
+class TestTheModelClassGoesOnACommandLine(ServerCase):
+    """/api/mint/start spawns a mint with this string in its argv.
+
+    It also becomes, under §4.1, the permanent definition of what one
+    millicredit means for that mint_id. A five-thousand-character one was
+    accepted and really spawned.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.control.started = []
+        self.control.stopped = []
+
+    def start_body(self, baseline):
+        return {"mint_id": "bounded-mint", "baseline_model_class": baseline,
+                "port": 9911, "rate_ppm": 0, "cap_mc": 0,
+                "exempt_below_mc": 10}
+
+    def test_a_five_thousand_character_class_never_reaches_a_subprocess(self):
+        status, obj, raw = self.call("POST", "/api/mint/start",
+                                     self.start_body("b" * 5000))
+        self.assertEqual(status, 400, raw[:200])
+        self.assert_envelope(status, obj, raw)
+        self.assertEqual(self.control.started, [],
+                         "a mint was spawned with a 5,000-character argv")
+
+    def test_control_characters_never_reach_a_command_line(self):
+        for baseline in ("base\nline-v1", "base\tline", "base\x00line",
+                         "base\rline", "\x1b[2Jbaseline"):
+            with self.subTest(baseline=baseline):
+                status, obj, raw = self.call("POST", "/api/mint/start",
+                                             self.start_body(baseline))
+                self.assertEqual(status, 400, raw[:200])
+                self.assert_envelope(status, obj, raw)
+        self.assertEqual(self.control.started, [])
+
+    def test_the_ordinary_value_still_starts_a_mint(self):
+        status, _obj, raw = self.call("POST", "/api/mint/start",
+                                      self.start_body("baseline-v1"))
+        self.assertEqual(status, 200, raw[:300])
+        self.assertEqual([s["baseline_model_class"]
+                          for s in self.control.started], ["baseline-v1"])
+        longest = "b" * gui_app.BASELINE_MAX
+        status, _obj, raw = self.call("POST", "/api/mint/start",
+                                      self.start_body(longest))
+        self.assertEqual(status, 200, raw[:300])
+        self.assertEqual(self.control.started[-1]["baseline_model_class"],
+                         longest)
+
+
+# ======================================================================
+# A BODY THIS SERVER CANNOT PARSE IS NOT THIS SERVER FAILING
+#
+# The reader was wrapped in a handler for ValueError alone. json.loads
+# says "no" in more ways than that, and the one it was missing --
+# RecursionError, out of the C scanner, on a document nested deep enough
+# to blow its stack -- is not a ValueError at all. It escaped to the
+# blanket handler in _handle, so every POST route on this server answered
+# a 200 KB array of brackets with 500 "internal_error" and printed a
+# traceback on the operator's terminal: a malformed request reported as a
+# failure of the money server that received it.
+#
+# The mint (aicash/mintapi.py), the supervision server and the operator
+# console widened this exact clause in earlier rounds. Nobody asked
+# whether THIS reader had the same gap. These tests are the question,
+# asked of every POST route and of every field of the widest body.
+#
+# Raw sockets, not http.client: half of what is being asserted is what is
+# on the wire AFTER the response -- one well-formed answer, nothing
+# trailing it, and never no answer at all.
+# ======================================================================
+#: Deep enough that CPython's C scanner gives up (measured at ~9,997 on
+#: this interpreter), small enough to sit well inside MAX_BODY_BYTES: at
+#: 40,000 levels this is 80 KB against a 1 MiB cap. That combination is
+#: the whole point -- the body is not refused for its size, it is refused
+#: for its shape, and the refusal has to be a sentence rather than a
+#: crash.
+NEST_DEPTH = 40_000
+
+
+def nested_array(depth: int = NEST_DEPTH) -> bytes:
+    return (b"[" * depth) + (b"]" * depth)
+
+
+#: Every route on this server that reads a body, which is every route
+#: that calls _read_body, which is every POST route in ROUTES. Derived
+#: from the table rather than typed out, so a POST route added tomorrow
+#: is covered by these tests on the day it is added.
+POST_ROUTES = tuple(sorted(p for (m, p) in gui_app.ROUTES if m == "POST"))
+
+#: The six fields /api/mint/start reads. A body can be a well-formed JSON
+#: object and still carry the hostile document one level down, which is
+#: the shape a real caller would send: the sweep that found this counted
+#: each field separately for exactly that reason.
+MINT_START_FIELDS = ("mint_id", "baseline_model_class", "port",
+                     "rate_ppm", "cap_mc", "exempt_below_mc")
+
+
+class TestADeeplyNestedBodyIsNotAnInternalError(ServerCase):
+    """Thirteen cells: eight POST routes, six fields of the widest one.
+
+    EVERY CELL HERE SENDS ``Connection: close``, so none of them can see
+    what this server does with the socket -- which is how a round spent on
+    framing left a deep body's connection decision unmeasured. That half
+    is TestABadBodyDoesNotCostTheConnection below, which sends the same
+    document with no Connection header and a valid request pipelined
+    behind it.
+    """
+
+    def post_raw(self, path, body: bytes, cookie=True):
+        """One POST over a raw socket. Returns (responses, trailing, raw)."""
+        head = ("POST %s HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n" % (path, self.port, len(body)))
+        if cookie:
+            head += "Cookie: %s\r\n" % self.cookie
+        data, _closed = raw_exchange(self.port, head.encode() + b"\r\n" + body,
+                                     wait=20.0)
+        responses, trailing = split_all_responses(data)
+        return responses, trailing, data
+
+    def assert_bad_json_not_internal(self, path, body, note=""):
+        responses, trailing, data = self.post_raw(path, body)
+        self.assertEqual(len(responses), 1,
+                         "%s%s answered %d times, not once: %r"
+                         % (path, note, len(responses), data[:300]))
+        self.assertEqual(trailing, b"",
+                         "%s%s left octets past its own framing: %r"
+                         % (path, note, trailing[:200]))
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(
+            status, 400,
+            "%s%s answered %d, not 400: %r" % (path, note, status,
+                                               payload[:300]))
+        obj = json.loads(payload)
+        self.assert_envelope(status, obj, payload)
+        self.assertEqual(obj["error"]["reason"], "bad_json",
+                         "%s%s: %r" % (path, note, obj))
+
+    def test_every_post_route_calls_a_deep_body_bad_json(self):
+        """The finding itself, on every route that reads a body."""
+        self.assertEqual(len(POST_ROUTES), 8, POST_ROUTES)
+        for path in POST_ROUTES:
+            with self.subTest(path=path):
+                self.assert_bad_json_not_internal(path, nested_array())
+
+    def test_every_field_of_mint_start_is_covered_too(self):
+        """A well-formed object carrying the document one level down.
+
+        This is the shape a caller actually sends, and it is the one that
+        proves the refusal is the READER's and not some route's own
+        validation: the route never runs.
+        """
+        for field in MINT_START_FIELDS:
+            with self.subTest(field=field):
+                body = (b'{"mint_id": "m", "baseline_model_class": "b", '
+                        b'"port": 9911, "rate_ppm": 0, "cap_mc": 0, '
+                        b'"exempt_below_mc": 0, "%s": %s}'
+                        % (field.encode(), nested_array()))
+                self.assert_bad_json_not_internal(
+                    "/api/mint/start", body, note=" (field %s)" % field)
+
+    def test_a_nested_object_is_refused_the_same_way(self):
+        """Braces, not brackets: the same C scanner, the same stack."""
+        depth = NEST_DEPTH
+        body = (b'{"a":' * depth) + b"1" + (b"}" * depth)
+        self.assert_bad_json_not_internal("/api/wallet/pay", body)
+
+    def test_the_answer_carries_no_interpreter_vocabulary(self):
+        """No traceback, no exception name, no parser file path.
+
+        The blanket handler's sentence is not acceptable here either: it
+        says something inside this GUI failed, and nothing did.
+        """
+        _responses, _trailing, data = self.post_raw("/api/wallet/quote",
+                                                    nested_array())
+        text = data.decode("utf-8", "replace")
+        for forbidden in ("Traceback", "RecursionError", "maximum recursion",
+                          "json/decoder.py", "scan_once", "internal_error",
+                          "Something inside this GUI failed"):
+            self.assertNotIn(forbidden, text,
+                             "the answer quoted the interpreter: %r" % text[:400])
+
+    def test_nothing_is_printed_on_the_operators_terminal(self):
+        """A malformed request is not an incident.
+
+        The blanket handler prints a traceback to stderr on purpose --
+        that is where an internal failure belongs. A body that is simply
+        bad JSON must not produce one, or the terminal fills with stack
+        traces every time somebody fat-fingers a paste.
+        """
+        noise = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = noise              # the handler thread prints here
+        try:
+            self.post_raw("/api/wallet/receive", nested_array())
+        finally:
+            sys.stderr = saved
+        self.assertNotIn("Traceback", noise.getvalue(), noise.getvalue()[:500])
+        self.assertNotIn("RecursionError", noise.getvalue())
+
+    def test_an_unauthenticated_deep_body_is_still_refused_for_the_credential(self):
+        """The gate is still in front of the reader.
+
+        Worth pinning: a fix applied in the wrong place -- parsing before
+        authorising, so the refusal can name the parse -- would hand an
+        unauthenticated caller a different answer than 401, and that is a
+        way to probe a server without a credential.
+        """
+        responses, trailing, data = self.post_raw("/api/wallet/pay",
+                                                  nested_array(), cookie=False)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertEqual(trailing, b"")
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 401, payload[:300])
+
+    def test_an_ordinary_body_still_routes(self):
+        """The widened clause did not widen what counts as bad JSON."""
+        body = json.dumps({"name": "alice", "amount_mc": 11}).encode()
+        responses, trailing, data = self.post_raw("/api/wallet/pay", body)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertEqual(trailing, b"")
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 200, payload[:300])
+
+    def test_shallow_nesting_is_not_collateral(self):
+        """A hundred levels is legal JSON and stays legal.
+
+        The refusal is the parser's limit, not a depth rule this server
+        invented, and a test that only sent forty thousand levels would
+        not notice if somebody replaced it with one.
+        """
+        body = b'{"name": "alice", "amount_mc": 11, "note": %s}' % (
+            nested_array(100),)
+        responses, _trailing, data = self.post_raw("/api/wallet/pay", body)
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 200, payload[:300])
+
+
+class TestEveryJsonReaderNamesTheSameFamily(unittest.TestCase):
+    """The drift detector, across all four servers rather than this one.
+
+    The defect it exists against was repo-wide: the narrow
+    ``except ValueError`` around json.loads was in four files, three were
+    widened in earlier rounds and the fourth was not, because each fix was
+    made where its defect was reported instead of everywhere the shape
+    lived. A detector that walks ONE of the four repeats that mistake in
+    the place meant to prevent it -- it is the same "fix it where it was
+    found" one level up -- so it walks all four, from this file, because
+    reading a sibling's source costs nothing and importing it is already
+    done by the acceptance test in impl/tests/test_c06_mintapi.py.
+
+    IN SCOPE is a reader that parses what another process sent: one whose
+    enclosing class (or function, for a reader outside a class) also takes
+    bytes off a socket. That rule is mechanical and it is the rule the
+    defect follows -- a stack overflow or a five-thousand-digit integer is
+    something a PEER sends. A parser reading this process's own durable
+    state is not in scope and must not be: aicash/supervision.py's
+    _SupCore re-reads a details_json column it wrote itself, inside a
+    class that touches no socket at all, and demanding a network guard
+    there would be a test asserting a thing nobody found a reason for.
+    """
+
+    #: Every HTTP server in this repository. The list is the claim: a
+    #: fifth server added tomorrow is not covered until it is added here,
+    #: and the per-file assertion below fails loudly if one of these stops
+    #: containing a reader, rather than passing quietly.
+    SERVER_SOURCES = ("gui/app.py", "mint_console.py",
+                      "impl/aicash/mintapi.py", "impl/aicash/supervision.py")
+
+    #: What "this scope takes bytes off a socket" looks like in source.
+    #: rfile for a request handler, urlopen/getresponse for a client, recv
+    #: and makefile for the raw layer underneath both.
+    NETWORK_MARKERS = ("rfile", "urlopen", "getresponse", "recv", "makefile")
+
+    def handled_names(self, node):
+        """Every exception name an except clause names, however spelled."""
+        if node is None:
+            return {"BARE"}
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, ast.Attribute):
+            return {node.attr}
+        if isinstance(node, ast.Tuple):
+            out = set()
+            for elt in node.elts:
+                out |= self.handled_names(elt)
+            return out
+        return set()                                     # pragma: no cover
+
+    def json_readers(self, relpath):
+        """[(lineno, {handled}, in_scope)] for every json.loads in a file."""
+        path = os.path.join(REPO, relpath)
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+
+        def scope_of(lineno):
+            """The enclosing class, or the enclosing function if none."""
+            best = None
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+                    continue
+                if not node.lineno <= lineno <= (node.end_lineno or node.lineno):
+                    continue
+                if isinstance(node, ast.ClassDef):
+                    if best is None or not isinstance(best, ast.ClassDef):
+                        best = node
+                    elif node.lineno > best.lineno:
+                        best = node
+                elif best is None:
+                    best = node
+            return best
+
+        handlers = {}
+        for outer in ast.walk(tree):
+            if not isinstance(outer, ast.Try):
+                continue
+            handled = set()
+            for handler in outer.handlers:
+                handled |= self.handled_names(handler.type)
+            for node in outer.body:
+                for call in ast.walk(node):
+                    if self.is_json_loads(call):
+                        handlers[call.lineno] = handled
+
+        found = []
+        for call in ast.walk(tree):
+            if not self.is_json_loads(call):
+                continue
+            scope = scope_of(call.lineno)
+            text = ast.get_source_segment(source, scope) if scope else source
+            in_scope = any(marker in (text or "")
+                           for marker in self.NETWORK_MARKERS)
+            found.append((call.lineno, handlers.get(call.lineno, set()),
+                          in_scope))
+        return found
+
+    @staticmethod
+    def is_json_loads(node):
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "loads"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "json")
+
+    def test_every_server_still_has_a_reader_to_check(self):
+        """A walk that finds nothing must fail, not pass quietly.
+
+        Per file, not in total: four files summing to six readers still
+        passes if one file has none and another has three, and "this
+        server no longer parses anything a peer sent" is exactly the
+        change that should be looked at rather than assumed.
+        """
+        for relpath in self.SERVER_SOURCES:
+            with self.subTest(source=relpath):
+                in_scope = [r for r in self.json_readers(relpath) if r[2]]
+                self.assertTrue(
+                    in_scope,
+                    "%s parses nothing that came off a socket any more, so "
+                    "the assertions below no longer check it" % relpath)
+
+    def test_every_json_loads_of_network_bytes_handles_recursionerror(self):
+        """The rule, in all four files, spelled with the name itself.
+
+        RecursionError BY NAME. A blanket ``except Exception`` catches it
+        and was accepted here a round ago, which is a hole in a drift
+        detector rather than a convenience: a reader wrapped in a blanket
+        handler passes while producing exactly the 500 this exists to
+        prevent, because the blanket is the thing that turns a malformed
+        document into "something inside this server failed".
+        """
+        for relpath in self.SERVER_SOURCES:
+            for lineno, handled, in_scope in self.json_readers(relpath):
+                if not in_scope:
+                    continue
+                with self.subTest(source=relpath, line=lineno):
+                    self.assertIn(
+                        "RecursionError", handled,
+                        "%s:%d parses bytes from another process under a "
+                        "handler that does not name RecursionError (%s). A "
+                        "nested document raises it, it is not a ValueError, "
+                        "and uncaught it becomes a 500 or no answer at all."
+                        % (relpath, lineno, sorted(handled) or "nothing"))
+
+    def test_the_family_is_named_in_full(self):
+        """ValueError too, where bytes off a socket are parsed.
+
+        The other two of the three ways json.loads says no: a syntax
+        error and CPython's int/str digit limit are both ValueErrors, and
+        UnicodeDecodeError is a ValueError as well, so naming ValueError
+        covers all three. Named separately from the test above because a
+        reader that named only RecursionError would pass that one and
+        still fail on the five-thousand-digit amount_mc that started this.
+        """
+        for relpath in self.SERVER_SOURCES:
+            for lineno, handled, in_scope in self.json_readers(relpath):
+                if not in_scope:
+                    continue
+                with self.subTest(source=relpath, line=lineno):
+                    self.assertIn("ValueError", handled,
+                                  "%s:%d does not name ValueError (%s)"
+                                  % (relpath, lineno, sorted(handled)))
+
+    def test_the_encoder_is_covered_too(self):
+        """json.dumps recurses as well, and it is the LAST reporter.
+
+        _json is what the blanket handler calls to say anything at all.
+        An exception raised there has nowhere left to be reported, and the
+        request ends with no response on the wire -- the one outcome this
+        round's bar names explicitly.
+        """
+        source = textwrap.dedent(inspect.getsource(gui_app.Handler._json))
+        handled = set()
+        dumps_seen = 0
+        for outer in ast.walk(ast.parse(source)):
+            if not isinstance(outer, ast.Try):
+                continue
+            for node in outer.body:
+                for call in ast.walk(node):
+                    if (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr == "dumps"):
+                        dumps_seen += 1
+                        for handler in outer.handlers:
+                            names = handler.type
+                            if isinstance(names, ast.Tuple):
+                                handled |= {e.id for e in names.elts
+                                            if isinstance(e, ast.Name)}
+                            elif isinstance(names, ast.Name):
+                                handled.add(names.id)
+        # The AST and not the source text: this method's own comment says
+        # the word, and a test a comment can satisfy is a test of prose.
+        self.assertTrue(dumps_seen, "no guarded json.dumps in Handler._json")
+        self.assertIn("RecursionError", handled,
+                      "Handler._json encodes under a handler that does not "
+                      "name RecursionError (%s)" % sorted(handled))
+
+
+# ======================================================================
+# THE THREE FRAMING CELLS THE VERIFIER RECORDED AS DISAGREEMENTS
+#
+# THE MATRIX WAS RIGHT AND THE LAST ROUND'S COUNTER-MEASUREMENT WAS NOT.
+# The claim recorded here a round ago -- that the verifier's closes were
+# all its "Host: h" probes being refused 403 before framing was ever the
+# question -- is true of the absolute-form cell and FALSE of the short
+# declared length. Addressed to a loopback Host, a short Content-Length
+# over a longer body closed this socket too, for a different reason
+# nobody looked for: the body WAS read, but the parse that followed
+# raised before _handle reached its own `drained = True`, so the finally
+# clause hung up on a stream that was perfectly well framed. The cell
+# passed only because "Content-Length: 2" over "{}EXTRAEXTRA" truncates
+# to "{}", which is valid JSON; raising the length by ONE octet flipped
+# the answer.
+#
+# Measured since, with the four-server harness that already exists
+# (impl/tests/test_c06_mintapi.py, FourServersOneFramingRuleTest.
+# start_four), byte-identical requests, loopback Host, no Connection
+# header:
+#
+#   cell                          mint  supervision  GUI (was)  console
+#   bad JSON, exact length        keep     keep        CLOSE     keep*
+#   short declared length         keep     keep        CLOSE     keep*
+#   a plain well-formed GET       keep     keep        keep      close*
+#
+#   * the console never sets protocol_version, so it answers HTTP/1.0 and
+#     BaseHTTPRequestHandler leaves close_connection True on every request
+#     -- its own docstring says so. It closes on the third row too, where
+#     there is nothing to decide. Its closes are not framing decisions and
+#     cannot be counted as agreement or disagreement with anything.
+#
+# So this server was the only one of the four that hung up on a malformed
+# body, in the one path where its comment claimed it did not. That is
+# fixed in app.py (the parse moved out of the reader and behind the
+# drain), and these tests are the measurement, per spelling, so a single
+# lucky payload cannot carry the claim again.
+# ======================================================================
+class TestWhatThisServerActuallyDoesWithTheSocket(ServerCase):
+
+    def probe(self, payload, expect=1, wait=8.0):
+        return exchange_and_watch(self.port, payload, expect=expect,
+                                  wait=wait)
+
+    def good_headers(self):
+        return ("Host: 127.0.0.1:%d\r\nCookie: %s\r\n"
+                % (self.port, self.cookie))
+
+    #: Four spellings of ONE cell: the peer declares fewer octets than it
+    #: sends. They differ only in whether the truncated prefix happens to
+    #: be valid JSON, which is not a property of the framing and must not
+    #: change the socket decision. The first is the spelling the last
+    #: round tested, and it is the ONLY one of the four that passed: "{}"
+    #: parses, the route runs, and the answer says nothing about what a
+    #: malformed prefix would have done. The other three are the same cell
+    #: with one octet more.
+    SHORT_LENGTHS = (
+        (2, b"{}EXTRAEXTRA", "bad_name"),        # prefix "{}" -- valid JSON
+        (3, b"{}EXTRAEXTRA", "bad_json"),        # prefix "{}E"
+        (10, b'{"name":"alice","mint_id":"m"}XXXX', "bad_json"),
+        (20, b'{"name":"alice","mint_id":"m"}XXXX', "bad_json"),
+    )
+
+    def test_a_short_declared_length_is_honoured_and_the_socket_lives(self):
+        """CL declares fewer octets than arrive. The declaration is the frame.
+
+        The extra octets are not this message -- they are whatever the
+        peer sends next, and this server does not have to hang up to be
+        safe from them. It answers the request it was framed, once, and
+        leaves the socket up: the same call the mint and the supervision
+        server make, measured, on byte-identical requests.
+
+        EVERY SPELLING, because the one-spelling version of this test was
+        the round's own weakened check: it sent the single payload whose
+        truncation is still valid JSON, and one more octet of declared
+        length turned the answer from keep into close.
+        """
+        for length, body, reason in self.SHORT_LENGTHS:
+            with self.subTest(content_length=length):
+                head = ("POST /api/wallet/create HTTP/1.1\r\n"
+                        + self.good_headers()
+                        + "Content-Type: application/json\r\n"
+                          "Content-Length: %d\r\n\r\n" % length)
+                payload = head.encode() + body
+                responses, trailing, closed, data = self.probe(payload)
+                self.assertEqual(len(responses), 1, data[:400])
+                self.assertEqual(trailing, b"")
+                status, headers, payload_bytes = split_response(responses[0])
+                self.assertEqual(status, 400, payload_bytes[:300])
+                self.assertEqual(json.loads(payload_bytes)["error"]["reason"],
+                                 reason, payload_bytes[:300])
+                self.assertIsNone(headers.get("connection"),
+                                  "announced a close it did not have to make")
+                self.assertFalse(
+                    closed,
+                    "this server closed on a short declared length (CL=%d); "
+                    "the mint and the supervision server answer the "
+                    "pipelined request behind it on the same connection"
+                    % length)
+
+    def test_no_declared_length_with_octets_is_refused_and_closed(self):
+        """The one of the three that is a real framing decision.
+
+        No trustworthy statement of length, and octets on the wire: this
+        server cannot know where the message ends, so it does not guess
+        and the socket does not survive. All four servers close here.
+        """
+        payload = ("POST /api/wallet/create HTTP/1.1\r\n" + self.good_headers()
+                   + "Content-Type: application/json\r\n\r\n{}").encode()
+        responses, trailing, closed, data = self.probe(payload)
+        self.assertEqual(len(responses), 1, data[:400])
+        self.assertEqual(trailing, b"")
+        self.assertTrue(closed, "an unframable request kept the socket")
+        status, headers, payload_bytes = split_response(responses[0])
+        self.assertEqual(status, 400, payload_bytes[:300])
+        self.assertEqual(headers.get("connection"), "close",
+                         "closed without saying so, which a peer cannot act on")
+        self.assertEqual(json.loads(payload_bytes)["error"]["reason"],
+                         "unframable_request")
+
+    def test_an_absolute_form_target_is_answered_once_and_the_socket_goes(self):
+        """THIS TEST USED TO ASSERT THE OPPOSITE, AND IT WAS WRONG.
+
+        What stood here was
+        ``test_an_absolute_form_target_keeps_the_socket``, asserting
+        ``assertFalse(closed)`` with the message "the mint and the
+        supervision server do not [close]". That claim was false when it
+        was written and it certified the one cell where this server was
+        alone among the four. Re-measured with the four-server harness,
+        byte-identical requests, loopback Host, valid credential:
+
+            server        GET http://127.0.0.1:P/<route>
+            mint          400 bad_request_target, CLOSED
+            supervision   400 bad_request_target, CLOSED
+            console       answers, CLOSED
+            GUI (was)     404 not_found,          KEPT
+
+        Three to one, and the odd one out is the server an operator sits
+        in front of. app.py's parse_request now refuses it, for the reason
+        written there: this server routes on ``self.path`` verbatim, so an
+        absolute-form target has never matched a route and never could,
+        and RFC 7230 §5.3.2 says a server that accepts one must ignore
+        ``Host`` and route on the target's own authority -- which this
+        server does not do, so the request's two statements of "which
+        server is this for" leave this hop unresolved.
+        """
+        payload = ("GET http://127.0.0.1:%d/api/wallet/list HTTP/1.1\r\n"
+                   % self.port + self.good_headers() + "\r\n").encode()
+        responses, trailing, closed, data = self.probe(payload)
+        self.assertEqual(len(responses), 1, data[:400])
+        self.assertEqual(trailing, b"")
+        status, headers, payload_bytes = split_response(responses[0])
+        self.assertEqual(status, 400, payload_bytes[:300])
+        self.assertEqual(json.loads(payload_bytes)["error"]["reason"],
+                         "bad_request_target", payload_bytes[:300])
+        self.assertEqual(headers.get("connection"), "close",
+                         "hung up without saying so, which a peer and an "
+                         "intermediary both have to guess at")
+        self.assertTrue(closed,
+                        "this server answered an absolute-form target and "
+                        "then invited another request on the same socket; "
+                        "the other three answer once and hang up")
+
+    def test_a_bad_host_closes_and_it_is_a_separate_cause(self):
+        """The Host refusal is real, and it is NOT what cell A measured.
+
+        A Host that is not a loopback literal is refused 403 and hung up
+        on, before framing is the question. That much the last round had
+        right. What it then did with it was the error: it read the same
+        close on the short-length probe as "the verifier measured the Host
+        refusal", when with a loopback Host that probe ALSO closed, by a
+        different rule entirely. A close that two causes both produce
+        cannot be attributed to either by observing it.
+
+        So this test does what the old one could not: it drives both
+        probes with BOTH hosts and asserts the four outcomes differ. The
+        bad Host closes either way; the loopback Host closes on neither,
+        which is what makes the 403 the only cause left standing for the
+        cells that do close.
+        """
+        bad = "Host: h\r\nCookie: %s\r\n" % self.cookie
+        good = self.good_headers()
+        cells = {
+            ("short length", "bad host"): (
+                ("POST /api/wallet/create HTTP/1.1\r\n" + bad +
+                 "Content-Length: 10\r\n\r\n"
+                 '{"name":"alice","mint_id":"m"}XXXX'), 403, True),
+            ("short length", "loopback host"): (
+                ("POST /api/wallet/create HTTP/1.1\r\n" + good +
+                 "Content-Length: 10\r\n\r\n"
+                 '{"name":"alice","mint_id":"m"}XXXX'), 400, False),
+            # AN ORIGIN-FORM GET WHERE THE ABSOLUTE-FORM ONE USED TO BE.
+            # The absolute-form probe cannot carry this half of the claim
+            # any more: parse_request now refuses that target BEFORE
+            # _handle runs the Host check at all, so it answers 400
+            # bad_request_target and closes whatever the Host says, and a
+            # cell whose two rows are identical separates nothing. Its own
+            # behaviour is asserted in full by
+            # test_an_absolute_form_target_is_answered_once_and_the_socket_goes.
+            #
+            # A plain GET is the right substitute and is strictly stronger
+            # here: it is a request with NOTHING wrong with it except the
+            # Host, so the 403-and-close it gets is attributable to the
+            # Host refusal and to nothing else, and the same bytes with a
+            # loopback Host are answered 200 on a live socket. That is the
+            # cleanest possible statement of "the Host refusal is real and
+            # it is a separate cause", which is what this test is for.
+            ("plain get", "bad host"): (
+                ("GET /api/wallet/list HTTP/1.1\r\n"
+                 + bad + "\r\n"), 403, True),
+            ("plain get", "loopback host"): (
+                ("GET /api/wallet/list HTTP/1.1\r\n"
+                 + good + "\r\n"), 200, False),
+        }
+        for (probe, host), (text, expect_status, expect_closed) in cells.items():
+            with self.subTest(probe=probe, host=host):
+                responses, trailing, closed, data = self.probe(text.encode())
+                self.assertEqual(len(responses), 1, data[:400])
+                self.assertEqual(trailing, b"")
+                status, _headers, payload = split_response(responses[0])
+                self.assertEqual(status, expect_status, payload[:300])
+                if expect_status == 403:
+                    self.assertEqual(json.loads(payload)["error"]["reason"],
+                                     "not_loopback")
+                self.assertEqual(
+                    closed, expect_closed,
+                    "%s with a %s: closed=%s, which is not what makes the "
+                    "two causes tellable apart" % (probe, host, closed))
+
+
+# ======================================================================
+# THE MINT PORT IS NOT NECESSARILY THE MINT
+#
+# The round's own finding shape, one layer down and in the function the
+# round touched. _mint_http widened its json.loads clause to catch
+# RecursionError -- copied out of the console's tuple at
+# mint_console.py:1252, which is
+#
+#     (OSError, ValueError, RecursionError, http.client.HTTPException)
+#
+# -- and left the fourth member behind. http.client.HTTPException is a
+# plain Exception, not an OSError, so the urlopen/read above the parse
+# caught none of it and four shapes of reply walked out of the Api and
+# into the blanket handler: HTTP/1.1 500 internal_error, with a traceback
+# on the operator's terminal, on /api/mint/descriptor, /api/token/status
+# and /api/mint/issue. The money route is the one that matters: a 500
+# there leaves it undetermined whether tokens were created and says
+# nothing about it.
+#
+# These tests put a real socket on the mint port and answer real garbage.
+# ======================================================================
+class TestTheMintPortAnsweredSomethingThatIsNotHttp(ServerCase):
+
+    #: Every http.client.HTTPException the stdlib client raises for a
+    #: reply that is not HTTP, with the class it raises named so a reader
+    #: can check the tuple against the exception hierarchy rather than
+    #: against this comment.
+    REPLIES = {
+        "BadStatusLine": b"GARBAGE\r\n\r\n",
+        "HTTPException (more than 100 headers)":
+            b"HTTP/1.1 200 OK\r\n"
+            + b"".join(b"X-Pad-%d: v\r\n" % i for i in range(200))
+            + b"\r\n",
+        "IncompleteRead":
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
+        "LineTooLong":
+            b"HTTP/1.1 200 OK\r\nX-Big: " + b"a" * 200_000 + b"\r\n\r\n",
+    }
+
+    #: The three routes that reach _mint_http, derived from the call sites
+    #: rather than typed from memory: descriptor, token status, issue.
+    ROUTES = (
+        ("GET", "/api/mint/descriptor", None),
+        ("GET", "/api/token/status?token=abc", None),
+        ("POST", "/api/mint/issue", {"amount_mc": 500, "count": 2}),
+    )
+
+    def rogue(self, reply: bytes) -> int:
+        """A real listener on a real port that answers ``reply``, verbatim.
+
+        Not an http.server: the whole point is a reply the stdlib's own
+        server could not produce. It reads the request first, so the GUI's
+        request is genuinely sent and the outcome genuinely undetermined.
+        """
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        stop = threading.Event()
+
+        def serve():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except (socket.timeout, TimeoutError, OSError):
+                    continue
+                try:
+                    conn.recv(65536)
+                    conn.sendall(reply)
+                    # EOF, not a reset. Closing outright races the reader:
+                    # a peer that is still mid-read gets ECONNRESET, which
+                    # is an OSError and lands on the mint_unreachable
+                    # clause instead of the one under test. Half-closing
+                    # and then waiting for the client to hang up gives the
+                    # deterministic end-of-message every one of these
+                    # replies needs to be the exception it is named for.
+                    conn.shutdown(socket.SHUT_WR)
+                    conn.settimeout(5)
+                    while conn.recv(65536):
+                        pass
+                except OSError:                          # pragma: no cover
+                    pass
+                finally:
+                    conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        port = listener.getsockname()[1]
+        self.addCleanup(listener.close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(stop.set)
+
+        real = self.control.status
+
+        def status_here():
+            out = dict(real())
+            out["base_url"] = "http://127.0.0.1:%d" % port
+            out["port"] = port
+            return out
+
+        self.control.status = status_here
+        self.addCleanup(self.control.__dict__.pop, "status", None)
+        return port
+
+    def drive(self, reply):
+        """Every route against one rogue reply, with stderr captured."""
+        self.rogue(reply)
+        noise = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = noise                  # the handler thread prints here
+        try:
+            out = [(method, path) + self.call(method, path, body)
+                   for method, path, body in self.ROUTES]
+        finally:
+            sys.stderr = saved
+        return out, noise.getvalue()
+
+    def test_a_reply_that_is_not_http_is_not_an_internal_error(self):
+        """The finding itself: four replies, three routes, twelve cells."""
+        for label, reply in self.REPLIES.items():
+            results, noise = self.drive(reply)
+            for method, path, status, obj, raw in results:
+                with self.subTest(reply=label, route="%s %s" % (method, path)):
+                    self.assert_envelope(status, obj, raw)
+                    self.assertEqual(
+                        status, 502,
+                        "%s %s answered %d for a %s reply: %r"
+                        % (method, path, status, label, raw[:300]))
+                    self.assertEqual(obj["error"]["reason"],
+                                     "bad_mint_response", raw[:300])
+                    self.assertEqual(obj["error"]["cause"], "unknown",
+                                     raw[:300])
+            with self.subTest(reply=label, check="terminal"):
+                self.assertNotIn("Traceback", noise, noise[:600])
+
+    def test_it_does_not_say_the_mint_did_not_answer(self):
+        """The cause vocabulary, which is the whole reason for the split.
+
+        mint_unreachable means "nothing answered; it never saw the
+        request" and page.html renders it as exactly that. Octets came
+        back here. Saying unreachable would put that headline above a
+        detail describing what arrived -- and on the issue route it would
+        do it about money.
+        """
+        for label, reply in self.REPLIES.items():
+            results, _noise = self.drive(reply)
+            for method, path, _status, obj, raw in results:
+                with self.subTest(reply=label, route="%s %s" % (method, path)):
+                    self.assertNotEqual(obj["error"]["cause"],
+                                        "mint_unreachable", raw[:300])
+                    self.assertNotIn("did not answer", obj["error"]["detail"])
+
+    def test_the_issue_route_says_the_outcome_is_undetermined(self):
+        """The money route, and the reason a 500 there is not acceptable.
+
+        The request went out. Whatever is on that port may have created
+        tokens against secrets that existed only inside that call. The
+        answer has to say so -- which it does, because the cause is
+        unknown and route_mint_issue appends the undetermined sentence to
+        exactly that cause.
+        """
+        for label, reply in self.REPLIES.items():
+            with self.subTest(reply=label):
+                self.rogue(reply)
+                noise, saved = io.StringIO(), sys.stderr
+                sys.stderr = noise
+                try:
+                    status, obj, raw = self.call(
+                        "POST", "/api/mint/issue",
+                        {"amount_mc": 500, "count": 2})
+                finally:
+                    sys.stderr = saved
+                self.assertEqual(status, 502, raw[:300])
+                detail = obj["error"]["detail"]
+                self.assertIn("UNDETERMINED", detail)
+                self.assertIn("1000 mc", detail)
+                self.assertNotIn("Nothing was issued", detail)
+
+    def test_the_answer_quotes_no_traceback_to_the_browser(self):
+        """A rogue process on that port must not get to write the page."""
+        for label, reply in self.REPLIES.items():
+            results, _noise = self.drive(reply)
+            for method, path, _status, _obj, raw in results:
+                with self.subTest(reply=label, route="%s %s" % (method, path)):
+                    text = raw.decode("utf-8", "replace")
+                    for forbidden in ("Traceback", "internal_error",
+                                      "Something inside this GUI failed",
+                                      "urllib", "http/client.py"):
+                        self.assertNotIn(forbidden, text, text[:400])
+
+    def test_a_refused_connection_is_still_mint_unreachable(self):
+        """The neighbour, so the widened clause did not swallow it.
+
+        Nothing listening is the one shape that really is "the mint did
+        not answer", and it must keep saying so: connection refused is a
+        ConnectionRefusedError, an OSError, and it is caught ABOVE the new
+        clause. http.client.RemoteDisconnected is the same story spelled
+        differently -- it inherits from ConnectionResetError AND from
+        BadStatusLine, and the order of the except clauses is what keeps
+        it on the mint_unreachable side.
+        """
+        port = free_port()
+        real = self.control.status
+
+        def status_here():
+            out = dict(real())
+            out["base_url"] = "http://127.0.0.1:%d" % port
+            out["port"] = port
+            return out
+
+        self.control.status = status_here
+        self.addCleanup(self.control.__dict__.pop, "status", None)
+        status, obj, raw = self.call("GET", "/api/mint/descriptor")
+        self.assertEqual(status, 502, raw[:300])
+        self.assertEqual(obj["error"]["cause"], "mint_unreachable", raw[:300])
+
+    def test_the_client_call_is_guarded_where_the_parse_is(self):
+        """The drift question, asked of the CALL and not only the parse.
+
+        The enumeration that missed this asked what every json.loads can
+        raise and stopped there. The call that FEEDS the parse raises its
+        own family, and it is a family no clause above it named. This
+        walks the source instead of trusting that it was thought about:
+        every urlopen/getresponse in this file must sit under a handler
+        that names HTTPException.
+        """
+        with open(gui_app.__file__, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        checked = 0
+        for outer in ast.walk(tree):
+            if not isinstance(outer, ast.Try):
+                continue
+            handled = set()
+            for handler in outer.handlers:
+                node = handler.type
+                if node is None:
+                    handled.add("BARE")
+                elif isinstance(node, ast.Tuple):
+                    for elt in node.elts:
+                        handled.add(getattr(elt, "attr", None)
+                                    or getattr(elt, "id", ""))
+                else:
+                    handled.add(getattr(node, "attr", None)
+                                or getattr(node, "id", ""))
+            for node in outer.body:
+                for call in ast.walk(node):
+                    if (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr in ("urlopen", "getresponse")):
+                        checked += 1
+                        self.assertIn(
+                            "HTTPException", handled,
+                            "gui/app.py:%d speaks to another process under a "
+                            "handler that does not name HTTPException (%s). "
+                            "BadStatusLine, IncompleteRead and LineTooLong "
+                            "are not OSErrors and become a bare 500."
+                            % (call.lineno, sorted(handled)))
+        self.assertTrue(checked, "the walk found no client call to check; "
+                                 "the assertion above is vacuous")
+
+
+# ======================================================================
+# A MALFORMED BODY IS NOT A FRAMING FAILURE
+#
+# The connection decision, which this server got wrong in the one path
+# its own comment said it got right. Every cell here sends a body the
+# reader refuses and a COMPLETE valid request pipelined behind it: if the
+# socket survives, the second request is answered on it, and that is the
+# assertion. The mint and the supervision server answer both, measured.
+# ======================================================================
+class TestABadBodyDoesNotCostTheConnection(ServerCase):
+
+    #: One class of bad body per spelling of "no".
+    BODIES = {
+        "unterminated object": b"{",
+        "not an object": b"[]",
+        "invalid utf-8": b'{"name": "\xff\xfe"}',
+        "five thousand digits": b'{"amount_mc": ' + b"9" * 5000 + b"}",
+        "ten thousand levels deep": (b"[" * 10_000) + (b"]" * 10_000),
+    }
+
+    def two_requests(self, path, body, headers=None):
+        """A POST with ``body``, then a valid GET, on one connection."""
+        head = ("POST %s HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Cookie: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n"
+                % (path, self.port, self.cookie, len(body)))
+        second = ("GET /api/wallet/list HTTP/1.1\r\n"
+                  "Host: 127.0.0.1:%d\r\n"
+                  "Cookie: %s\r\n\r\n" % (self.port, self.cookie))
+        payload = ((head + (headers or "") + "\r\n").encode() + body
+                   + second.encode())
+        return exchange_and_watch(self.port, payload, expect=2)
+
+    def test_the_pipelined_request_behind_a_bad_body_is_answered(self):
+        """Two requests in, two responses out, on one socket."""
+        for label, body in self.BODIES.items():
+            with self.subTest(body=label):
+                responses, trailing, closed, data = self.two_requests(
+                    "/api/wallet/pay", body)
+                self.assertEqual(
+                    len(responses), 2,
+                    "%s: %d response(s), so the request behind it was "
+                    "discarded: %r" % (label, len(responses), data[:400]))
+                self.assertEqual(trailing, b"")
+                first, second = (split_response(r) for r in responses)
+                self.assertEqual(first[0], 400, first[2][:300])
+                self.assertEqual(json.loads(first[2])["error"]["reason"],
+                                 "bad_json", first[2][:300])
+                self.assertIsNone(
+                    first[1].get("connection"),
+                    "%s: announced a close for a body that was read whole"
+                    % label)
+                self.assertEqual(second[0], 200, second[2][:300])
+
+    def test_every_post_route_keeps_the_socket(self):
+        """Not one route: the reader is shared, so the claim is shared."""
+        for path in POST_ROUTES:
+            with self.subTest(path=path):
+                responses, trailing, closed, data = self.two_requests(
+                    path, b"{")
+                self.assertEqual(len(responses), 2, data[:400])
+                self.assertEqual(trailing, b"")
+                self.assertEqual(split_response(responses[1])[0], 200,
+                                 data[:400])
+
+    def test_an_unframable_body_still_costs_the_connection(self):
+        """The other side of the line, and why this is not "never close".
+
+        No trustworthy statement of length means the octets on the wire
+        cannot be told from the next request line. Nothing was read, the
+        stream is not framed, and the socket does not survive -- so the
+        request behind it is NOT answered, and must not be.
+        """
+        head = ("POST /api/wallet/pay HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Cookie: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n" % (self.port, self.cookie))
+        second = ("GET /api/wallet/list HTTP/1.1\r\n"
+                  "Host: 127.0.0.1:%d\r\n"
+                  "Cookie: %s\r\n\r\n" % (self.port, self.cookie))
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, (head + second).encode(), expect=1)
+        self.assertEqual(len(responses), 1, data[:400])
+        self.assertEqual(trailing, b"")
+        self.assertTrue(closed, "an unframable request kept the socket")
+        status, headers, payload = split_response(responses[0])
+        self.assertEqual(status, 400, payload[:300])
+        self.assertEqual(json.loads(payload)["error"]["reason"],
+                         "unframable_request")
+        self.assertEqual(headers.get("connection"), "close")
+
+    def test_a_short_body_still_costs_the_connection(self):
+        """A body that stopped before its own declared length.
+
+        The peer said more octets were coming and then did not send them.
+        Whatever arrives next cannot be told from the rest of this body,
+        so this one closes too -- the distinction being drawn is "were the
+        octets read", not "did the parse like them".
+        """
+        body = b'{"name": "alice"}'
+        head = ("POST /api/wallet/create HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Cookie: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n\r\n" % (self.port, self.cookie,
+                                                len(body) + 40))
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, head.encode() + body, expect=1, half_close=True)
+        self.assertEqual(len(responses), 1, data[:400])
+        self.assertEqual(trailing, b"")
+        self.assertTrue(closed, "a truncated body kept the socket")
+        status, headers, payload = split_response(responses[0])
+        self.assertEqual(status, 400, payload[:300])
+        self.assertEqual(json.loads(payload)["error"]["reason"], "bad_request")
+        self.assertEqual(headers.get("connection"), "close")
+
+    def test_a_peer_that_asked_to_close_is_still_obeyed(self):
+        """Keeping the socket is not overriding the client.
+
+        Connection: close is the peer's decision, not this server's, and
+        the drain does not undo it.
+        """
+        body = b"{"
+        payload = ("POST /api/wallet/pay HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n"
+                   "Cookie: %s\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "Content-Length: %d\r\n\r\n"
+                   % (self.port, self.cookie, len(body))).encode() + body
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1)
+        self.assertEqual(len(responses), 1, data[:400])
+        self.assertTrue(closed, "the peer asked to close and was not obeyed")
+        status, headers, payload_bytes = split_response(responses[0])
+        self.assertEqual(status, 400, payload_bytes[:300])
+        self.assertEqual(headers.get("connection"), "close")
+
+
+# ======================================================================
+# THE BAND EITHER SIDE OF THE PARSER'S DEPTH LIMIT
+#
+# The nesting tests pin 100 levels (accepted) and 40,000 (refused). On
+# this interpreter json.loads gives up at about 9,980, so nothing in the
+# suite sat anywhere near the boundary and a change that moved it -- a
+# depth rule invented locally, a different parser, a thread with a
+# smaller stack -- would have been invisible in both directions.
+#
+# This does not pin the boundary, which is the interpreter's business and
+# moves between builds. It sweeps ACROSS it and asserts the only two
+# things that are this server's business: every depth is answered exactly
+# once, and every answer is either the route's or a bad_json -- never a
+# 500, never silence, never octets past the framing.
+# ======================================================================
+class TestTheNestingBoundaryBand(ServerCase):
+
+    DEPTHS = tuple(range(8_000, 11_001, 250))
+
+    def ask(self, depth):
+        body = (b'{"name": "alice", "amount_mc": 11, "note": %s}'
+                % ((b"[" * depth) + (b"]" * depth)))
+        payload = ("POST /api/wallet/pay HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n"
+                   "Cookie: %s\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "Content-Length: %d\r\n\r\n"
+                   % (self.port, self.cookie, len(body))).encode() + body
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=20.0, linger=0.2)
+        self.assertEqual(len(responses), 1,
+                         "depth %d: %d response(s): %r"
+                         % (depth, len(responses), data[:300]))
+        self.assertEqual(trailing, b"", "depth %d left octets" % depth)
+        return split_response(responses[0])
+
+    def test_every_depth_across_the_boundary_is_answered_the_same_two_ways(self):
+        outcomes = set()
+        for depth in self.DEPTHS:
+            with self.subTest(depth=depth):
+                status, _headers, payload = self.ask(depth)
+                if status == 200:
+                    outcomes.add("accepted")
+                    continue
+                self.assertEqual(status, 400, "depth %d answered %d: %r"
+                                 % (depth, status, payload[:300]))
+                self.assertEqual(json.loads(payload)["error"]["reason"],
+                                 "bad_json", payload[:300])
+                outcomes.add("bad_json")
+        self.assertEqual(
+            outcomes, {"accepted", "bad_json"},
+            "the sweep did not straddle the parser's limit (%s); it is "
+            "measuring one side of a boundary it was written to cross"
+            % sorted(outcomes))
+
+    def test_the_deepest_accepted_document_reaches_the_route(self):
+        """The half a "refuse everything deep" rule would break.
+
+        Just under the limit is a legal JSON document and the route runs
+        on it. Without this, a local depth cap -- the thing the refusal
+        must NOT become -- would pass the whole class.
+        """
+        status, _headers, payload = self.ask(9_000)
+        self.assertEqual(status, 200, payload[:300])
+
+
+# ======================================================================
+# THE ONE PATH THAT COULD ANSWER BEFORE THE FRAMING GATE
+# ======================================================================
+class TestAnInterimAnswerIsNotEmittedBeforeTheGate(ServerCase):
+    """Expect: 100-continue, which is live on three of the four servers.
+
+    protocol_version = HTTP/1.1 makes BaseHTTPRequestHandler.
+    handle_expect_100 reachable, and it fires inside parse_request --
+    before _handle, and therefore before the framing gate everything in
+    this round is built around. The console considered this exact hook,
+    neutralised it and has a test for it, even though its own
+    protocol_version leaves it unreachable; nothing carried that across to
+    the servers where it was reachable, and neither the 58-spelling sweep
+    nor the round's new tests ever sent the header.
+
+    MEASURED AT ALL FOUR, byte-identical requests, through the harness in
+    impl/tests/test_c06_mintapi.py: POST with Expect: 100-continue and a
+    chunked body drew a bare "HTTP/1.1 100 Continue" out of the mint and
+    out of the supervision profile as well, ahead of their own framing
+    refusal. Those two files are not this round's to edit and the finding
+    is reported rather than fixed there; these tests are this server's
+    half, and they are what the other two would inherit.
+    """
+
+    def probe(self, extra, path="/api/wallet/pay", body=b""):
+        payload = ("POST %s HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n"
+                   "Cookie: %s\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Expect: 100-continue\r\n"
+                   "%s\r\n" % (path, self.port, self.cookie, extra)).encode()
+        return exchange_and_watch(self.port, payload + body, expect=1)
+
+    def test_no_continue_before_a_framing_refusal(self):
+        """The finding: a bare 100 promising to read an unframable body."""
+        for label, extra in (("chunked", "Transfer-Encoding: chunked\r\n"),
+                             ("two lengths",
+                              "Content-Length: 5\r\nContent-Length: 6\r\n"),
+                             ("no length at all", "")):
+            with self.subTest(spelling=label):
+                responses, trailing, closed, data = self.probe(extra)
+                self.assertNotIn(
+                    b"100 Continue", data,
+                    "%s: this server invited a body it had already decided "
+                    "not to frame: %r" % (label, data[:200]))
+                self.assertEqual(len(responses), 1, data[:300])
+                self.assertEqual(trailing, b"")
+                self.assertTrue(closed)
+                status, headers, payload = split_response(responses[0])
+                self.assertEqual(status, 400, payload[:300])
+                self.assertEqual(json.loads(payload)["error"]["reason"],
+                                 "unframable_request", payload[:300])
+                self.assertEqual(headers.get("connection"), "close")
+
+    def test_no_continue_before_a_body_too_large_to_read(self):
+        """The same promise, one refusal along."""
+        responses, trailing, closed, data = self.probe(
+            "Content-Length: %d\r\n" % (gui_app.MAX_BODY_BYTES + 1))
+        self.assertNotIn(b"100 Continue", data, data[:200])
+        self.assertEqual(len(responses), 1, data[:300])
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 413, payload[:300])
+        self.assertEqual(json.loads(payload)["error"]["reason"], "too_large")
+        self.assertTrue(closed)
+
+    def test_a_framable_body_still_gets_its_continue(self):
+        """And the hook is not simply switched off.
+
+        A client that waits for the interim answer before sending its body
+        has to get one, or every such request pays the body-read timeout.
+        The override refuses the requests the gate would refuse and hands
+        the rest to the stdlib.
+        """
+        body = json.dumps({"name": "alice", "amount_mc": 11}).encode()
+        responses, trailing, closed, data = self.probe(
+            "Content-Length: %d\r\n" % len(body), body=body)
+        self.assertIn(b"HTTP/1.1 100 Continue", data, data[:200])
+        self.assertEqual(trailing, b"")
+        # The interim line is not a response: split_all_responses counts it
+        # as one, so the tail is what matters here.
+        self.assertTrue(data.rstrip().endswith(b"}"), data[-200:])
+        self.assertIn(b"200 OK", data)
+
+    def test_the_interim_answer_does_not_suppress_the_real_one(self):
+        """A 1xx is not an answer, and must not be recorded as one.
+
+        The console's note on this hook: counting the 100 as "a response
+        has begun" is what made its own last-resort handler suppressible,
+        and a failing request would then get silence -- the defect class
+        re-entering through the fix for it. _send only records a status of
+        200 or more, and this is the test of that.
+        """
+        body = json.dumps({"name": "alice", "amount_mc": 11}).encode()
+        broken = RuntimeError("after the continue, before the answer")
+        original = gui_app.Handler._handle
+
+        def explode(self, method):
+            raise broken
+
+        gui_app.Handler._handle = explode
+        self.addCleanup(setattr, gui_app.Handler, "_handle", original)
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            responses, trailing, closed, data = self.probe(
+                "Content-Length: %d\r\n" % len(body), body=body)
+        finally:
+            sys.stderr = saved
+        self.assertIn(b"HTTP/1.1 100 Continue", data, data[:200])
+        self.assertIn(b"500", data, data[:300])
+        self.assertIn("internal_error", data.decode("utf-8", "replace"))
+
+
+# ======================================================================
+# NOTHING LEAVES THIS SERVER WITH NO ANSWER AT ALL
+#
+# The coverage boundary of the blanket handler, which the enumeration
+# never asked about. _handle's try starts after the HTTP/0.9 refusal,
+# after the framing verdict and after the path parsing, and a try does
+# not cover its own except and finally clauses -- where _error -> _json
+# -> _send is what writes to the socket. Both sibling servers have a
+# handle_one_request last resort for exactly this; this one did not.
+# ======================================================================
+class TestNothingLeavesThisServerUnanswered(ServerCase):
+
+    def request(self, path="/api/wallet/list", method="GET"):
+        payload = ("%s %s HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n"
+                   "Cookie: %s\r\n"
+                   "Connection: close\r\n\r\n"
+                   % (method, path, self.port, self.cookie)).encode()
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            out = exchange_and_watch(self.port, payload, expect=1)
+        finally:
+            sys.stderr = saved
+        return out + (noise.getvalue(),)
+
+    def break_it(self, name, boom=None):
+        """Make one module-level name raise, for one test."""
+        original = getattr(gui_app, name)
+
+        def explode(*args, **kwargs):
+            raise boom or RuntimeError("%s failed" % name)
+
+        setattr(gui_app, name, explode)
+        self.addCleanup(setattr, gui_app, name, original)
+
+    def test_a_failure_before_the_blanket_handler_is_still_answered(self):
+        """framing_fields runs OUTSIDE _handle's try, on every request."""
+        self.break_it("framing_fields")
+        responses, trailing, closed, data, noise = self.request()
+        self.assertEqual(len(responses), 1,
+                         "zero bytes back, which is the bar's own words: %r"
+                         % data[:200])
+        self.assertEqual(trailing, b"")
+        status, headers, payload = split_response(responses[0])
+        self.assertEqual(status, 500, payload[:300])
+        obj = json.loads(payload)
+        self.assert_envelope(status, obj, payload)
+        self.assertEqual(obj["error"]["reason"], "internal_error")
+        self.assertEqual(headers.get("connection"), "close")
+        self.assertIn("Traceback", noise,
+                      "the operator got no trace of a failure that is a bug "
+                      "in this file")
+
+    def test_the_verdict_itself_failing_is_answered_too(self):
+        self.break_it("framing_verdict")
+        responses, _trailing, _closed, data, _noise = self.request()
+        self.assertEqual(len(responses), 1, data[:200])
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 500, payload[:300])
+
+    def test_the_backstop_does_not_write_a_second_response(self):
+        """A failure AFTER the answer is on the wire is not answered twice.
+
+        That is the desync this whole round exists to prevent, and it is
+        the shape a naive last resort introduces: _handle answers, the
+        finally clause raises, and the backstop appends a second status
+        line to a socket that already carries one.
+        """
+        original = gui_app.Handler._handle
+
+        def answer_then_fail(self, method):
+            original(self, method)
+            raise RuntimeError("in the finally, after the answer")
+
+        gui_app.Handler._handle = answer_then_fail
+        self.addCleanup(setattr, gui_app.Handler, "_handle", original)
+        responses, trailing, _closed, data, noise = self.request()
+        self.assertEqual(len(responses), 1,
+                         "two responses on one request: %r" % data[:400])
+        self.assertEqual(trailing, b"",
+                         "octets past the framing: %r" % trailing[:200])
+        status, _headers, payload = split_response(responses[0])
+        self.assertEqual(status, 200, payload[:300])
+        self.assertIn("Traceback", noise)
+
+    def test_the_answer_is_a_sentence_and_not_a_stack_trace(self):
+        self.break_it("framing_fields", RuntimeError("secret-looking text"))
+        responses, _trailing, _closed, data, _noise = self.request()
+        text = data.decode("utf-8", "replace")
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("secret-looking text", text)
+        self.assertNotIn("RuntimeError", text)
+
+    def test_it_does_not_claim_nothing_happened(self):
+        """The honesty rule the console's version of this is written to.
+
+        A backstop cannot know whether the request took effect -- POST
+        /api/mint/issue creates money and then formats tokens locally --
+        so the sentence must not assert that it did not.
+        """
+        self.break_it("framing_fields")
+        responses, _trailing, _closed, data, _noise = self.request()
+        self.assertEqual(len(responses), 1, data[:200])
+        _status, _headers, payload = split_response(responses[0])
+        detail = json.loads(payload)["error"]["detail"]
+        self.assertIn("cannot tell whether the request took effect", detail)
+
+
+# ======================================================================
+# THE THREE HARDENINGS THE MINT HAD AND THIS SERVER DID NOT
+#
+# All three findings below are the same shape, and it is the shape that
+# has cost this project four rounds: a transport bound was reported once,
+# fixed in the server it was reported against, and never carried to the
+# three siblings. The coverage that let each one survive here is the part
+# worth naming, because a green suite over the wrong shape reads as
+# coverage and is worse than none:
+#
+#   * the drip: this file's socket tests all send a COMPLETE request in
+#     one sendall(), so nothing in 8,000 lines ever exercised a request
+#     that arrives slowly, and the class attribute that was supposed to
+#     bound one was an idle timeout wearing the word "deadline" in its
+#     comment.
+#   * the leading empty line: every raw payload in this file starts at
+#     the method token. The one shape RFC 7230 §3.5 says a server SHOULD
+#     tolerate was never sent.
+#   * the unroutable target: it WAS covered, by a test that asserted the
+#     defect. See
+#     test_an_absolute_form_target_is_answered_once_and_the_socket_goes.
+#
+# Every test here drives raw sockets and every one of them fails against
+# the app.py that preceded it.
+# ======================================================================
+class TestTheDripIsBoundedByAWallClock(ServerCase):
+    """An idle timeout is not a request budget, and this one was not one.
+
+    MEASURED BEFORE THE FIX, against this server, with no credential and
+    no valid route needed: a connection that sent
+    ``GET /api/mint/status HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n`` and then
+    ONE BYTE EVERY TWO SECONDS into the header block held a handler thread
+    and a file descriptor for as long as it kept dripping -- 41 seconds in
+    the run that produced this class, past 100 seconds in the verifier's.
+    ``Handler.timeout`` is applied per recv, so every one of those bytes
+    reset it, and GuiServer is a ThreadingHTTPServer, which caps neither
+    connections nor threads: N such sockets are N parked threads, and the
+    cost to mount it is one byte every two seconds per socket.
+
+    The fix is the mint's, imported and not rewritten: ``_DeadlineRaw``
+    under ``io.BufferedReader``, which is the only position that covers
+    the HEADER phase as well as the body.
+    """
+
+    #: Clamped for the test, so watching a drip die costs a second instead
+    #: of ten. The SHIPPED value is asserted separately below, because a
+    #: test that only ever sets its own is a test of nothing.
+    CLAMP = 1.0
+
+    def drip(self, head, step=0.15, limit=8.0):
+        """Send `head`, then one byte at a time. Returns (held, closed).
+
+        The drip is deliberately far faster than the idle timeout: if
+        ``Handler.timeout`` were what ended this connection the test would
+        prove nothing.
+        """
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=20.0)
+        self.addCleanup(sock.close)
+        sock.sendall(head)
+        started = time.monotonic()
+        closed = False
+        while time.monotonic() - started < limit:
+            time.sleep(step)
+            try:
+                sock.sendall(b"X")
+            except OSError:
+                closed = True           # the server hung up mid-drip
+                break
+            sock.settimeout(0.05)
+            try:
+                if sock.recv(65536) == b"":
+                    closed = True
+                    break
+                while sock.recv(65536):   # an answer arrived; drain to EOF
+                    pass
+                closed = True
+                break
+            except (socket.timeout, TimeoutError):
+                pass
+        return time.monotonic() - started, closed
+
+    def clamp(self):
+        original = gui_app.Handler.request_timeout
+        self.assertIsNotNone(original)
+        gui_app.Handler.request_timeout = self.CLAMP
+        self.addCleanup(setattr, gui_app.Handler, "request_timeout", original)
+        # The idle timeout keeps its shipped value on purpose.
+        self.assertGreaterEqual(gui_app.Handler.timeout, 5)
+
+    def test_a_drip_into_the_header_block_is_ended_by_the_deadline(self):
+        """The measured finding, with no credential anywhere in it.
+
+        The header phase is the half an idle timeout cannot reach and the
+        half no authentication runs in front of: this connection never
+        completes a request line, so ``_authorize`` never runs and the
+        peer never has to be anybody.
+        """
+        self.clamp()
+        held, closed = self.drip(b"GET /api/mint/status HTTP/1.1\r\n"
+                                 b"Host: 127.0.0.1\r\n")
+        self.assertTrue(closed,
+                        "a header-block drip held the connection, and its "
+                        "thread, for %.1fs and counting" % held)
+        self.assertLess(held, 5.0,
+                        "the request outlived its deadline: %.1fs" % held)
+
+    def test_a_drip_into_the_body_is_ended_too(self):
+        """The same bound, one phase down, on an authenticated POST.
+
+        ``Content-Length`` is exactly MAX_BODY_BYTES, so the byte cap
+        never fires and only a wall clock can end this.
+        """
+        self.clamp()
+        head = ("POST /api/wallet/create HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\nCookie: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n\r\n"
+                % (self.port, self.cookie, gui_app.MAX_BODY_BYTES)).encode()
+        held, closed = self.drip(head)
+        self.assertTrue(closed,
+                        "a dripped body held the connection for %.1fs" % held)
+        self.assertLess(held, 5.0,
+                        "the body outlived its deadline: %.1fs" % held)
+
+    def test_the_deadline_is_the_shipped_default_and_it_is_finite(self):
+        """Not something only a test sets, and not something only a
+        deployment sets either."""
+        self.assertEqual(gui_app.Handler.request_timeout,
+                         gui_app.REQUEST_DEADLINE_S)
+        self.assertGreater(gui_app.REQUEST_DEADLINE_S, 0)
+        self.assertLessEqual(gui_app.REQUEST_DEADLINE_S, 120)
+
+    def test_the_budget_is_sized_against_the_page_and_the_body_cap(self):
+        """Why TEN and not the mint's thirty, asserted rather than argued.
+
+        Two bounds, both of them properties of THIS server:
+
+          * page.html aborts its own fetch and shows its own message
+            instead of whatever this server determined, so a request whose
+            READ alone can outlast that is a request whose answer nothing
+            will read. Each budget is at most half of the page's patience,
+            leaving the other half to the other direction.
+          * require_loopback() refuses to bind anything the world can
+            reach, so every request this server will ever read is written
+            by a process on this machine. The floor the budget implies
+            against a full MAX_BODY_BYTES body is asserted to be modest --
+            far below loopback, far above any drip.
+
+        AND THE PAGE'S PATIENCE IS NOT ONE NUMBER, which is what the
+        version of this test that stood here got wrong: it pinned against
+        PAGE_ABORT_S alone, and PAGE_ABORT_S is ``TIMEOUTS.default``,
+        which covers nineteen of the twenty-one routes. /api/mint/start
+        waits 90s and /api/mint/stop 70s. The premise a budget is argued
+        from has to be the whole object, so this reads the whole object
+        and pins against the SMALLEST of the three -- which is the default
+        today, so the number is unchanged and the ARGUMENT is now true.
+        A page that shortens any of the three fails here.
+        """
+        declared = page_timeouts_ms()
+        self.assertIn("default", declared)
+        self.assertEqual(gui_app.PAGE_ABORT_S, declared["default"] / 1000.0,
+                         "app.py's PAGE_ABORT_S is not page.html's default")
+        shortest = min(declared.values()) / 1000.0
+        for name, budget in (("read", gui_app.REQUEST_DEADLINE_S),
+                             ("write", gui_app.RESPONSE_BUDGET_S)):
+            self.assertLessEqual(
+                budget, shortest / 2,
+                "the %s budget (%.1fs) is more than half the page's "
+                "shortest patience (%.1fs, from TIMEOUTS %r)"
+                % (name, budget, shortest, declared))
+        # Both halves together must still fit inside it, or a request that
+        # spends its whole read budget has no answering time left at all.
+        self.assertLessEqual(
+            gui_app.REQUEST_DEADLINE_S + gui_app.RESPONSE_BUDGET_S, shortest,
+            "read budget + write budget outlasts the page's own abort")
+        floor_bytes_per_second = (gui_app.MAX_BODY_BYTES
+                                  / gui_app.REQUEST_DEADLINE_S)
+        self.assertLess(floor_bytes_per_second, 1 << 20,
+                        "the budget demands more than a megabyte a second "
+                        "of a local client")
+        self.assertGreater(floor_bytes_per_second, 1 << 10,
+                           "the budget is so loose a drip fits inside it")
+
+    def test_the_idle_timeout_is_a_ceiling_over_both_budgets(self):
+        """The ordering, pinned so an edit cannot invert it.
+
+        WHAT THIS TEST USED TO BE CALLED, because the rename is the
+        finding. It was
+        ``test_the_read_side_is_the_deadline_and_the_write_side_is_the_idle``
+        and its docstring asserted that ``timeout`` "remains the bound on
+        a blocked WRITE". It opened no socket and drove no write, and the
+        claim in its name was FALSE: ``timeout`` is applied per sendall,
+        so a peer that queues responses and drains them slowly gets a
+        fresh window for each one -- measured at 200 seconds and still
+        running on a 2000-deep pipeline. A green test whose NAME asserts a
+        bound nobody measured is the exact defect this round was convened
+        to remove, reproduced inside the fix for it.
+
+        So the write-side claim is gone from here and lives in
+        TestTheWriteSideIsABudgetAndNotAWindow, which drives it on live
+        sockets. What is left here is the arithmetic that has to hold
+        between the three numbers, and only that:
+
+        ``timeout`` is the ceiling on ONE syscall and must be the largest,
+        so it never pre-empts either budget; each budget is the operative
+        bound on its own side. If someone later raises the read deadline
+        above the idle timeout, the header phase goes back to being
+        covered by an idle timeout for the window between them -- which is
+        the original defect. This fails first.
+        """
+        self.assertLess(gui_app.Handler.request_timeout,
+                        gui_app.Handler.timeout,
+                        "the read budget no longer beats the idle timeout: "
+                        "the header phase is back under an idle bound")
+        self.assertLess(gui_app.Handler.write_budget,
+                        gui_app.Handler.timeout,
+                        "the write budget no longer beats the idle timeout")
+        # And the read budget must still clear the page's own poll
+        # interval, or an idle keep-alive socket is torn down under a page
+        # that is about to use it. page.html's fastest poll is four
+        # seconds.
+        self.assertGreater(gui_app.Handler.request_timeout, 4.0)
+
+    def test_the_deadline_is_disarmed_between_requests(self):
+        """Each request on a kept connection gets a WHOLE budget, and the
+        one it was armed for is the one that spends it.
+
+        WHAT THIS TEST USED TO BE, because it is the second of the two
+        this round shipped that certified nothing. It sent two requests
+        back to back down one socket and asserted both were answered --
+        with a docstring claiming "a pause between them longer than a
+        clamped budget" and NO SLEEP ANYWHERE IN THE LOOP. It was verified
+        to pass with the ``self.request_deadline = None`` disarm deleted,
+        because handle_one_request re-arms at the top of every iteration
+        and whether the finally disarms is unobservable from a socket.
+
+        So both halves are driven here, each by the thing that can see it:
+
+          * THE RE-ARM, from outside. Four requests down one connection
+            with a real one-second pause before each, against a budget
+            clamped to two seconds. Every wait and every read is inside
+            one budget; the RUN is not. A deadline armed once per
+            connection instead of once per request expires during the
+            third wait and answers 408 instead of 200, and a budget that
+            is never re-armed at all does the same.
+          * THE DISARM, from inside, because that is where it is visible
+            at all. handle_one_request is wrapped and the deadline is read
+            back the instant it returns: it must be None every time. Delete
+            the disarm and this half fails; nothing driven over a socket
+            can fail for it.
+        """
+        original = gui_app.Handler.request_timeout
+        gui_app.Handler.request_timeout = 2.0
+        self.addCleanup(setattr, gui_app.Handler, "request_timeout", original)
+
+        left_armed = []
+        unwrapped = gui_app.Handler.handle_one_request
+
+        def watch(handler):
+            try:
+                return unwrapped(handler)
+            finally:
+                left_armed.append(handler.request_deadline)
+
+        gui_app.Handler.handle_one_request = watch
+        self.addCleanup(setattr, gui_app.Handler, "handle_one_request",
+                        unwrapped)
+
+        head = ("GET /api/mint/status HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\nCookie: %s\r\n\r\n"
+                % (self.port, self.cookie)).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=20.0)
+        self.addCleanup(sock.close)
+        data = b""
+        for turn in range(4):
+            # A REAL pause, which the version of this test that stood here
+            # only claimed. One second against a two-second budget: fine
+            # per request, and three seconds of it across the run.
+            time.sleep(1.0)
+            sock.sendall(head)
+            deadline = time.monotonic() + 5.0
+            want = complete_responses(data) + 1
+            while complete_responses(data) < want:
+                if time.monotonic() > deadline:
+                    break
+                sock.settimeout(max(0.05, deadline - time.monotonic()))
+                try:
+                    chunk = sock.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not chunk:
+                    break
+                data += chunk
+        responses, trailing = split_all_responses(data)
+        self.assertEqual(len(responses), 4,
+                         "a kept connection lost a request whose own budget "
+                         "was never spent: %r" % data[:400])
+        self.assertEqual(trailing, b"")
+        for response in responses:
+            status, _headers, payload = split_response(response)
+            self.assertEqual(
+                status, 200,
+                "a request inside its own budget was refused (%d): %r"
+                % (status, payload[:200]))
+        # The inside half. Four requests were answered, so at least four
+        # turns through handle_one_request have finished.
+        self.assertGreaterEqual(len(left_armed), 4, left_armed)
+        self.assertEqual(
+            [seen for seen in left_armed if seen is not None], [],
+            "handle_one_request returned with a deadline still armed: %r "
+            "-- state from a finished request, left where the next one "
+            "reads it" % (left_armed,))
+
+    def test_the_deadline_reader_is_the_mints_and_there_is_no_second_copy(self):
+        """One implementation, imported, and a check that it stays one.
+
+        The whole cause of this round is a transport hardening carried by
+        hand from one server to the next, with each hand-carry leaving one
+        server behind. app.py imports aicash.mintapi._DeadlineRaw rather
+        than reproducing it, so there is one wall clock in this repository
+        and not four.
+
+        The second half of this test is what keeps that true: an AST walk
+        over app.py for a class of its own that reads from the socket. A
+        comment cannot satisfy it and a docstring cannot either.
+
+        AND IT LOOKS FOR MORE THAN ONE METHOD NAME, because the version
+        that shipped looked for a class defining literally ``readinto``
+        and nothing else -- so a re-implementation spelled any other way
+        walked past it: a shim over ``read``, a ``recv_into`` wrapper
+        around the socket, or a subclass of the mint's own class that
+        overrode the clock. The whole read surface is named here, and so
+        is inheritance.
+
+        THE WRITE SIDE IS DELIBERATELY NOT COVERED BY THIS GUARD, and the
+        distinction is the point rather than an exemption. ``_DeadlineRaw``
+        bounds one request's reads against an absolute instant and there
+        is exactly one of those in this repository. ``_BudgetedWriter``
+        bounds a connection's writes against an accumulated total, which
+        is a different quantity the mint does not have -- so it is a local
+        class on purpose, and the guard below insists it stay a WRITER by
+        failing if it ever grows a read method.
+        """
+        from aicash import mintapi as real_mintapi
+        self.assertIs(gui_app._DeadlineRaw, real_mintapi._DeadlineRaw,
+                      "app.py is not using the mint's deadline reader")
+        #: Everything a class would have to define to sit under (or
+        #: around, or instead of) the buffered reader and hold a clock of
+        #: its own. Any one of them in a class in app.py is a second
+        #: implementation of the bound the mint already owns.
+        reading = {"readinto", "readinto1", "read", "read1", "readline",
+                   "readlines", "recv", "recv_into", "peek"}
+        with open(gui_app.__file__, encoding="utf-8") as handle:
+            source = ast.parse(handle.read())
+        homegrown, inherited = [], []
+        for node in ast.walk(source):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods = {body.name for body in node.body
+                       if isinstance(body, (ast.FunctionDef,
+                                            ast.AsyncFunctionDef))}
+            overlap = sorted(methods & reading)
+            if overlap:
+                homegrown.append("%s (%s)" % (node.name, ", ".join(overlap)))
+            for base in node.bases:
+                # `class X(_DeadlineRaw)` and `class X(mintapi._DeadlineRaw)`
+                name = getattr(base, "id", None) or getattr(base, "attr", None)
+                if name == "_DeadlineRaw":
+                    inherited.append(node.name)
+        self.assertEqual(homegrown, [],
+                         "app.py grew its own socket reader (%s); there is "
+                         "one in aicash.mintapi and a second copy is how "
+                         "this defect class survived four rounds"
+                         % "; ".join(homegrown))
+        self.assertEqual(inherited, [],
+                         "app.py subclasses the mint's deadline reader (%s); "
+                         "an override of readinto there is a second clock "
+                         "wearing the first one's name"
+                         % ", ".join(inherited))
+
+    def test_the_reader_is_actually_plugged_in(self):
+        """The import and the class attribute prove nothing on their own.
+
+        setup() is what puts the deadline layer under the buffered
+        reader, and a handler whose rfile is the stock one has a comment
+        and no bound. Asserted on a live connection's own handler.
+        """
+        seen = {}
+        original = gui_app.Handler._handle
+
+        def capture(handler, method):
+            seen["rfile"] = handler.rfile
+            seen["raw"] = getattr(handler.rfile, "raw", None)
+            seen["deadline"] = handler.request_deadline
+            return original(handler, method)
+
+        gui_app.Handler._handle = capture
+        self.addCleanup(setattr, gui_app.Handler, "_handle", original)
+        status, _obj, _raw = self.call("GET", "/api/mint/status")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(seen["rfile"], io.BufferedReader)
+        self.assertIsInstance(seen["raw"], gui_app._DeadlineRaw)
+        self.assertIsNotNone(seen["deadline"],
+                             "the deadline was not armed for a live request")
+
+
+class TestTheWriteSideIsABudgetAndNotAWindow(ServerCase):
+    """A timeout that resets is not a budget -- one direction over.
+
+    THE FINDING, MEASURED AGAINST A LIVE ``gui.app.serve()``. The round
+    before this one put a wall clock under the READ side and left a
+    comment saying ``Handler.timeout`` was "the bound on a blocked WRITE".
+    It was not. socketserver applies ``timeout`` to the socket, so it is
+    the ceiling on ONE ``sendall``, and a peer that accepts a few
+    kilobytes inside every window gets a fresh window for every response
+    it queued:
+
+        one socket, 2000 pipelined `GET /` with a valid session cookie
+        (226 KB of request), peer draining ~10 KB/s -- handler thread and
+        fd STILL HELD at 200.0 seconds and 2,006,461 bytes delivered when
+        the measurement was capped.
+
+    And when a write finally did time out, ``_handle``'s blanket
+    ``except Exception`` printed a traceback on the operator's terminal
+    and composed a 500 onto a socket that already carried a partial
+    response -- a second response after a first, buying the peer another
+    whole window: 65.0 seconds of hold on a 400-deep pipeline.
+
+    GuiServer is a ThreadingHTTPServer with no connection or thread cap,
+    so N such sockets are N parked threads, and the cost to mount it is
+    one socket and a slow reader. This is the server that is on by default
+    with an operator in front of it.
+
+    THE FIX IS A CUMULATIVE BUDGET THAT BELONGS TO THE CONNECTION
+    (``_BudgetedWriter`` + ``Handler.write_budget``), because that is the
+    only scope a pipeline cannot multiply: the peer chooses how many
+    responses it queues, so any per-response bound is multiplied by a
+    number the peer picks. AFTER, same harness, same rate: 11.5 seconds
+    and 65,213 bytes, thread and fd back. With the budget removed from the
+    same tree: 55.5 seconds and 401,213 bytes.
+
+    Every test below drives a real socket. None of them asserts the bound
+    by comparing two constants, which is how the claim this class replaces
+    came to be green and false at the same time.
+    """
+
+    #: Clamped so watching a slow drain die costs a second instead of ten.
+    #: The SHIPPED value is asserted separately below.
+    CLAMP = 1.0
+
+    def clamp(self, budget=CLAMP):
+        original = gui_app.Handler.write_budget
+        gui_app.Handler.write_budget = budget
+        self.addCleanup(setattr, gui_app.Handler, "write_budget", original)
+        # The idle timeout keeps its shipped value: if `timeout` were what
+        # ended these connections the tests would prove nothing.
+        self.assertGreaterEqual(gui_app.Handler.timeout, 5)
+
+    def watch_handlers(self):
+        """When each connection's handler thread LET GO, by client port.
+
+        THE THING BEING BOUNDED IS A SERVER-SIDE RESOURCE, and measuring
+        it from the client would measure the wrong end. A slow peer still
+        has megabytes of already-queued response sitting in the kernel
+        when the server hangs up -- the socket buffer autotunes into the
+        megabytes on loopback -- so the client goes on receiving for
+        minutes after the handler thread and the fd are gone. The finding
+        was "handler thread and fd STILL HELD at 200.0s"; this watches
+        exactly that, through ``finish()``, which socketserver calls in a
+        finally when the handler is done with the connection.
+        """
+        released = {}
+        original = gui_app.Handler.finish
+
+        def watch(handler):
+            try:
+                return original(handler)
+            finally:
+                released[handler.client_address[1]] = time.monotonic()
+
+        gui_app.Handler.finish = watch
+        self.addCleanup(setattr, gui_app.Handler, "finish", original)
+        return released
+
+    def drain(self, depth, rate=8192, cap=12.0, cookie=True):
+        """`depth` pipelined ``GET /``, read at about `rate` bytes/second.
+
+        Returns ``(held, released, got, sock)``: how long the handler
+        thread lived, whether it let go at all inside `cap`, how many
+        bytes the slow peer had taken by then, and the socket, still open,
+        for a test that wants to drain the rest.
+
+        The peer always makes progress -- it reads a slice every quarter
+        second, far inside the idle timeout -- which is the whole point: a
+        bound that only fires when a peer stops reading ENTIRELY is not a
+        bound on this shape. ``/`` is the operator page, ~261 KiB, so one
+        response alone is half a minute at this rate.
+        """
+        released = self.watch_handlers()
+        head = "GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n" % self.port
+        if cookie:
+            head += "Cookie: %s\r\n" % self.cookie
+        payload = (head + "\r\n").encode() * depth
+        sock = socket.create_connection(("127.0.0.1", self.port),
+                                        timeout=cap + 5.0)
+        self.addCleanup(sock.close)
+        # A small receive buffer so this peer really is slow rather than
+        # merely polite.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        mine = sock.getsockname()[1]
+        sock.sendall(payload)
+        started = time.monotonic()
+        step, got = 0.25, 0
+        want = max(1, int(rate * step))
+        nxt = started + step
+        while time.monotonic() - started < cap:
+            if mine in released:
+                break
+            now = time.monotonic()
+            if now < nxt:
+                time.sleep(min(0.05, nxt - now))
+                continue
+            nxt += step
+            read = 0
+            while read < want:
+                sock.settimeout(0.05)
+                try:
+                    part = sock.recv(min(4096, want - read))
+                except (socket.timeout, TimeoutError):
+                    break
+                except OSError:             # the server reset us
+                    break
+                if not part:
+                    break
+                got += len(part)
+                read += len(part)
+        letgo = released.get(mine)
+        held = (letgo - started) if letgo else (time.monotonic() - started)
+        return held, letgo is not None, got, sock
+
+    def rest_of_it(self, sock, cap=20.0):
+        """Everything still on the wire after the handler let go, read as
+        fast as the kernel will give it up."""
+        data = b""
+        deadline = time.monotonic() + cap
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                part = sock.recv(1 << 20)
+            except (socket.timeout, TimeoutError):
+                break
+            except OSError:
+                break
+            if not part:
+                break
+            data += part
+        return data
+
+    def test_a_slow_drain_is_ended_by_the_budget(self):
+        """The measured finding, on an authenticated pipeline.
+
+        Forty queued responses, a peer reading steadily but slowly, and a
+        socket the server must let go of. Before the budget this shape ran
+        past 200 seconds; the assertion here is against a clamp, so it
+        fails in seconds rather than in minutes.
+        """
+        self.clamp()
+        held, released, got, _sock = self.drain(depth=60)
+        self.assertTrue(
+            released,
+            "a slow-drain pipeline held the handler thread, and its fd, for "
+            "%.1fs and counting (%d bytes taken by the peer)" % (held, got))
+        self.assertLess(
+            held, 6.0,
+            "the write side outlived its budget: %.1fs against a %.1fs "
+            "budget" % (held, self.CLAMP))
+
+    def test_the_budget_is_what_ends_it_and_nothing_else(self):
+        """THE NEGATIVE CONTROL, which is the half that makes the test
+        above mean something.
+
+        Same peer, same rate, same depth, with only ``write_budget``
+        removed -- which is the fix reverted in place. The connection must
+        still be alive at a point where the budgeted one was long gone.
+        Without this, "the socket closed" could be the idle timeout, a
+        full send buffer, or the peer's own bookkeeping.
+        """
+        self.clamp(budget=None)
+        held, released, got, _sock = self.drain(depth=60, cap=5.0)
+        self.assertFalse(
+            released,
+            "with the budget removed the handler let go anyway after %.1fs "
+            "(%d bytes) -- then the test above is not measuring the budget"
+            % (held, got))
+
+    def test_the_hold_does_not_scale_with_the_depth_of_the_pipeline(self):
+        """The reason the budget belongs to the CONNECTION.
+
+        A per-response bound would be multiplied by a number the PEER
+        picks: forty responses, forty windows. Ten deep and four hundred
+        deep must cost the same wall clock, because the budget is one
+        total and not one per answer.
+        """
+        self.clamp()
+        shallow, shallow_released, _g, _s = self.drain(depth=60)
+        deep, deep_released, _g2, _s2 = self.drain(depth=2000)
+        self.assertTrue(shallow_released, "60-deep held %.1fs" % shallow)
+        self.assertTrue(deep_released, "2000-deep held %.1fs" % deep)
+        self.assertLess(
+            deep, shallow + 4.0,
+            "a thirty-fold deeper pipeline bought %.1fs more hold (%.1fs vs "
+            "%.1fs): the bound is per response, not per connection"
+            % (deep - shallow, deep, shallow))
+
+    def test_a_write_that_runs_out_does_not_answer_twice(self):
+        """The recovery shape, which doubled the hold and desynced the
+        socket at the same time.
+
+        MEASURED: the first write timed out inside ``_send`` ->
+        ``end_headers``; ``_handle``'s blanket ``except`` then printed a
+        traceback and called ``_error(500, ...)``, writing a SECOND,
+        complete response onto a socket that already carried a partial
+        one, and burning another full window doing it -- 65.0s total on a
+        400-deep pipeline. ``_answered`` was already True and that clause
+        never read it.
+
+        So: no 500 anywhere on the wire, no ``internal_error`` envelope
+        behind a partial response, nothing on the operator's terminal for
+        what is a peer-side condition, and no second window.
+        """
+        self.clamp(budget=0.5)
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            held, released, _got, sock = self.drain(depth=60, cap=10.0)
+            data = self.rest_of_it(sock)
+            time.sleep(0.3)
+        finally:
+            sys.stderr = saved
+        self.assertTrue(released,
+                        "the handler was still held at %.1fs" % held)
+        self.assertLess(held, 4.0,
+                        "the recovery bought a second window: %.1fs" % held)
+        self.assertNotIn(b"HTTP/1.1 500", data,
+                         "a 500 was written onto a socket that already "
+                         "carried a response")
+        # The ENVELOPE, not the bare word: page.html's own JavaScript
+        # mentions `internal_error` by name, and the page is what these
+        # sixty responses are made of.
+        self.assertNotIn(b'"reason": "internal_error"', data,
+                         "a peer that stopped reading was reported to "
+                         "itself as this server failing")
+        self.assertNotIn("Traceback", noise.getvalue(),
+                         "a peer-side condition printed a traceback on the "
+                         "operator's terminal: %s" % noise.getvalue()[:400])
+        responses, _trailing = split_all_responses(data)
+        for response in responses:
+            status, _headers, _body = split_response(response)
+            self.assertEqual(status, 200, response[:120])
+
+    def test_the_writer_is_actually_plugged_in(self):
+        """The class and the constant prove nothing on their own.
+
+        setup() is what puts the budget layer over the socket, and a
+        handler whose wfile is the stock ``_SocketWriter`` has a comment
+        and no bound. Asserted on a live connection's own handler.
+        """
+        seen = {}
+        original = gui_app.Handler._handle
+
+        def capture(handler, method):
+            seen["wfile"] = handler.wfile
+            seen["budget"] = handler.write_budget
+            return original(handler, method)
+
+        gui_app.Handler._handle = capture
+        self.addCleanup(setattr, gui_app.Handler, "_handle", original)
+        status, _obj, _raw = self.call("GET", "/api/mint/status")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(seen["wfile"], gui_app._BudgetedWriter,
+                              "the response stream is not under a budget")
+        self.assertIsNotNone(seen["budget"],
+                             "the budget was disabled for a live request")
+
+    def test_the_budget_belongs_to_the_connection_not_to_the_request(self):
+        """Where ``write_spent`` is reset is the whole of the fix.
+
+        Reset per REQUEST -- in handle_one_request, which is where a
+        reader reaching for symmetry with ``request_deadline`` would put
+        it -- and the peer gets the multiplier back: every queued response
+        starts the budget again. It is reset in setup(), which runs once
+        per CONNECTION, and this is what says so: across three requests on
+        one kept socket the spend only ever goes up, and a fresh
+        connection starts at zero.
+        """
+        seen = []
+        original = gui_app.Handler._handle
+
+        def capture(handler, method):
+            seen.append((id(handler), handler.write_spent))
+            return original(handler, method)
+
+        gui_app.Handler._handle = capture
+        self.addCleanup(setattr, gui_app.Handler, "_handle", original)
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(conn.close)
+        for _ in range(3):
+            conn.request("GET", "/api/mint/status",
+                         headers={"Cookie": self.cookie})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+        kept = [spent for handler, spent in seen
+                if handler == seen[0][0]]
+        self.assertEqual(len(kept), 3,
+                         "the three requests did not share one connection: "
+                         "%r" % (seen,))
+        self.assertEqual(kept[0], 0.0,
+                         "a new connection did not start with a whole "
+                         "budget: %r" % (kept,))
+        self.assertEqual(sorted(kept), kept,
+                         "the write spend went DOWN between two requests on "
+                         "one connection -- the budget is being reset per "
+                         "request, which is the scope a pipeline multiplies: "
+                         "%r" % (kept,))
+        self.assertGreater(kept[-1], 0.0,
+                           "two answered requests spent no measurable write "
+                           "time at all; nothing is being charged: %r"
+                           % (kept,))
+        # ...and a second connection is a second budget, not a continuation
+        # of the first.
+        before = len(seen)
+        status, _obj, _raw = self.call("GET", "/api/mint/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(seen[before][1], 0.0,
+                         "a fresh connection inherited another connection's "
+                         "spend: %r" % (seen[before],))
+
+    def test_the_budget_is_the_shipped_default_and_it_is_finite(self):
+        """Not something only a test sets, and not something only a
+        deployment sets either."""
+        self.assertEqual(gui_app.Handler.write_budget,
+                         gui_app.RESPONSE_BUDGET_S)
+        self.assertGreater(gui_app.RESPONSE_BUDGET_S, 0)
+        self.assertLessEqual(gui_app.RESPONSE_BUDGET_S, 120)
+
+
+class TestEveryTransportRefusalGoesThroughOneDoor(ServerCase):
+    """One funnel, because the mint wrote one down as the countermeasure.
+
+    impl/aicash/mintapi.py routes every refusal of a request that never
+    became a call through ``_Handler._refuse_transport(code, reason)``,
+    with the reason spelled out in its docstring: "One place, so the three
+    refusals below cannot drift into three spellings of 'close and answer
+    400' -- which is the shape this round exists to remove."
+
+    THE MINT'S CHECK WAS CARRIED HERE LAST ROUND AND THE MINT'S FUNNEL WAS
+    NOT. This file had two hand-written sites in two different methods,
+    each spelling ``self.close_connection = True`` and then
+    ``self._error(400, <reason>, <prose>)``, plus a third in
+    ``send_error`` that also had to remember to move ``request_version``
+    off HTTP/0.9 -- and this round was about to add a fourth and a fifth.
+    Three things have to happen together on every one of them (close the
+    connection, get off a version with no status line, fill in the two
+    fields ``send_response`` reads) and every hand-written site is a site
+    that can forget one. Forgetting the version one emits a NAKED BODY,
+    which is the precise defect this round is closing.
+
+    So the assertions below are structural, over app.py's own AST: the
+    door exists, every transport reason word goes through it, and nothing
+    goes around it.
+    """
+
+    #: The reason words that mean "this never became a call". Each one is
+    #: answered by a refusal that must close the connection.
+    TRANSPORT_REASONS = {"bad_version", "bad_request_target",
+                         "bad_request_line", "request_timeout"}
+
+    def app_source(self):
+        with open(gui_app.__file__, encoding="utf-8") as handle:
+            return ast.parse(handle.read())
+
+    def calls_to(self, tree, attribute):
+        """Every ``self.<attribute>(...)`` call in app.py, with its args."""
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Attribute) and func.attr == attribute
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "self"):
+                found.append(node)
+        return found
+
+    def test_the_door_exists_and_does_all_three_things(self):
+        """A funnel that only closes the connection is not the funnel."""
+        self.assertTrue(hasattr(gui_app.Handler, "_refuse_transport"),
+                        "app.py has no transport-refusal funnel at all")
+        source = inspect.getsource(gui_app.Handler._refuse_transport)
+        self.assertIn("close_connection", source)
+        self.assertIn("request_version", source,
+                      "the funnel does not move a 0.9 request off a version "
+                      "where send_response is a no-op -- which is how a "
+                      "refusal goes out as a naked body")
+        self.assertIn("command", source,
+                      "the funnel does not fill in the field _send reads to "
+                      "ask whether this was a HEAD")
+
+    def test_every_transport_reason_is_answered_through_it(self):
+        """Each of the four words reaches the wire through the funnel."""
+        tree = self.app_source()
+        through = set()
+        for call in self.calls_to(tree, "_refuse_transport"):
+            for arg in call.args:
+                if isinstance(arg, ast.Constant) and arg.value in \
+                        self.TRANSPORT_REASONS:
+                    through.add(arg.value)
+        self.assertEqual(
+            through, self.TRANSPORT_REASONS,
+            "these transport refusals do not go through the funnel: %s"
+            % ", ".join(sorted(self.TRANSPORT_REASONS - through)))
+
+    def test_nothing_goes_around_it(self):
+        """The half that keeps the test above from rotting.
+
+        A future edit that adds a fifth refusal by hand -- ``_error(400,
+        "bad_version", ...)`` next to a ``close_connection`` of its own --
+        passes the test above (the word still appears at the funnel too)
+        and fails here.
+        """
+        tree = self.app_source()
+        around = []
+        for call in self.calls_to(tree, "_error"):
+            for arg in call.args:
+                if isinstance(arg, ast.Constant) and arg.value in \
+                        self.TRANSPORT_REASONS:
+                    around.append((arg.value, call.lineno))
+        self.assertEqual(
+            around, [],
+            "a transport refusal is spelled out by hand instead of going "
+            "through _refuse_transport: %s"
+            % ", ".join("%s at app.py:%d" % pair for pair in around))
+
+    def test_the_refusals_agree_on_the_wire(self):
+        """Structure is not behaviour, so the four are also driven.
+
+        Each shape below is a request that never became a call. All four
+        must come back as ONE framed response with a length, with the
+        hang-up announced, carrying this server's envelope and a cause
+        from the closed set -- and the socket must go. A refusal that
+        forgot one of the funnel's three jobs shows up here as a naked
+        body, a kept socket, or no answer at all.
+        """
+        original = gui_app.Handler.request_timeout
+        gui_app.Handler.request_timeout = 1.0
+        self.addCleanup(setattr, gui_app.Handler, "request_timeout", original)
+        host = "Host: 127.0.0.1:%d\r\n" % self.port
+        cases = (
+            ("bad_version", 400, b"GET /api/mint/status\r\n\r\n"),
+            ("bad_request_target", 400,
+             ("GET http://127.0.0.1:%d/api/mint/status HTTP/1.1\r\n%s\r\n"
+              % (self.port, host)).encode()),
+            ("bad_request_line", 400,
+             ("\r\n\r\nGET /api/mint/status HTTP/1.1\r\n%s\r\n"
+              % host).encode()),
+            # No terminator at all: answered when the clock runs out.
+            ("request_timeout", 408, b"GET /api/mint/status HTTP/1.1"),
+        )
+        for reason, code, payload in cases:
+            with self.subTest(reason=reason):
+                data, closed = raw_exchange(self.port, payload, wait=6.0)
+                self.assertNotEqual(data, b"",
+                                    "%s got no answer at all" % reason)
+                responses, trailing = split_all_responses(data)
+                self.assertEqual(len(responses), 1,
+                                 "%s: %r" % (reason, data[:200]))
+                self.assertEqual(trailing, b"",
+                                 "%s left trailing octets: %r"
+                                 % (reason, trailing[:120]))
+                status, headers, body = split_response(responses[0])
+                self.assertEqual(status, code, "%s: %r" % (reason, body[:200]))
+                self.assertIn("content-length", headers, reason)
+                self.assertEqual(headers.get("connection"), "close",
+                                 "%s hung up without saying so: %r"
+                                 % (reason, headers))
+                obj = json.loads(body)
+                self.assertEqual(obj["error"]["reason"], reason, body[:200])
+                self.assertIn(obj["error"]["cause"], gui_app.CAUSES, reason)
+                self.assertTrue(closed, "%s kept the socket" % reason)
+
+
+class TestARequestThatRanOutOfClockIsStillAnswered(ServerCase):
+    """The last two shapes on this server that got NO STATUS LINE.
+
+    MEASURED BEFORE THIS, on all twenty-one routes, with a valid session
+    cookie:
+
+        GET <route> HTTP/1.1                      (request line never
+                                                   terminated)
+        GET <route> HTTP/1.1\\r\\nHost: x\\r\\n        (header block never
+                                                   terminated)
+
+    ZERO BYTES in both cases, socket dropped at the deadline. The read
+    budget was doing its job -- the thread and the fd came back at ten
+    seconds -- but the caller was told nothing, and "nothing" is the one
+    outcome this round's bar names outright: a caller cannot tell it from
+    a crash, a wrong port, or a server that never existed.
+
+    ``BaseHTTPRequestHandler`` wraps its whole request in
+    ``except TimeoutError: close and return``, silently, so the answer
+    cannot come from the base class; ``_answer_an_unfinished_request`` is
+    where it comes from. 408 is what RFC 7231 6.5.7 defines for exactly
+    this, and it says to send ``Connection: close`` with it.
+
+    A DELIBERATE DIVERGENCE FROM THE MINT, written down rather than
+    discovered later: impl/aicash/mintapi.py drops these two shapes, and
+    this file does not own that. The GUI is the server an operator sits in
+    front of and the one that is on by default, and answering is strictly
+    more than dropping -- but it is a transport decision this server now
+    makes alone, and the honest place for that sentence is here, next to
+    the tests that prove it.
+    """
+
+    #: Clamped so watching a request run out of clock costs a second
+    #: instead of ten. The SHIPPED value is pinned in
+    #: TestTheDripIsBoundedByAWallClock.
+    CLAMP = 1.0
+
+    def clamp(self):
+        original = gui_app.Handler.request_timeout
+        gui_app.Handler.request_timeout = self.CLAMP
+        self.addCleanup(setattr, gui_app.Handler, "request_timeout", original)
+        self.assertGreaterEqual(gui_app.Handler.timeout, 5)
+
+    def routes(self):
+        api = sorted(gui_app.ROUTES)
+        return ([("GET", "/"), ("HEAD", "/"), ("GET", "/index.html"),
+                 ("GET", "/favicon.ico")] + api)
+
+    def stall(self, payload, cap=6.0):
+        """Send a partial request and then say nothing. (held, data, closed)."""
+        sock = socket.create_connection(("127.0.0.1", self.port),
+                                        timeout=cap + 2.0)
+        self.addCleanup(sock.close)
+        started = time.monotonic()
+        data, closed = b"", False
+        try:
+            sock.sendall(payload)
+            while time.monotonic() - started < cap:
+                sock.settimeout(max(0.05, cap - (time.monotonic() - started)))
+                try:
+                    part = sock.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not part:
+                    closed = True
+                    break
+                data += part
+        except OSError:
+            closed = True
+        return time.monotonic() - started, data, closed
+
+    def assert_framed_408(self, data, label, head_request=False):
+        """One framed 408, a length on it, and the hang-up announced.
+
+        ``head_request`` is about WHEN the clock ran out, not about what
+        the caller typed. A request line that never terminated leaves this
+        server with no method at all -- it never read one -- so its
+        refusal carries a body even if the caller meant HEAD. A header
+        block that never terminated leaves the method parsed, so a HEAD is
+        answered the way a HEAD must be: headers, a Content-Length, and no
+        octets after them.
+        """
+        responses, trailing = split_all_responses(data, head_request)
+        self.assertEqual(len(responses), 1,
+                         "%s got %d responses, not one: %r"
+                         % (label, len(responses), data[:200]))
+        self.assertEqual(trailing, b"", "%s: %r" % (label, trailing[:120]))
+        status, headers, body = split_response(responses[0])
+        self.assertEqual(status, 408, "%s: %r" % (label, body[:200]))
+        self.assertEqual(headers.get("connection"), "close",
+                         "%s did not announce the hang-up: %r"
+                         % (label, headers))
+        self.assertIn("content-length", headers, label)
+        if head_request:
+            self.assertEqual(body, b"", "%s: a HEAD was answered with a "
+                                        "body: %r" % (label, body[:120]))
+            return
+        obj = json.loads(body)
+        self.assertEqual(obj["error"]["reason"], "request_timeout", label)
+        self.assertIn(obj["error"]["cause"], gui_app.CAUSES, label)
+        self.assertNotIn(b"Traceback", body)
+
+    def test_a_request_line_that_never_ends_is_answered_on_every_route(self):
+        """No CRLF, ever. Twenty-one routes, one answer each.
+
+        Every route, not one: a fix proven on a single route is how this
+        project's signature defect keeps surviving, and the shape is
+        refused before any route runs, so a route-dependent answer here
+        would itself be the finding.
+        """
+        self.clamp()
+        for method, path in self.routes():
+            with self.subTest(method=method, path=path):
+                held, data, closed = self.stall(
+                    ("%s %s HTTP/1.1" % (method, path)).encode())
+                self.assertNotEqual(
+                    data, b"",
+                    "%s %s: zero bytes and a dropped socket after %.1fs"
+                    % (method, path, held))
+                self.assert_framed_408(data, "%s %s" % (method, path))
+                self.assertTrue(closed, "%s %s kept the socket" % (method, path))
+
+    def test_a_header_block_that_never_ends_is_answered_on_every_route(self):
+        """A complete request line, a header, and then silence."""
+        self.clamp()
+        for method, path in self.routes():
+            with self.subTest(method=method, path=path):
+                held, data, closed = self.stall(
+                    ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                     % (method, path, self.port)).encode())
+                self.assertNotEqual(
+                    data, b"",
+                    "%s %s: zero bytes and a dropped socket after %.1fs"
+                    % (method, path, held))
+                self.assert_framed_408(data, "%s %s" % (method, path),
+                                       head_request=method == "HEAD")
+                self.assertTrue(closed, "%s %s kept the socket" % (method, path))
+
+    def test_a_drip_that_never_completes_a_request_is_answered_too(self):
+        """Not only silence: a peer that keeps the socket warm a byte at a
+        time and never finishes the header block gets the same answer,
+        because the bound is a wall clock and not idleness."""
+        self.clamp()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=8.0)
+        self.addCleanup(sock.close)
+        sock.sendall(b"GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        started, data = time.monotonic(), b""
+        while time.monotonic() - started < 6.0:
+            try:
+                sock.sendall(b"X")
+            except OSError:
+                break
+            time.sleep(0.2)
+            sock.settimeout(0.05)
+            try:
+                part = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                continue
+            if not part:
+                break
+            data += part
+        self.assertNotEqual(data, b"", "a drip was dropped without an answer")
+        self.assert_framed_408(data, "header drip")
+
+    def test_an_idle_keep_alive_socket_is_answered_and_closed(self):
+        """A kept connection that goes quiet past the budget.
+
+        This is the shape two comments in app.py used to describe wrongly
+        -- they said `timeout` governed idle keep-alive time, and the
+        deadline does, because handle_one_request arms it BEFORE the
+        blocking read that waits for the next request line. Measured at
+        the shipped values: closed at 10.0s, not 30. page.html polls every
+        four seconds, so its own connection never reaches this.
+        """
+        self.clamp()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=8.0)
+        self.addCleanup(sock.close)
+        sock.sendall(("GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                      "Cookie: %s\r\n\r\n"
+                      % (self.port, self.cookie)).encode())
+        first = b""
+        sock.settimeout(6.0)
+        while complete_responses(first) < 1:
+            part = sock.recv(65536)
+            if not part:
+                break
+            first += part
+        status, _headers, _body = split_response(first)
+        self.assertEqual(status, 200, first[:200])
+        # ...and now say nothing at all.
+        started, tail = time.monotonic(), b""
+        while time.monotonic() - started < 6.0:
+            try:
+                part = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
+            if not part:
+                break
+            tail += part
+        self.assertNotEqual(tail, b"",
+                            "an idle kept socket was dropped with no answer")
+        self.assert_framed_408(tail, "idle keep-alive")
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_with_the_answer_removed_these_shapes_return_zero_bytes(self):
+        """THE NEGATIVE CONTROL, and it is the fix reverted in place.
+
+        ``_answer_an_unfinished_request`` neutered, same clamp, same
+        bytes: the base class's silent ``except TimeoutError`` is what is
+        left, and it writes nothing. That is what these three shapes did
+        before this class existed, and it is what the tests above would be
+        accepting if they were written to tolerate an empty answer.
+        """
+        self.clamp()
+        original = gui_app.Handler._answer_an_unfinished_request
+        gui_app.Handler._answer_an_unfinished_request = lambda handler: None
+        self.addCleanup(setattr, gui_app.Handler,
+                        "_answer_an_unfinished_request", original)
+        for label, payload in (
+                ("request line", b"GET /api/mint/status HTTP/1.1"),
+                ("header block",
+                 b"GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n")):
+            with self.subTest(label=label):
+                held, data, closed = self.stall(payload)
+                self.assertEqual(
+                    data, b"",
+                    "%s answered without the hook -- then the tests above "
+                    "are not measuring it: %r" % (label, data[:120]))
+                self.assertTrue(closed,
+                                "%s was neither answered nor released after "
+                                "%.1fs" % (label, held))
+
+    def test_a_peer_that_says_nothing_and_leaves_is_not_answered(self):
+        """The other negative control: 408 is for a clock that ran out,
+        not for every connection that ends.
+
+        A peer that opens a socket and closes it without asking anything
+        -- which is every speculative connection a browser opens and never
+        uses -- has not timed out. There is no request, there is nobody
+        waiting, and a status line written into that would mean answering
+        every dropped connection on the machine. The EOF arrives long
+        before the clamped budget, so the clock never expires and the hook
+        never fires.
+        """
+        self.clamp()
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            sock = socket.create_connection(("127.0.0.1", self.port),
+                                            timeout=5.0)
+            try:
+                sock.shutdown(socket.SHUT_WR)
+                sock.settimeout(3.0)
+                got = sock.recv(65536)
+            finally:
+                sock.close()
+            time.sleep(0.2)
+        finally:
+            sys.stderr = saved
+        self.assertEqual(got, b"", "an EOF was answered as a timeout")
+        self.assertNotIn("Traceback", noise.getvalue())
+
+    def test_nothing_is_printed_on_the_operators_terminal(self):
+        """A peer that ran out of clock is a fact about the peer. The
+        operator's terminal is for this server's own failures."""
+        self.clamp()
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            _held, data, _closed = self.stall(
+                b"GET /api/mint/status HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            time.sleep(0.3)
+        finally:
+            sys.stderr = saved
+        self.assert_framed_408(data, "header block")
+        self.assertNotIn("Traceback", noise.getvalue(),
+                         "a timed-out request printed a traceback: %s"
+                         % noise.getvalue()[:400])
+
+
+class TestOneEmptyLineBeforeTheRequestIsTolerated(ServerCase):
+    """RFC 7230 §3.5: a server SHOULD ignore at least one empty line
+    received before the request line.
+
+    MEASURED BEFORE THE FIX, on every route, with a valid session cookie:
+    ``\\r\\n`` followed by a perfectly well-formed request came back as
+    ZERO BYTES and a dropped socket. That is the "no answer at all" class,
+    on a shape the standard blesses and that a client which terminated its
+    last body with an extra CRLF really emits -- and it was one of three
+    cells where the four servers here disagreed about identical bytes:
+
+        server        \\r\\nGET <route> HTTP/1.1 ...
+        mint          200, socket kept
+        supervision   200, socket kept
+        GUI (was)     NOTHING, socket dropped
+        console (was) NOTHING, socket dropped
+
+    The fix is the mint's parse_request, carried here.
+
+    THE CONSOLE ROW IS NOW STALE AND IS CORRECTED RATHER THAN LEFT, which
+    is the point of writing tables like this down at all. mint_console.py
+    landed the same block later on 2026-09-17; a report from earlier in
+    this round still says the console drops this shape, and it does not.
+    All four servers answer one leading empty line today:
+
+        server        \\r\\n + request      \\r\\n\\r\\n + request
+        mint          200, socket kept    NOTHING, socket dropped
+        supervision   200, socket kept    NOTHING, socket dropped
+        console       200, then closes    200 up to its own cap, then a
+                                          framed 400 past it
+        this server   200, socket kept    framed 400, socket goes
+
+    The second column is a cell the four do NOT agree on, and it is
+    asserted here as a divergence rather than glossed: see
+    test_it_is_one_line_and_not_a_loop_and_it_says_so, and app.py's
+    parse_request docstring for why this file takes the strictest of the
+    three answers.
+    """
+
+    #: Every route this server answers, plus the page and the favicon.
+    #: The finding was reported against all of them and it is asserted
+    #: against all of them: a fix proven on one route is how the framing
+    #: rule came to be fixed for a single spelling twice.
+    def routes(self):
+        api = sorted(gui_app.ROUTES)
+        return ([("GET", "/"), ("HEAD", "/"), ("GET", "/index.html"),
+                 ("GET", "/favicon.ico")] + api)
+
+    def probe(self, lead, method, path, body=b"", head_request=None):
+        """``head_request`` overrides how the answer is FRAMED on the way
+        back, which matters on exactly one shape: a refusal taken before
+        the request line was ever parsed. The server has no method then --
+        it never read one -- so it frames its refusal with a body, and a
+        reader told to expect a bodiless answer mis-splits it."""
+        head = ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nCookie: %s\r\n"
+                % (method, path, self.port, self.cookie))
+        if method == "POST":
+            head += ("Content-Type: application/json\r\n"
+                     "Content-Length: %d\r\n" % len(body))
+        payload = lead + (head + "\r\n").encode() + body
+        if head_request is None:
+            head_request = method == "HEAD"
+        return exchange_and_watch(self.port, payload, expect=1, wait=6.0,
+                                  linger=0.4, head_request=head_request)
+
+    def test_every_route_answers_behind_one_leading_crlf(self):
+        """DIFFERENTIAL, not a status whitelist: the same bytes with and
+        without the empty line must produce the same answer.
+
+        A whitelist ("< 500", "not a 400") would pass a server that turned
+        every request behind a CRLF into some other refusal, and most of
+        these routes refuse an empty ``{}`` body on their own merits
+        anyway. Asserting EQUALITY with the un-prefixed request is the
+        claim the RFC actually makes -- one leading empty line changes
+        nothing -- and it is checkable on every route without the test
+        having to know what any of them do.
+        """
+        for method, path in self.routes():
+            with self.subTest(method=method, path=path):
+                plain = self.probe(b"", method, path, b"{}")
+                behind = self.probe(b"\r\n", method, path, b"{}")
+                for label, (responses, trailing, closed, data) in (
+                        ("plain", plain), ("behind one CRLF", behind)):
+                    self.assertEqual(
+                        len(responses), 1,
+                        "%s %s %s got %d responses (%r)"
+                        % (method, path, label, len(responses), data[:200]))
+                    self.assertEqual(trailing, b"", "%s %s %s: %r"
+                                     % (method, path, label, trailing[:120]))
+                self.assertEqual(
+                    split_response(behind[0][0])[0],
+                    split_response(plain[0][0])[0],
+                    "%s %s answered differently behind one empty line: %r"
+                    % (method, path, behind[0][0][:200]))
+                self.assertEqual(
+                    split_response(behind[0][0])[2],
+                    split_response(plain[0][0])[2],
+                    "%s %s: the body changed behind one empty line"
+                    % (method, path))
+                self.assertEqual(
+                    behind[2], plain[2],
+                    "%s %s: one leading empty line changed the connection "
+                    "decision (closed=%s, plain closed=%s)"
+                    % (method, path, behind[2], plain[2]))
+                self.assertFalse(
+                    behind[2],
+                    "%s %s behind one CRLF cost the connection; the mint and "
+                    "the supervision profile keep it" % (method, path))
+
+    def test_the_bare_lf_and_bare_cr_spellings_too(self):
+        """A stray empty line is not always spelled CRLF.
+
+        A client that terminated a body with a bare LF leaves one, and the
+        mint tolerates all three spellings. A fix that covered only the
+        one spelling the author happened to send is this project's
+        signature defect.
+        """
+        for lead in (b"\n", b"\r"):
+            with self.subTest(lead=lead):
+                responses, trailing, closed, data = self.probe(
+                    lead, "GET", "/api/mint/status")
+                self.assertEqual(len(responses), 1, data[:300])
+                self.assertEqual(trailing, b"")
+                status, _headers, payload = split_response(responses[0])
+                self.assertEqual(status, 200, payload[:200])
+                self.assertFalse(closed)
+
+    def test_the_request_behind_it_is_really_read_and_really_routed(self):
+        """Not merely "something came back": the right route ran, with the
+        right query, and the component saw it.
+
+        A parse_request that swallowed the empty line and then answered
+        from a stale request line -- or that answered without dispatching
+        at all -- would pass a test that only counted responses.
+        """
+        FakeWalletOps.calls = []
+        payload = (b"\r\n" + ("GET /api/wallet/history?name=alice&limit=7"
+                              " HTTP/1.1\r\n"
+                              "Host: 127.0.0.1:%d\r\nCookie: %s\r\n\r\n"
+                              % (self.port, self.cookie)).encode())
+        responses, trailing, _closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.4)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertEqual(trailing, b"")
+        status, _headers, body = split_response(responses[0])
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(("history", "alice", 7), FakeWalletOps.calls,
+                      "the route behind the empty line never ran, or ran "
+                      "with the wrong query: %r" % (FakeWalletOps.calls,))
+
+    def test_it_is_one_line_and_not_a_loop_and_it_says_so(self):
+        """"At least one" is what the RFC asks for, and a loop would let a
+        peer hold a thread by trickling CRLFs. Stopping at one is right.
+        SAYING SO is the part that was missing.
+
+        WHAT THIS TEST USED TO ACCEPT, which is why it is rewritten rather
+        than renamed. It asserted "no route ran and the socket went" and
+        then walked ``for response in responses`` -- a loop over an EMPTY
+        LIST, because two leading empty lines returned ZERO BYTES. It
+        blessed "nothing at all" as the right answer to a request shape,
+        which is the one outcome this round's bar names outright, and it
+        did so in the file whose job is to catch exactly that.
+
+        A second empty line is now refused with a framed 400 carrying a
+        length and ``Connection: close``, on every route, in both
+        spellings and at three lines deep as well as two. The count still
+        stops at one: no route runs, and the socket still goes.
+        """
+        for lead in (b"\r\n\r\n", b"\n\n", b"\r\n\r\n\r\n"):
+            for method, path in self.routes():
+                with self.subTest(lead=lead, method=method, path=path):
+                    FakeWalletOps.calls = []
+                    # head_request=False even for HEAD, deliberately: this
+                    # refusal is taken before super().parse_request() has
+                    # read a request line, so the server does not know the
+                    # method and frames a body. That is the right answer --
+                    # the alternative is a refusal whose reason nobody can
+                    # read -- and the socket goes immediately, so nothing
+                    # can desync behind it.
+                    responses, trailing, closed, data = self.probe(
+                        lead, method, path, b"{}", head_request=False)
+                    self.assertEqual(
+                        len(responses), 1,
+                        "%d leading empty lines before %s %s got %d "
+                        "responses (%r)"
+                        % (lead.count(b"\n"), method, path,
+                           len(responses), data[:200]))
+                    self.assertEqual(trailing, b"", repr(trailing[:120]))
+                    status, headers, body = split_response(responses[0])
+                    self.assertEqual(status, 400, body[:200])
+                    self.assertEqual(headers.get("connection"), "close",
+                                     "the hang-up was not announced: %r"
+                                     % headers)
+                    self.assertIn("content-length", headers)
+                    obj = json.loads(body)
+                    self.assertEqual(obj["error"]["reason"],
+                                     "bad_request_line", body[:200])
+                    self.assertIn(obj["error"]["cause"], gui_app.CAUSES)
+                    self.assertTrue(closed,
+                                    "a second empty line kept the socket")
+                    self.assertEqual(
+                        [c for c in FakeWalletOps.calls if c[0] == "list"],
+                        [], "a route ran behind two leading empty lines")
+
+    def test_an_empty_line_and_then_nothing_is_not_an_internal_error(self):
+        """EOF after the empty line. There is nothing to answer, and
+        nothing to print a traceback about either."""
+        noise, saved = io.StringIO(), sys.stderr
+        sys.stderr = noise
+        try:
+            sock = socket.create_connection(("127.0.0.1", self.port),
+                                            timeout=5.0)
+            try:
+                sock.sendall(b"\r\n")
+                sock.shutdown(socket.SHUT_WR)
+                sock.settimeout(3.0)
+                got = sock.recv(65536)
+            finally:
+                sock.close()
+            time.sleep(0.2)
+        finally:
+            sys.stderr = saved
+        self.assertEqual(got, b"")
+        self.assertNotIn("Traceback", noise.getvalue())
+
+    def test_an_absurd_request_line_behind_it_is_still_framed(self):
+        """The 414 guard on the line parse_request reads itself.
+
+        handle_one_request bounds the request line at 64 KiB; the line
+        read after an empty one is read by this file, so it carries the
+        same guard -- and the refusal has to be a framed HTTP message, not
+        the naked body this server used to emit for an unparseable one.
+        """
+        payload = b"\r\nGET /" + b"a" * 70000 + b" HTTP/1.1\r\n\r\n"
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.4)
+        self.assertEqual(len(responses), 1, data[:200])
+        self.assertEqual(trailing, b"")
+        self.assertTrue(closed)
+        status, headers, body = split_response(responses[0])
+        self.assertEqual(status, 414, body[:200])
+        self.assertEqual(headers.get("connection"), "close")
+        self.assertIn("content-length", headers)
+        json.loads(body)          # this server's envelope, not an HTML page
+
+
+class TestARequestTargetThisServerCannotRoute(ServerCase):
+    """Absolute-form, asterisk-form and a bare relative path.
+
+    MEASURED BEFORE THE FIX: 404, and then the connection KEPT, on all
+    three -- the third of the three cells where the four servers here
+    disagreed on identical bytes and the only one where this server was
+    alone. The mint and the supervision profile answer 400
+    bad_request_target and hang up; the console answers and hangs up.
+
+    No body is involved, so this was not a smuggling hole by itself. It is
+    a server that answered a request it could not route and then invited
+    another one down the same socket, while three siblings did not.
+    """
+
+    TARGETS = (
+        ("absolute form", "http://127.0.0.1:%(port)d/api/wallet/list"),
+        ("absolute form, no port", "http://127.0.0.1/api/wallet/list"),
+        ("absolute form, elsewhere", "http://example.invalid/api/wallet/list"),
+        ("asterisk", "*"),
+        ("relative path", "api/wallet/list"),
+        ("relative path, page", "index.html"),
+        ("authority form", "127.0.0.1:%(port)d"),
+    )
+
+    def probe(self, method, target, extra=""):
+        payload = ("%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nCookie: %s\r\n%s"
+                   "\r\n" % (method, target % {"port": self.port}, self.port,
+                             self.cookie, extra)).encode()
+        return exchange_and_watch(self.port, payload, expect=1, wait=6.0,
+                                  linger=0.5,
+                                  head_request=method == "HEAD")
+
+    def test_every_form_is_answered_once_and_hung_up_on(self):
+        for name, target in self.TARGETS:
+            with self.subTest(target=name):
+                responses, trailing, closed, data = self.probe("GET", target)
+                self.assertEqual(len(responses), 1, data[:300])
+                self.assertEqual(trailing, b"",
+                                 "octets past the framing: %r" % trailing[:120])
+                status, headers, body = split_response(responses[0])
+                self.assertEqual(status, 400, body[:300])
+                obj = json.loads(body)
+                self.assert_envelope(status, obj, body)
+                self.assertEqual(obj["error"]["reason"], "bad_request_target")
+                self.assertEqual(
+                    headers.get("connection"), "close",
+                    "%s: hung up without announcing it" % name)
+                self.assertTrue(
+                    closed,
+                    "%s: answered and then invited another request on the "
+                    "same socket; the other three servers answer once and "
+                    "hang up" % name)
+
+    def test_it_covers_the_methods_with_no_handler_of_their_own(self):
+        """parse_request and not the top of _handle, which is why.
+
+        A method this file implements no ``do_*`` for is answered 501 from
+        inside handle_one_request without any of _handle running. Putting
+        the target check in _handle would have left those uncovered, which
+        is the mint's own reason for the hook it chose.
+        """
+        for method in ("GET", "HEAD", "POST", "OPTIONS", "PUT", "DELETE",
+                       "PATCH", "TRACE", "PROPFIND"):
+            with self.subTest(method=method):
+                extra = ("Content-Type: application/json\r\n"
+                         "Content-Length: 0\r\n" if method == "POST" else "")
+                responses, trailing, closed, data = self.probe(
+                    method, "*", extra)
+                self.assertEqual(len(responses), 1, data[:300])
+                self.assertEqual(trailing, b"")
+                status, _headers, body = split_response(responses[0])
+                self.assertEqual(status, 400, body[:200])
+                self.assertTrue(closed, "%s kept the socket" % method)
+
+    def test_no_route_ran_and_no_credential_was_needed_to_find_that_out(self):
+        """The refusal is a transport decision, so it is taken before
+        dispatch -- and it must not have run a route on the way."""
+        FakeWalletOps.calls = []
+        payload = ("GET http://127.0.0.1:%d/api/wallet/list HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n\r\n"
+                   % (self.port, self.port)).encode()
+        responses, _trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.5)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertTrue(closed)
+        status, _headers, body = split_response(responses[0])
+        self.assertEqual(status, 400, body[:200])
+        self.assertEqual(FakeWalletOps.calls, [])
+
+    def test_the_refusal_does_not_quote_the_target_back(self):
+        """A request target can carry the capability key (``/?k=...``),
+        and an error body is the cheapest place to hand it to whatever can
+        read a response. The console's 400 on a bad target is written to
+        the same rule."""
+        secret = self.httpd.auth.key
+        payload = ("GET http://127.0.0.1:%d/?k=%s HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\n\r\n"
+                   % (self.port, secret, self.port)).encode()
+        responses, _trailing, _closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.5)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertNotIn(secret.encode(), data,
+                         "the refusal handed the capability key back")
+
+    def test_a_bodiless_protocol_request_line_is_still_bad_version(self):
+        """PRECEDENCE, and it is not decoration.
+
+        A two-word request line is HTTP/0.9, where send_response,
+        send_header and end_headers are ALL no-ops -- so a target refusal
+        composed for one would go out as a naked body with no status line,
+        which is the exact defect the 0.9 guard exists against. The target
+        check therefore steps aside for 0.9 and _handle refuses it as
+        bad_version, which is also the mint's order on the same bytes.
+        """
+        for target in ("http://127.0.0.1/api/wallet/list", "*",
+                       "api/wallet/list"):
+            with self.subTest(target=target):
+                payload = ("GET %s\r\nHost: 127.0.0.1\r\n\r\n"
+                           % target).encode()
+                responses, trailing, closed, data = exchange_and_watch(
+                    self.port, payload, expect=1, wait=6.0, linger=0.5)
+                self.assertEqual(len(responses), 1, data[:300])
+                self.assertEqual(
+                    trailing, b"",
+                    "a response with no status line went out: %r"
+                    % trailing[:200])
+                self.assertTrue(data.startswith(b"HTTP/1."), data[:120])
+                status, headers, body = split_response(responses[0])
+                self.assertEqual(status, 400, body[:200])
+                self.assertEqual(json.loads(body)["error"]["reason"],
+                                 "bad_version", body[:200])
+                self.assertEqual(headers.get("connection"), "close")
+                self.assertTrue(closed)
+
+    def test_the_zero_nine_guard_depends_on_the_library_default(self):
+        """Found by the mint-versus-this-server sweep, and pinned here.
+
+        The mint carries THREE pieces against a naked answer:
+        ``default_request_version = "HTTP/1.1"``, a ``send_error``
+        override, and a check in parse_request that refuses both
+        spellings of 0.9 -- a WORD COUNT for a two-word request line and a
+        VERSION test for an explicit ``HTTP/0.9``. This file carries two
+        of the three: the ``send_error`` override, and ``_handle``'s
+        version test. It has no ``default_request_version``, and measured
+        across all seven doors (an unparseable request line, a one-word
+        line, a two-word line, ``HTTP/9.9``, an explicit ``HTTP/0.9``, a
+        64 KiB request line, a bad method) every answer comes back framed,
+        so there is no open door here today.
+
+        But the two pieces are load-bearing TOGETHER with the library
+        default staying where it is. ``_handle`` refuses a two-word
+        request line only because the stdlib default puts ``HTTP/0.9`` in
+        ``request_version`` when it cannot read one off the wire. Setting
+        ``default_request_version`` here without ALSO adding the mint's
+        word count would make a two-word request line read as HTTP/1.1
+        and be ROUTED -- a request with no version on it answered on its
+        merits, which is the door the mint's word count exists for. That
+        is why this file was left with two pieces rather than given the
+        third, and this test is what makes the coupling visible to the
+        next person instead of leaving it in a comment.
+        """
+        self.assertEqual(gui_app.Handler.default_request_version, "HTTP/0.9",
+                         "this server's 0.9 refusal reads request_version, "
+                         "which is only HTTP/0.9 for a version-less request "
+                         "line while the library default says so; raising it "
+                         "needs the mint's word count added at the same time")
+        payload = ("GET /api/wallet/list\r\nHost: 127.0.0.1:%d\r\n"
+                   "Cookie: %s\r\n\r\n" % (self.port, self.cookie)).encode()
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.5)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertEqual(trailing, b"", "a naked answer: %r" % trailing[:200])
+        status, _headers, body = split_response(responses[0])
+        self.assertEqual(status, 400, body[:200])
+        self.assertEqual(json.loads(body)["error"]["reason"], "bad_version")
+        self.assertTrue(closed)
+
+    def test_an_origin_form_target_is_untouched(self):
+        """"Refuse everything" would pass every test above.
+
+        The ordinary shape still routes, still answers 200, and still
+        keeps the connection -- which is the cell all four servers agree
+        on and the one a target check is most likely to break.
+        """
+        payload = ("GET /api/wallet/list HTTP/1.1\r\n"
+                   "Host: 127.0.0.1:%d\r\nCookie: %s\r\n\r\n"
+                   % (self.port, self.cookie)).encode()
+        responses, trailing, closed, data = exchange_and_watch(
+            self.port, payload, expect=1, wait=6.0, linger=0.5)
+        self.assertEqual(len(responses), 1, data[:300])
+        self.assertEqual(trailing, b"")
+        status, headers, body = split_response(responses[0])
+        self.assertEqual(status, 200, body[:200])
+        self.assertIsNone(headers.get("connection"))
+        self.assertFalse(closed, "an origin-form GET lost its connection")

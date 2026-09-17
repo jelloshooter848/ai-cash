@@ -9,6 +9,8 @@ The Conditional Work Exchange escrow conventions: single-arbiter milestones, the
 ```python
 compute_deadlines(evidence_deadline, decision_deadline, grace_ms, settlement_margin) -> expiry_ms
     # enforces T_m >= decision_deadline + grace_ms + settlement_margin
+milestone_schedule(milestones) -> {m: (evidence_deadline, decision_deadline)}
+    # the offer's own deadline table, keyed by milestone; what a payee re-derives T_m from
 rung_composition(total_mc, denoms_desc) -> list[int]   # §9.6 rung-set ladder composition
 evidence_hash(evidence) -> str                          # b64u(sha256(canonical_json(evidence)))
 class FundingInfo:        # frozen dataclass — the secret-free payer→payee funding handoff
@@ -39,21 +41,43 @@ class EscrowPayer:
     refund_expired(m) -> int
     balance() -> int
 class EscrowPayee:        # the output-secret holder: the payee proper, or the panel's fee account
-    __init__(client, mint_id, arbiter_pubs: dict)
+    __init__(client, mint_id, arbiter_pubs: dict, milestones=None,
+             settlement_margin_ms=60_000)
+        # `milestones` is the payee's OWN copy of the offer it accepted. verify_funding
+        # needs it and refuses without it: a payee that checks the handoff only against
+        # the handoff is checking the payer's arithmetic against the payer's arithmetic.
     generate_output_hashes(attestations, kinds=("rung",)) -> dict   # one fresh output secret per
         # attested output of the given kinds; returns {(m, arbiter_id, rung): secret_hash} for the
         # payer's by-hash funding; kinds=("fee",) for the panel's fee account
-    verify_funding(info: FundingInfo | dict, attestations) -> None   # MANDATORY §9.3 pre-work check;
-        # raises FundingInvalid naming the offending rung; accepts the to_dict() wire form too.
-        # Validates each funded output's on-ledger §3.4 lock wire shape (preimage_hash / expiry /
-        # refund_hash — see spec §3.4): lock present, preimage_hash equal to the arbiter-attested
-        # value, expiry equal to the milestone's scheduled T_m
+    verify_funding(info: FundingInfo | dict, attestations, milestones=None) -> None
+        # MANDATORY §9.3 pre-work check; raises FundingInvalid naming the offending rung,
+        # or EscrowError when no milestone schedule is known; accepts the to_dict() wire
+        # form too. Validates each funded output's on-ledger §3.4 lock wire shape
+        # (preimage_hash / expiry / refund_hash — see spec §3.4): lock present,
+        # preimage_hash equal to the arbiter-attested value, and expiry RE-DERIVED from the
+        # payee's own offer and the mint's grace_ms (T_m >= decision_deadline + grace_ms +
+        # settlement_margin), not merely equal to whatever the handoff asserts.
+        # Also checks COMPLETENESS, which a set comparison against the counterparty's own
+        # attestation list cannot: every milestone of the payee's offer must be funded, and
+        # every output the payee holds a secret for must be funded — otherwise a payer
+        # prunes both sides of the handoff and the payee verifies a subset happily.
     redeem(m, reveals, allow_unverified=False) -> int   # allow_unverified models a negligent payee
         # in tests only — the default refuses redemption without a prior verify_funding
     balance() -> int
 class CommitThenAccept:   # §9.4
-    __init__(client, mint_id, redemption_margin_ms=60_000, grace_ms=None)
-    worker_hash() -> str / worker_verify(amount_mc=None, expiry=None) / worker_redeem(preimage_b64u)
+    __init__(client, mint_id, redemption_margin_ms=60_000, grace_ms=None,
+             agreed_amount_mc=None, agreed_expiry=None, accept_by=None)
+        # the last three are the WORKER's own copy of the agreed terms. worker_verify no
+        # longer falls back to the attributes payer_commit writes onto the same object:
+        # that made the worker check the payer's terms against the payer's terms.
+    worker_hash() -> str
+    worker_verify(amount_mc=None, expiry=None, accept_by=None) -> None
+        # raises EscrowError naming what is missing when the worker holds no terms of its
+        # own; FundingInvalid when the ON-LEDGER lock expiry is below the §9.4 minimum
+        # (expiry >= accept_by + grace_ms + redemption_margin, the analogue of §9.3's
+        # ordering check), or when the derived reveal deadline has already passed at the
+        # mint_time of the same /v3/status call
+    worker_redeem(preimage_b64u)   # redeems the amount worker_verify confirmed on-ledger
     payer_commit(hash_from_worker, amount_mc, expiry, funding_tokens) / payer_reveal()  # enforces the
         # reveal deadline expiry − grace_ms − redemption_margin
     payer_refund() -> int / reveal_deadline() -> int

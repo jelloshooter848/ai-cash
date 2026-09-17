@@ -132,7 +132,11 @@ def main():
     # 2. Register operator + 3 agents, and a payee under a second operator
     # ------------------------------------------------------------------
     print("\n== 2. Register ATLAS-OPS, 3 agents, and a service provider ==")
-    st, r = m.call("POST", "/v3/operator/register", {"operator_name": "ATLAS-OPS"})
+    # Operator registration is gated on the MINT operator's credential (the
+    # two-operator bypass): without it a stranger who can reach the port can
+    # create an operator and start issuing agent keys.
+    st, r = m.call("POST", "/v3/operator/register", {"operator_name": "ATLAS-OPS"},
+                   admin=ADMIN_TOKEN)
     check("operator registered", st == 200, r.get("operator_id", ""))
     atlas_id, atlas_key = r["operator_id"], r["operator_key"]
 
@@ -142,7 +146,8 @@ def main():
         check(f"agent '{name}' registered", st == 200, r.get("agent_id", ""))
         agents[name] = {"id": r["agent_id"], "key": r["agent_key"]}
 
-    st, r = m.call("POST", "/v3/operator/register", {"operator_name": "SERVICE-CO"})
+    st, r = m.call("POST", "/v3/operator/register", {"operator_name": "SERVICE-CO"},
+                   admin=ADMIN_TOKEN)
     svc_key = r["operator_key"]
     st, r = m.call("POST", "/v3/operator/agents", {"agent_name": "metrics-svc"}, key=svc_key)
     check("payee custodial account registered (other operator)", st == 200)

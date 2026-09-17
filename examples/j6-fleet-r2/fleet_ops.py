@@ -112,7 +112,9 @@ def main():
         print(f"1. Profile mounted; descriptor profiles = {desc['profiles']}")
 
         # --- 2. Register operator + fleet ---
-        st, r = sup.call("POST", "/v3/operator/register", {"operator_name": "ATLAS-OPS"})
+        # Gated on the mint operator's credential (the two-operator bypass).
+        st, r = sup.call("POST", "/v3/operator/register",
+                         {"operator_name": "ATLAS-OPS"}, admin=admin_token)
         assert st == 200, (st, r)
         op_id, op_key = r["operator_id"], r["operator_key"]
         print(f"2. Registered operator ATLAS-OPS -> {op_id}")

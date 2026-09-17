@@ -6,11 +6,17 @@ mint time comes from a FakeClock injected through the Ledger (L17); the
 wallet itself never needs a clock.
 """
 
+import datetime
+import http.client
 import json
 import os
 import sqlite3
+import ssl
 import tempfile
+import threading
 import unittest
+import unittest.mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NamedTuple
 
 from aicash.burncalc import BurnPolicy
@@ -836,6 +842,238 @@ class WalletTest(unittest.TestCase):
         for bad in (0, -5, True, 1.5, "10"):
             with self.assertRaises((ValueError, TypeError)):
                 w.pay(bad)
+
+
+# ---------------------------------------------------------------------------
+# the deployed scheme: https
+# ---------------------------------------------------------------------------
+
+
+class TlsProxy:
+    """A minimal TLS-terminating reverse proxy in front of a plain mint.
+
+    This is DEPLOYMENT.md §4 in twenty lines: the mint stays plain HTTP on
+    loopback (L17 — TLS is deployment, not mint code) and the address the
+    operator publishes is an ``https://`` one.  The point of testing
+    against it rather than against a stub is that the client must reach a
+    mint deployed the way this project's own guide *requires*.
+    """
+
+    def __init__(self, mint_port: int, tmpdir: str):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+                critical=False,
+            )
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
+            .sign(key, hashes.SHA256())
+        )
+        self.cert_path = os.path.join(tmpdir, "proxy-cert.pem")
+        key_path = os.path.join(tmpdir, "proxy-key.pem")
+        with open(self.cert_path, "wb") as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(key_path, "wb") as fh:
+            fh.write(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+            )
+
+        upstream = mint_port
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _forward(self, method):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else None
+                conn = http.client.HTTPConnection(
+                    "127.0.0.1", upstream, timeout=30
+                )
+                try:
+                    headers = {}
+                    ctype = self.headers.get("Content-Type")
+                    if ctype:
+                        headers["Content-Type"] = ctype
+                    admin = self.headers.get("X-Admin-Token")
+                    if admin:
+                        headers["X-Admin-Token"] = admin
+                    conn.request(method, self.path, body, headers)
+                    resp = conn.getresponse()
+                    payload = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                finally:
+                    conn.close()
+
+            def do_GET(self):
+                self._forward("GET")
+
+            def do_POST(self):
+                self._forward("POST")
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert_path, key_path)
+        self._server.socket = ctx.wrap_socket(
+            self._server.socket, server_side=True
+        )
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"https://localhost:{self.port}"
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=10)
+
+
+class HttpsClientTest(unittest.TestCase):
+    """The shipped client must be able to reach a correctly deployed mint.
+
+    DEPLOYMENT.md §4 makes a TLS-terminating reverse proxy mandatory and
+    the mint itself loopback-only, so the address an operator hands out is
+    ``https://``.  ``MintClient`` refused every scheme but ``http``, which
+    made the project's own client unable to reach a mint deployed the way
+    the project's own guide requires (found 2026-09-16 by outside review).
+    """
+
+    # Borrowed rather than inherited: subclassing WalletTest would re-run
+    # every B-benchmark test a second time under this class's name.
+    start_mint = WalletTest.start_mint
+    issue_token = WalletTest.issue_token
+
+    def tls_proxy(self, mint: Mint) -> TlsProxy:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        proxy = TlsProxy(mint.port, tmp.name)
+        self.addCleanup(proxy.stop)
+        return proxy
+
+    def test_https_origin_is_accepted_and_ports_follow_the_scheme(self):
+        """https is a legal base_url; the default port follows the scheme."""
+        for url, scheme, host, port in (
+            ("https://mint.example.org", "https", "mint.example.org", 443),
+            ("https://mint.example.org:8443", "https", "mint.example.org", 8443),
+            ("https://mint.example.org/", "https", "mint.example.org", 443),
+            ("http://127.0.0.1:8787", "http", "127.0.0.1", 8787),
+            ("http://mint.example.org", "http", "mint.example.org", 80),
+        ):
+            with self.subTest(url=url):
+                client = MintClient(url)
+                self.assertEqual(client._scheme, scheme)
+                self.assertEqual(client._host, host)
+                self.assertEqual(client._port, port)
+
+    def test_non_http_schemes_and_junk_are_still_refused(self):
+        """Widening to https widens to https only."""
+        for bad in (
+            "ftp://nope",
+            "not-a-url",
+            "",
+            "//mint.example.org",
+            "file:///etc/passwd",
+            "http://",
+            "https://",
+            # an origin, not a path-mounted service: every route this
+            # client issues is absolute, so a prefix would be dropped.
+            "https://mint.example.org/mint/",
+            "https://mint.example.org/v3",
+            "https://mint.example.org/?k=1",
+        ):
+            with self.subTest(base_url=bad):
+                with self.assertRaises(ValueError):
+                    MintClient(bad)
+
+    def test_wallet_round_trip_through_a_tls_proxy(self):
+        """The finding, end to end: mint behind a TLS proxy, client on
+        https, money moves.  Before the fix the constructor raised."""
+        mint = self.start_mint()
+        proxy = self.tls_proxy(mint)
+        with unittest.mock.patch.dict(
+            os.environ, {"SSL_CERT_FILE": proxy.cert_path}
+        ):
+            payer = Wallet.connect(
+                os.path.join(self.tmpdir(), "payer.sqlite3"), proxy.base_url
+            )
+            self.assertEqual(payer.mint_id, MINT_ID)
+            self.assertEqual(payer.client._scheme, "https")
+            self.assertEqual(payer.receive(self.issue_token(mint, 5_000)), 4_950)
+
+            payee = Wallet(
+                os.path.join(self.tmpdir(), "payee.sqlite3"),
+                MintClient(proxy.base_url),
+                MINT_ID,
+            )
+            tokens = payer.pay(1_000)
+            self.assertEqual(payee.receive_batch(tokens)["credited_mc"], 990)
+        self.assertEqual(payee.balance(), 990)
+
+    def test_tls_verification_is_on_and_has_no_opt_out(self):
+        """A token is a bearer password (L8), so §14's "token captured in
+        transit" row only holds if the client checks who it is talking to.
+        With the proxy's certificate untrusted the same call fails, and it
+        fails as a transport failure carrying the exception TYPE only —
+        no request contents, no token."""
+        mint = self.start_mint()
+        proxy = self.tls_proxy(mint)
+        env = dict(os.environ)
+        env.pop("SSL_CERT_FILE", None)
+        env.pop("SSL_CERT_DIR", None)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            client = MintClient(proxy.base_url)
+            with self.assertRaises(MintUnavailable) as ctx:
+                client.descriptor()
+        self.assertIn("SSLCertVerificationError", str(ctx.exception))
+
+    def test_the_tls_context_is_built_once_and_stays_verifying(self):
+        """The default context parses the entire system CA bundle, and a
+        payment-heavy client issues a request per exchange/status/descriptor
+        call.  One context per client, reused -- and reuse must not become a
+        place where verification is quietly relaxed between calls."""
+        client = MintClient("https://mint.example.org")
+        first = client._tls_context()
+        self.assertIs(client._tls_context(), first)
+        self.assertTrue(first.check_hostname)
+        self.assertEqual(first.verify_mode, ssl.CERT_REQUIRED)
+
+    def tmpdir(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
 
 
 if __name__ == "__main__":

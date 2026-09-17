@@ -14,11 +14,24 @@ import threading
 import unittest
 import uuid
 
-from aicash.burncalc import BurnPolicy
+from aicash.burncalc import BurnPolicy, compute_burn
 from aicash.clock import FakeClock
-from aicash.ledgerstore import ExchangeRejected, Ledger, OutputSpec
+from aicash.ledgerstore import (
+    ExchangeRejected,
+    Ledger,
+    OutputSpec,
+    _SQLITE_INT_MAX,
+    _SQLITE_INT_MIN,
+    _storable_int,
+)
 from aicash.lockeval import InputForm, Lock
-from aicash.tokencodec import Token, b64u_encode, ledger_key, new_secret
+from aicash.tokencodec import (
+    MAX_AMOUNT_MC,
+    Token,
+    b64u_encode,
+    ledger_key,
+    new_secret,
+)
 
 T0 = 1_756_000_000_000
 WEEK_MS = 7 * 24 * 60 * 60 * 1000
@@ -178,6 +191,330 @@ class TestConservationAndBurn(LedgerTestCase):
         )
         self.assertEqual(result["burn_mc"], 0)
         self.assert_invariant(ledger)
+
+
+class TestScheduledBurnPolicyChange(LedgerTestCase):
+    """§3.3 step 1 + §7.3: the burn a call is charged is computed from the
+    policy in force AT THAT CALL, not from whatever policy the ledger was
+    constructed with.
+
+    The ledger used to hold one frozen policy for its whole life, so the
+    moment an operator's announced `burn_policy_next` took effect the
+    ledger and every client disagreed about the arithmetic in §3.3 step 1
+    — every reference client (wallet, channels, swap, escrow) selects
+    through burncalc.effective_policy on the descriptor's mint_time, and
+    the ledger did not. Result: every client-built exchange, a plain
+    receive included, rejected `amount_mismatch` fleet-wide, caused by the
+    operator using the change-notice mechanism exactly as §7.3 documents
+    it.
+    """
+
+    def make_scheduled(self, *, effective_at, now=T0):
+        """A ledger at 0.1% with an announced move to 1%."""
+        clock = FakeClock(now)
+        d = tempfile.mkdtemp(prefix="c04-sched-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        ledger = Ledger(
+            os.path.join(d, "ledger.db"),
+            clock,
+            BurnPolicy(rate_ppm=1_000, cap_mc=10**9, exempt_below_mc=10),
+            WEEK_MS,
+            None,
+            burn_policy_next=(
+                BurnPolicy(rate_ppm=10_000, cap_mc=10**9, exempt_below_mc=10),
+                effective_at,
+            ),
+        )
+        return ledger, clock
+
+    def spend(self, ledger, amount, outputs_mc):
+        secret = self.fund(ledger, amount)
+        spec, _ = self.out(outputs_mc)
+        return ledger.exchange(
+            key(), "d", [self.plain(secret, amount)], outputs=[spec]
+        )
+
+    def test_the_announced_policy_takes_over_at_effective_at(self):
+        """Before effective_at the old policy is charged; from effective_at
+        the announced one is, and the flip is exactly at the instant."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.make_scheduled(effective_at=eff)
+
+        # 0.1% of 1000 = 1
+        self.assertEqual(self.spend(ledger, 1000, 999)["burn_mc"], 1)
+
+        clock.set(eff - 1)
+        self.assertEqual(self.spend(ledger, 1000, 999)["burn_mc"], 1)
+
+        # 1% of 1000 = 10, from the instant itself
+        clock.set(eff)
+        self.assertEqual(self.spend(ledger, 1000, 990)["burn_mc"], 10)
+
+        clock.set(eff + 10**6)
+        self.assertEqual(self.spend(ledger, 1000, 990)["burn_mc"], 10)
+        self.assert_invariant(ledger)
+
+    def test_a_call_budgeted_for_the_old_policy_is_rejected_after_the_flip(self):
+        """The reciprocal, and the shape of the bug: after the change, a
+        batch built against the SUPERSEDED policy is the one that must
+        fail, and the rejection quotes the new burn so the caller can
+        rebalance."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.make_scheduled(effective_at=eff)
+        clock.set(eff)
+        secret = self.fund(ledger, 1000)
+        spec, _ = self.out(999)  # what the OLD 0.1% policy would allow
+        errors = self.reject(ledger, [self.plain(secret, 1000)], [spec])
+        self.assertEqual(
+            errors,
+            [{"index": None, "kind": "call", "reason": "amount_mismatch",
+              "expected_burn_mc": 10}],
+        )
+
+    def test_the_whole_batch_uses_one_policy_the_calls_own_instant(self):
+        """L17 clock discipline extends to the policy: `now` is read once
+        per call, so a call that lands on the boundary cannot have its
+        inputs priced under one policy and its conservation check under
+        another."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.make_scheduled(effective_at=eff)
+        clock.set(eff)
+        s1 = self.fund(ledger, 600)
+        s2 = self.fund(ledger, 400)
+        o1, _ = self.out(500)
+        o2, _ = self.out(490)  # 1000 - 10 burn
+        result = ledger.exchange(
+            key(), "d",
+            [self.plain(s1, 600), self.plain(s2, 400)],
+            outputs=[o1, o2],
+        )
+        self.assertEqual(result["burn_mc"], 10)
+        self.assert_invariant(ledger)
+
+    def test_a_ledger_with_no_notice_is_unchanged(self):
+        """No notice, no flip: the ordinary ledger keeps one policy for
+        every instant, which is what every existing caller relies on."""
+        ledger, clock = self.make_ledger(rate_ppm=1_000)[0:2]
+        self.assertIsNone(ledger.burn_policy_next)
+        self.assertEqual(self.spend(ledger, 1000, 999)["burn_mc"], 1)
+        clock.set(T0 + 10**12)
+        self.assertEqual(self.spend(ledger, 1000, 999)["burn_mc"], 1)
+
+    def test_the_notice_is_readable_and_read_only(self):
+        """C06 asserts config/ledger consistency on this at boot, so it is
+        part of the read-only configuration view beside burn_policy."""
+        eff = T0 + WEEK_MS
+        ledger, _ = self.make_scheduled(effective_at=eff)
+        self.assertEqual(
+            ledger.burn_policy_next,
+            (BurnPolicy(rate_ppm=10_000, cap_mc=10**9, exempt_below_mc=10), eff),
+        )
+        with self.assertRaises(AttributeError):
+            ledger.burn_policy_next = None
+
+    def test_a_malformed_notice_is_refused_at_construction(self):
+        """A policy the ledger cannot evaluate is not a payment-time
+        surprise: it fails when the mint is built."""
+        d = tempfile.mkdtemp(prefix="c04-bad-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        good = BurnPolicy(rate_ppm=1_000, cap_mc=10**9, exempt_below_mc=10)
+        bad_notices = (
+            "not-a-pair",
+            (good,),
+            (good, T0, T0),
+            (good, "later"),
+            (good, -1),
+            (good, 1.0),
+            ({"rate_ppm": 1}, T0),
+            (BurnPolicy(rate_ppm=10_001, cap_mc=0, exempt_below_mc=10), T0),
+        )
+        for i, notice in enumerate(bad_notices):
+            with self.subTest(notice=notice):
+                with self.assertRaises((ValueError, TypeError)):
+                    Ledger(
+                        os.path.join(d, "l%d.db" % i),
+                        FakeClock(T0),
+                        good,
+                        WEEK_MS,
+                        None,
+                        burn_policy_next=notice,
+                    )
+
+    def test_adopt_completes_a_ledger_but_never_replaces_a_notice(self):
+        """The boot-time reconciliation C06 uses for hand-wired mints is
+        one-way: it fills an empty schedule and refuses to overwrite one."""
+        ledger, clock, _ = self.make_ledger(rate_ppm=1_000)
+        eff = T0 + WEEK_MS
+        nxt = BurnPolicy(rate_ppm=10_000, cap_mc=10**9, exempt_below_mc=10)
+        ledger.adopt_burn_policy_next((nxt, eff))
+        self.assertEqual(ledger.burn_policy_next, (nxt, eff))
+        clock.set(eff)
+        self.assertEqual(self.spend(ledger, 1000, 990)["burn_mc"], 10)
+
+        with self.assertRaises(ValueError) as ctx:
+            ledger.adopt_burn_policy_next((nxt, eff + 1))
+        self.assertIn("already carries", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            ledger.adopt_burn_policy_next(None)
+        self.assertEqual(ledger.burn_policy_next, (nxt, eff))
+
+
+class TestEffectiveBurnPolicyAccessor(LedgerTestCase):
+    """§7.3: the policy in force at an instant is a PUBLIC question.
+
+    `burn_policy` / `burn_policy_next` are two halves of a configuration;
+    answering "what does a call cost right now" from them requires
+    re-implementing the selection rule, and the mint-side callers that did
+    so (C10's supervision profile pre-computes the burn it will hand to
+    `exchange`) read the frozen private `_burn_policy` and therefore
+    disagreed with `exchange` from `effective_at` onwards — the same F2
+    bug one layer up. `effective_burn_policy(now)` is the single public
+    answer, and `exchange` itself prices through it, so a caller that
+    budgets through it agrees by construction.
+    """
+
+    OLD = BurnPolicy(rate_ppm=1_000, cap_mc=10**9, exempt_below_mc=10)
+    NEW = BurnPolicy(rate_ppm=10_000, cap_mc=10**9, exempt_below_mc=10)
+
+    def scheduled(self, *, effective_at, now=T0):
+        """A ledger at 0.1% with an announced move to 1%."""
+        clock = FakeClock(now)
+        d = tempfile.mkdtemp(prefix="c04-eff-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        ledger = Ledger(
+            os.path.join(d, "ledger.db"),
+            clock,
+            self.OLD,
+            WEEK_MS,
+            None,
+            burn_policy_next=(self.NEW, effective_at),
+        )
+        return ledger, clock
+
+    def test_it_answers_for_the_instant_not_for_the_configuration(self):
+        """The flip is exactly at effective_at, and `burn_policy` keeps
+        reporting the configured value throughout (C06's boot check
+        compares configuration to configuration, so that must not move)."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, _ = self.scheduled(effective_at=eff)
+        self.assertEqual(ledger.effective_burn_policy(T0), self.OLD)
+        self.assertEqual(ledger.effective_burn_policy(eff - 1), self.OLD)
+        self.assertEqual(ledger.effective_burn_policy(eff), self.NEW)
+        self.assertEqual(ledger.effective_burn_policy(eff + 10**9), self.NEW)
+        self.assertEqual(ledger.burn_policy, self.OLD)
+        self.assertEqual(ledger.burn_policy_next, (self.NEW, eff))
+
+    def test_it_defaults_to_this_ledgers_own_clock(self):
+        """A caller with no instant of its own gets the ledger's."""
+        eff = T0 + WEEK_MS
+        ledger, clock = self.scheduled(effective_at=eff)
+        self.assertEqual(ledger.effective_burn_policy(), self.OLD)
+        clock.set(eff)
+        self.assertEqual(ledger.effective_burn_policy(), self.NEW)
+
+    def test_a_ledger_with_no_notice_answers_the_same_at_every_instant(self):
+        ledger, _, _ = self.make_ledger(rate_ppm=1_000)
+        p = BurnPolicy(rate_ppm=1_000, cap_mc=10**9, exempt_below_mc=10)
+        self.assertEqual(ledger.effective_burn_policy(0), p)
+        self.assertEqual(ledger.effective_burn_policy(T0 + 10**12), p)
+        self.assertEqual(ledger.effective_burn_policy(), p)
+
+    def test_a_notice_adopted_at_boot_is_visible_to_the_accessor(self):
+        """adopt_burn_policy_next is the hand-wired C06 path; the accessor
+        must see what exchange will charge after it, not the value the
+        ledger was constructed with."""
+        ledger, clock, _ = self.make_ledger(rate_ppm=1_000)
+        eff = T0 + WEEK_MS
+        ledger.adopt_burn_policy_next((self.NEW, eff))
+        self.assertEqual(ledger.effective_burn_policy(eff - 1), self.OLD)
+        self.assertEqual(ledger.effective_burn_policy(eff), self.NEW)
+
+    def test_it_rejects_an_instant_that_is_not_a_plain_int(self):
+        """Same integer discipline as every other §7.3 entry point: a
+        float instant would silently change the comparison."""
+        ledger, _ = self.scheduled(effective_at=T0 + WEEK_MS)
+        for bad in (1.0, "later", True, None.__class__):
+            with self.subTest(now=bad):
+                with self.assertRaises(TypeError):
+                    ledger.effective_burn_policy(bad)
+
+    # -- the drift the accessor exists to prevent ----------------------
+
+    def budgeted_exchange(self, ledger, policy, amount, now=None):
+        """Build an exchange the way a mint-side caller does: pre-compute
+        the burn from `policy`, then spend the whole entry."""
+        burn = compute_burn(amount, policy)
+        secret = self.fund(ledger, amount)
+        spec, _ = self.out(amount - burn)
+        return ledger.exchange(
+            key(), "d", [self.plain(secret, amount)], outputs=[spec]
+        )
+
+    def test_a_caller_budgeting_through_the_accessor_agrees_with_exchange(self):
+        """Across the flip, in both directions, with no arithmetic of its
+        own: the pre-computing caller and the conservation check land on
+        the same number."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.scheduled(effective_at=eff)
+        for instant, expected in ((T0, 10), (eff - 1, 10), (eff, 100),
+                                  (eff + 10**6, 100)):
+            with self.subTest(now=instant):
+                clock.set(instant)
+                result = self.budgeted_exchange(
+                    ledger, ledger.effective_burn_policy(clock()), 10_000
+                )
+                self.assertEqual(result["burn_mc"], expected)
+        self.assert_invariant(ledger)
+
+    def test_a_caller_budgeting_from_burn_policy_is_the_bug_being_closed(self):
+        """The reciprocal, pinned so the drift cannot come back quietly:
+        the SAME caller shape reading the configured policy instead builds
+        a batch the mint's own conservation check rejects — after
+        effective_at and not before."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.scheduled(effective_at=eff)
+
+        # Before the flip the two agree, which is why the drift is silent
+        # until the day an announced change takes effect.
+        self.assertEqual(
+            self.budgeted_exchange(ledger, ledger.burn_policy, 10_000)["burn_mc"],
+            10,
+        )
+
+        clock.set(eff)
+        burn = compute_burn(10_000, ledger.burn_policy)  # the stale 10
+        secret = self.fund(ledger, 10_000)
+        spec, _ = self.out(10_000 - burn)
+        errors = self.reject(ledger, [self.plain(secret, 10_000)], [spec])
+        self.assertEqual(
+            errors,
+            [{"index": None, "kind": "call", "reason": "amount_mismatch",
+              "expected_burn_mc": 100}],
+        )
+
+    def test_exchange_prices_every_call_through_this_one_method(self):
+        """Behavioral proof that the accessor is the single entry point:
+        override it on one instance and the burn `exchange` charges moves
+        with it — and it is called with the call's own captured instant,
+        not a second clock read."""
+        eff = T0 + 30 * 24 * 60 * 60 * 1000
+        ledger, clock = self.scheduled(effective_at=eff)
+        seen = []
+        free = BurnPolicy(rate_ppm=0, cap_mc=0, exempt_below_mc=10)
+
+        def fake(now=None):
+            seen.append(now)
+            return free
+
+        ledger.effective_burn_policy = fake
+        clock.set(eff)  # the announced 1% would charge 100
+        secret = self.fund(ledger, 10_000)
+        spec, _ = self.out(10_000)  # budgeted for NO burn at all
+        result = ledger.exchange(
+            key(), "d", [self.plain(secret, 10_000)], outputs=[spec]
+        )
+        self.assertEqual(result["burn_mc"], 0)
+        self.assertEqual(seen, [eff])
 
 
 class TestDoubleSpendRace(LedgerTestCase):
@@ -883,6 +1220,271 @@ class TestLedgerConstruction(LedgerTestCase):
         self.assertEqual(ledger.max_lock_expiry_ms, WEEK_MS)
         with self.assertRaises(AttributeError):
             ledger.recovery_window_ms = 0
+
+
+class NumbersThisLedgerCannotStoreAreRejectedNotBoundTest(LedgerTestCase):
+    """B-class: a caller-supplied number that will not fit a column.
+
+    ``Ledger.issue`` bound ``amount_mc`` into sqlite with a TYPE check and
+    no RANGE check. Python's int is unbounded and SQLite's INTEGER is a
+    signed 64-bit value, so nineteen nines — 9999999999999999999, one more
+    digit than the column holds — is valid JSON, the correct type and
+    positive, passed every guard, reached ``conn.execute`` and raised
+    ``OverflowError``: not ``ExchangeRejected``, not a ``sqlite3.Error``,
+    so ``except ExchangeRejected`` walked past it and C06's issuance route
+    answered a bare 500 with no ``errors`` list. §3.8 promises an
+    enumerated reason for every value the mint refuses.
+
+    WHY IT SURVIVED. The identical value through ``/v3/exchange`` was
+    refused correctly — conservation cannot balance an amount no entry can
+    hold — so the case looked covered. It was covered by a DIFFERENT
+    check that happens to also catch it, and ``issue`` has no inputs and
+    therefore no conservation. A check that covers a case by accident
+    stops covering it the moment the accident changes, which is why the
+    bound below is at the one place an output amount enters the ledger
+    rather than on the route that was reported.
+
+    So these tests sweep the SHAPE — every caller-supplied number this
+    module binds into a column — and not the one field.
+    """
+
+    # 9999999999999999999: nineteen nines, the reported value.
+    NINETEEN_NINES = int("9" * 19)
+
+    def unstorable_amounts(self):
+        return {
+            "nineteen nines": self.NINETEEN_NINES,
+            "2**63": 1 << 63,
+            "max + 1": _SQLITE_INT_MAX + 1,
+            "10**25": 10 ** 25,
+            "10**600": 10 ** 600,
+        }
+
+    # -- the reported instance, at the ledger ---------------------------
+
+    def test_issue_refuses_an_amount_no_column_can_hold(self):
+        """Enumerated, per output index, and NOT an OverflowError."""
+        for name, amount in self.unstorable_amounts().items():
+            with self.subTest(name):
+                ledger, _, _ = self.make_ledger()
+                with self.assertRaises(ExchangeRejected) as caught:
+                    ledger.issue(
+                        [OutputSpec(amount_mc=amount,
+                                    secret_hash=ledger_key(new_secret()))]
+                    )
+                self.assertEqual(
+                    caught.exception.errors,
+                    [{"index": 0, "kind": "output", "reason": "bad_format"}],
+                )
+
+    def test_nothing_is_written_when_the_amount_is_refused(self):
+        """The refusal rolls back: no entry, no supply movement."""
+        ledger, _, path = self.make_ledger()
+        with self.assertRaises(ExchangeRejected):
+            ledger.issue(
+                [OutputSpec(amount_mc=self.NINETEEN_NINES,
+                            secret_hash=ledger_key(new_secret()))]
+            )
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+        self.assertEqual(ledger.supply()["cumulative_issued_mc"], 0)
+
+    def test_the_index_named_is_the_offending_one(self):
+        """§3.8 enumerates indices, so the index has to be right in a
+        batch where the bad entry is not first."""
+        ledger, _, _ = self.make_ledger()
+        with self.assertRaises(ExchangeRejected) as caught:
+            ledger.issue([
+                OutputSpec(amount_mc=5, secret_hash=ledger_key(new_secret())),
+                OutputSpec(amount_mc=7, secret_hash=ledger_key(new_secret())),
+                OutputSpec(amount_mc=self.NINETEEN_NINES,
+                           secret_hash=ledger_key(new_secret())),
+            ])
+        self.assertEqual(
+            caught.exception.errors,
+            [{"index": 2, "kind": "output", "reason": "bad_format"}],
+        )
+
+    def test_the_largest_storable_amount_is_still_ordinary_money(self):
+        """The bound is the COLUMN's, so the value at the bound works. A
+        fix that refused 2**63-1 would be a fix that broke the ledger."""
+        ledger, _, _ = self.make_ledger()
+        secret = new_secret()
+        ledger.issue([OutputSpec(amount_mc=_SQLITE_INT_MAX,
+                                 secret_hash=ledger_key(secret))])
+        self.assertEqual(
+            ledger.supply()["cumulative_issued_mc"], _SQLITE_INT_MAX
+        )
+        _, results = ledger.status([ledger_key(secret)])
+        self.assertEqual(results[0]["amount_mc"], _SQLITE_INT_MAX)
+
+    # -- every caller BENEFITS, not just the reported route -------------
+
+    def test_exchange_refuses_the_same_amount_the_same_way(self):
+        """The bound is at ``_resolve_output``, which both routes share,
+        so the answer is the same on both. It used to be
+        `amount_mismatch` here and OverflowError there — two answers to
+        one question, which is how this survived."""
+        ledger, _, _ = self.make_ledger()
+        with self.assertRaises(ExchangeRejected) as caught:
+            ledger.exchange(
+                "idem-huge", "digest",
+                [],
+                outputs=[OutputSpec(amount_mc=self.NINETEEN_NINES,
+                                    secret_hash=ledger_key(new_secret()))],
+            )
+        self.assertEqual(
+            caught.exception.errors,
+            [{"index": 0, "kind": "output", "reason": "bad_format"}],
+        )
+
+    # -- the OTHER numbers this module binds ----------------------------
+
+    def test_a_lock_expiry_no_column_can_hold_is_refused(self):
+        """The second caller-supplied number on an entries row. C02's
+        validate_lock pins expiry's FORM (a positive int of ms) and says
+        nothing about its SIZE, so `{"expiry": 10**19}` is a valid §3.4
+        lock that raised the identical OverflowError out of
+        ``_insert_entry``.
+
+        Driven with ``max_lock=None`` on purpose: a ledger configured with
+        a finite lock horizon refuses that expiry for a different reason
+        (§8(b)), which is the same kind of accidental cover that hid the
+        amount defect. ``max_lock_expiry_ms=None`` is a supported
+        configuration, and it is the one where nothing else is watching.
+        """
+        for expiry in (10 ** 19, 1 << 63, _SQLITE_INT_MAX + 1, 10 ** 600):
+            with self.subTest(expiry=expiry):
+                ledger, _, _ = self.make_ledger(max_lock=None)
+                lock = {
+                    "preimage_hash": sha_b64u(b"p"),
+                    "expiry": expiry,
+                    "refund_hash": sha_b64u(b"r"),
+                }
+                with self.assertRaises(ExchangeRejected) as caught:
+                    ledger.issue([
+                        OutputSpec(amount_mc=5,
+                                   secret_hash=ledger_key(new_secret()),
+                                   lock=lock)
+                    ])
+                self.assertEqual(
+                    caught.exception.errors,
+                    [{"index": 0, "kind": "output", "reason": "bad_format"}],
+                )
+
+    def test_a_storable_lock_expiry_still_works(self):
+        ledger, _, _ = self.make_ledger(max_lock=None)
+        secret = new_secret()
+        ledger.issue([
+            OutputSpec(amount_mc=5, secret_hash=ledger_key(secret),
+                       lock={"preimage_hash": sha_b64u(b"p"),
+                             "expiry": _SQLITE_INT_MAX,
+                             "refund_hash": sha_b64u(b"r")})
+        ])
+        _, results = ledger.status([ledger_key(secret)])
+        self.assertEqual(results[0]["lock"]["expiry"], _SQLITE_INT_MAX)
+
+    def test_a_batch_whose_SUM_overflows_the_supply_counter(self):
+        """The number no per-value bound can reach.
+
+        Every amount below is individually storable and their total is
+        not: the supply UPDATE binds `total`, so two outputs of
+        `_SQLITE_INT_MAX` raised the identical OverflowError from the
+        identical route with every per-amount check passing. Found by
+        sweeping this module for "what else does it bind", not by a second
+        report.
+        """
+        ledger, _, _ = self.make_ledger()
+        with self.assertRaises(ExchangeRejected) as caught:
+            ledger.issue([
+                OutputSpec(amount_mc=_SQLITE_INT_MAX,
+                           secret_hash=ledger_key(new_secret())),
+                OutputSpec(amount_mc=_SQLITE_INT_MAX,
+                           secret_hash=ledger_key(new_secret())),
+            ])
+        # Index 1: the first entry fits, the second is where the ledger
+        # runs out of column.
+        self.assertEqual(
+            caught.exception.errors,
+            [{"index": 1, "kind": "output", "reason": "bad_format"}],
+        )
+        self.assertEqual(ledger.supply()["cumulative_issued_mc"], 0)
+
+    def test_the_headroom_is_read_from_what_is_already_issued(self):
+        """Not a per-call bound: a second call that would push the
+        cumulative counter over the column is refused too, and the
+        counter is exact right up to the edge."""
+        ledger, _, _ = self.make_ledger()
+        ledger.issue([OutputSpec(amount_mc=_SQLITE_INT_MAX - 1,
+                                 secret_hash=ledger_key(new_secret()))])
+        ledger.issue([OutputSpec(amount_mc=1,
+                                 secret_hash=ledger_key(new_secret()))])
+        self.assertEqual(
+            ledger.supply()["cumulative_issued_mc"], _SQLITE_INT_MAX
+        )
+        with self.assertRaises(ExchangeRejected) as caught:
+            ledger.issue([OutputSpec(amount_mc=1,
+                                     secret_hash=ledger_key(new_secret()))])
+        self.assertEqual(
+            caught.exception.errors,
+            [{"index": 0, "kind": "output", "reason": "bad_format"}],
+        )
+
+    # -- the bound itself, stated once ----------------------------------
+
+    def test_the_bound_is_the_column_and_is_named_once(self):
+        """One number with one cause. C01 already answers "how big can an
+        amount be" with the same value for the same reason (the column),
+        and a repository with two spellings of it is one where a retune
+        moves only one of them."""
+        self.assertEqual(_SQLITE_INT_MAX, (1 << 63) - 1)
+        self.assertEqual(_SQLITE_INT_MIN, -(2 ** 63))
+        self.assertIs(_SQLITE_INT_MAX, MAX_AMOUNT_MC)
+
+    def test_the_predicate_is_about_the_value_not_the_field(self):
+        """`_storable_int` is the chokepoint, so anything routed through it
+        is covered — including a field added later."""
+        for good in (0, 1, -1, _SQLITE_INT_MIN, _SQLITE_INT_MAX):
+            self.assertTrue(_storable_int(good), good)
+        for bad in (_SQLITE_INT_MAX + 1, _SQLITE_INT_MIN - 1, 1 << 63,
+                    10 ** 600, True, False, 1.0, "5", None, 5 + 0j):
+            self.assertFalse(_storable_int(bad), bad)
+
+    def test_an_unstorable_number_never_reaches_sqlite(self):
+        """The property, stated as the absence of the exception class the
+        defect was made of: no path out of `issue` or `exchange` raises
+        OverflowError for any of these, on any field."""
+        candidates = list(self.unstorable_amounts().values())
+        for amount in candidates:
+            with self.subTest(amount=str(amount)[:12]):
+                ledger, _, _ = self.make_ledger(max_lock=None)
+                for call in (
+                    lambda: ledger.issue([
+                        OutputSpec(amount_mc=amount,
+                                   secret_hash=ledger_key(new_secret()))]),
+                    lambda: ledger.issue([
+                        OutputSpec(amount_mc=5,
+                                   secret_hash=ledger_key(new_secret()),
+                                   lock={"preimage_hash": sha_b64u(b"p"),
+                                         "expiry": amount,
+                                         "refund_hash": sha_b64u(b"r")})]),
+                    lambda: ledger.exchange(
+                        "i-%s" % str(amount)[:8], "d", [],
+                        outputs=[OutputSpec(
+                            amount_mc=amount,
+                            secret_hash=ledger_key(new_secret()))]),
+                ):
+                    try:
+                        call()
+                    except ExchangeRejected:
+                        pass
+                    except OverflowError as exc:  # pragma: no cover
+                        self.fail("OverflowError reached sqlite: %r" % exc)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 """Start an aicash mint. Nothing here is protocol - it is only a launcher.
 
   python3 run_mint.py [--port N] [--db PATH] [--keys PATH] [--mint-id ID]
+  python3 run_mint.py --supervision [--provision-operator NAME]
 
 Keys are generated on first run and reused after, so the mint keeps its
 identity across restarts; a fresh keypair would invalidate every token
@@ -11,6 +12,20 @@ a client has everything it needs to talk to this mint.
 Defaults are for a local functional test: loopback only, plain HTTP. TLS is
 deployment, not code (LOCKED-DESIGN-DECISIONS L17), so do not expose this
 port beyond localhost without a reverse proxy terminating TLS in front.
+
+THE OPERATOR CONSOLE IS OFF UNLESS ASKED FOR (``--console-port 0`` is the
+default; ``--console-port 8080`` starts one). It used to be on, on a fixed
+port, and turning it off was something a deployment guide asked an operator
+to remember. That is the wrong way round for the one process here that
+holds the ISSUING CREDENTIAL and puts a button on it: every other dangerous
+power in this launcher is opt-in (--open-issuance, --open-registration,
+--supervision), the console was the exception, and an operator who followed
+the guide loosely was running it without having chosen to. A default is a
+decision the software makes for everyone who does not make one; the safe
+decision here is "no second listener holding the mint's credential". The
+console has lost nothing -- it is one flag away, it prints its own
+capability URL, and `python3 mint_console.py` still starts one against an
+already-running mint.
 
 Three things here exist for supervised runs rather than laptops:
 
@@ -27,6 +42,18 @@ Three things here exist for supervised runs rather than laptops:
     ``prunes_spent_records`` claim is PINNED into the key file the way
     mint_id and baseline_model_class are, so it cannot flip back to false on
     a database whose history has already been deleted.
+
+--supervision mounts the C10 Supervision Profile on the same port. Operator
+registration (POST /v3/operator/register) is credential-gated, and its
+credential is NOT the issuance credential: creating an operator account and
+creating credits from nothing are two different powers, and a mint run with
+--open-issuance absent and issuance disabled used to have no way to register
+an operator at all -- the profile mounted, advertised itself and could do
+nothing. By default registration follows --admin-token where there is one;
+where there is not, a registration credential is GENERATED and written to
+--supervision-keys-file beside the issuance one. --provision-operator creates
+the first operator in process, which is the bootstrap for a mint that wants
+no HTTP registration route at all (--no-registration).
 """
 import argparse, base64, binascii, json, logging, math, os, signal, sys
 import threading, time
@@ -34,8 +61,22 @@ import threading, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "impl"))
 
 from aicash.burncalc import BurnPolicy
-from aicash.mintapi import ADMIN_ISSUANCE_OPEN, MintConfig, make_mint
+from aicash.mintapi import (
+    ADMIN_ISSUANCE_DISABLED,
+    ADMIN_ISSUANCE_OPEN,
+    MintConfig,
+    make_mint,
+)
 from aicash.signing import generate_keypair, pubkey_b64u
+# Not re-exported from the package root (aicash/__init__.py mirrors
+# supervision.__all__, which is deliberately just the server class), so the
+# profile's vocabulary is imported from the module by name.
+from aicash.supervision import (
+    REGISTRATION_DISABLED,
+    REGISTRATION_INHERITS_ISSUANCE,
+    REGISTRATION_OPEN,
+    make_supervision_mint,
+)
 
 # Anything nonzero below this is rejected rather than accepted silently:
 # prune() takes BEGIN IMMEDIATE, so each pass blocks every writer for the
@@ -158,9 +199,12 @@ def handler_port(thread):
     its first positional argument, and Thread keeps the args it was built
     with. That is the only handle from out here on whether a given handler
     belongs to the MINT or to the operator console — and the difference
-    matters: mint_console's handler class sets no ``timeout``, so a browser
-    sitting on the console page parks an idle keep-alive handler forever, and
-    draining that one would add the full deadline to every ctrl-c.
+    matters: a browser sitting on the console page parks an idle keep-alive
+    handler for as long as mint_console's own idle timeout allows, and
+    draining that one would add that wait to every ctrl-c. (It used to say
+    the console handler class sets no timeout at all. It sets one — 30s,
+    plus a whole-request deadline since 2026-09-17 — which changes the size
+    of the wait and not the reason for skipping it.)
 
     None means "could not tell" (a different CPython, a thread that is not a
     socketserver handler at all). Callers treat that as drainable: waiting on
@@ -332,6 +376,50 @@ def prune_interval_hours(text):
     return value
 
 
+def supervision_report(args, server, sup_path, provisioned):
+    """What the startup JSON says about the profile. Never a live secret
+    unless --show-supervision-secrets asked for one, exactly as the
+    issuance credential is handled: under a process manager stdout is a
+    shipped, indexed, retained log stream."""
+    show = args.show_supervision_secrets
+    if server.registration_token is None:
+        credential = ("(NONE - registration is open to anyone)"
+                      if not args.no_registration
+                      else "(NONE - HTTP registration is disabled)")
+    elif show:
+        credential = server.registration_token
+    elif server.registration_source == "generated":
+        credential = (f'(written to {sup_path}, JSON field '
+                      f'"registration_token")' if sup_path
+                      else "(generated, but nowhere to write it)")
+    elif server.registration_source == "inherited":
+        credential = "(same as admin_token; send it in X-Admin-Token)"
+    else:
+        credential = "(as supplied on the command line; not written to disk)"
+    report = {
+        "register_route": "/v3/operator/register",
+        "registration_credential": credential,
+        "registration_source": server.registration_source,
+        # Both header names the registration credential is accepted in, so
+        # an operator hardening a reverse proxy has the whole admin plane in
+        # front of them rather than the one header DEPLOYMENT.md happens to
+        # name. Registration gained its OWN header this round;
+        # X-Admin-Token still works wherever the two secrets are the same,
+        # which means a proxy that strips or ACLs only X-Admin-Token from
+        # untrusted clients no longer blocks registration. That is a
+        # configuration change an operator has to be told about at the
+        # moment they start the mint, not left to find.
+        "credential_headers": ["X-Registration-Token", "X-Admin-Token"],
+    }
+    if provisioned:
+        report["operator_id"] = provisioned["operator_id"]
+        report["operator_key"] = (
+            provisioned["operator_key"] if show
+            else (f'(written to {sup_path}, JSON field "operator_key")'
+                  if sup_path else "(provisioned, but nowhere to write it)"))
+    return report
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run an aicash mint.")
     ap.add_argument("--port", type=int, default=8787,
@@ -339,8 +427,11 @@ def main():
     ap.add_argument("--db", default="mint.db")
     ap.add_argument("--keys", default="mint-keys.json")
     ap.add_argument("--mint-id", default="local-test-mint")
-    ap.add_argument("--console-port", type=int, default=8080,
-                    help="operator console in a browser; 0 disables it")
+    ap.add_argument("--console-port", type=int, default=0,
+                    help="operator console in a browser, on this port. OFF "
+                         "by default: the console holds the issuing "
+                         "credential and exposes issuance, so it is started "
+                         "only when asked for. Try 8080.")
     ap.add_argument("--access-log", default="mint-access.log",
                     help="request log: method, route pattern and status. The "
                          "mint already emits these at INFO and nothing was "
@@ -390,6 +481,59 @@ def main():
                          "mint built without saying anything does not start at "
                          "all. Passing this flag is opting in by name "
                          "(MintConfig.admin_token=ADMIN_ISSUANCE_OPEN).")
+    ap.add_argument("--no-issuance", action="store_true",
+                    help="build the mint with issuance turned OFF: "
+                         "/admin/issue answers 401 to everyone "
+                         "(MintConfig.admin_token=ADMIN_ISSUANCE_DISABLED). "
+                         "The mint still serves Layer 0, and with "
+                         "--supervision it still registers operators -- "
+                         "creating an operator account is not the power to "
+                         "create credits, and this launcher could not "
+                         "produce that configuration at all before.")
+    ap.add_argument("--supervision", action="store_true",
+                    help="mount the C10 Supervision Profile on the same port: "
+                         "operator/agent custodial accounts, caps, freeze, "
+                         "flags, pulls and signed statements. Layer 0 is "
+                         "unchanged and stays authless.")
+    ap.add_argument("--registration-token",
+                    help="credential for POST /v3/operator/register. NOT the "
+                         "issuance credential: registering an operator and "
+                         "minting value are different powers. Omitted, it "
+                         "follows --admin-token when there is one and is "
+                         "GENERATED when there is not.")
+    ap.add_argument("--open-registration", action="store_true",
+                    help="DANGEROUS: leave /v3/operator/register "
+                         "unauthenticated. Anyone who can reach the port can "
+                         "create an operator, and an agent under a new "
+                         "operator is outside every existing operator's caps, "
+                         "freeze and flags.")
+    ap.add_argument("--no-registration", action="store_true",
+                    help="serve no HTTP registration route at all (401 to "
+                         "everyone). Operators then come from "
+                         "--provision-operator, or already exist in the "
+                         "database from an earlier run.")
+    ap.add_argument("--provision-operator", metavar="NAME",
+                    help="create an operator in process at startup and write "
+                         "its key to --supervision-keys-file. This is the "
+                         "out-of-band bootstrap: it takes no credential "
+                         "because it never touches the port. Note it runs on "
+                         "EVERY start, and operator names are not unique -- "
+                         "restarting with this flag creates ANOTHER operator "
+                         "and rewrites the key file, while the previous "
+                         "operator and its agents keep working. Pass it once "
+                         "to bootstrap, then drop it.")
+    # Same -keys.json suffix as the other two secret files, for the same
+    # .gitignore reason recorded above --admin-token-file.
+    ap.add_argument("--supervision-keys-file",
+                    default="mint-supervision-keys.json",
+                    help="0600 JSON file the GENERATED registration "
+                         "credential and any --provision-operator key are "
+                         "written to. Empty string disables the file, which "
+                         "then requires --show-supervision-secrets.")
+    ap.add_argument("--show-supervision-secrets", action="store_true",
+                    help="also print the registration credential and any "
+                         "provisioned operator key to stdout. Off by "
+                         "default: under a process manager stdout is a log.")
     args = ap.parse_args()
 
     if isinstance(args.admin_token, str) and not args.admin_token.strip():
@@ -407,11 +551,21 @@ def main():
                  "nothing. Pass a real token, drop the flag to have one "
                  "generated, or pass --open-issuance to run with no "
                  "credential on purpose.")
+    if args.no_issuance and args.admin_token:
+        ap.error("--admin-token with --no-issuance is contradictory: "
+                 "--no-issuance makes /admin/issue refuse everyone, so the "
+                 "token would gate nothing. Pick one. (To keep issuance off "
+                 "but registration on, use --no-issuance --supervision "
+                 "--registration-token.)")
+    if args.no_issuance and args.open_issuance:
+        ap.error("--no-issuance and --open-issuance are opposites: one "
+                 "refuses every /admin/issue, the other accepts every one.")
     if args.open_issuance and args.admin_token:
         ap.error("--admin-token with --open-issuance is contradictory: "
                  "--open-issuance makes /admin/issue accept everyone, so the "
                  "token would be silently ignored. Pick one.")
-    if (not args.open_issuance and not args.admin_token
+    if (not args.open_issuance and not args.no_issuance
+            and not args.admin_token
             and not args.admin_token_file and not args.show_admin_token):
         # Otherwise the mint would run its whole life with a random credential
         # that was never written anywhere and never printed — unusable, and
@@ -419,6 +573,60 @@ def main():
         ap.error("--admin-token-file '' leaves nowhere to put the generated "
                  "credential. Pass --admin-token to supply your own, or "
                  "--show-admin-token to print it, or keep the token file.")
+
+    sup_only = [
+        ("--registration-token", bool(args.registration_token)),
+        ("--open-registration", args.open_registration),
+        ("--no-registration", args.no_registration),
+        ("--provision-operator", bool(args.provision_operator)),
+        ("--show-supervision-secrets", args.show_supervision_secrets),
+    ]
+    if not args.supervision:
+        for name, given in sup_only:
+            if given:
+                # Silently ignoring these would start a mint with NO
+                # supervision routes while the operator believes they
+                # configured them -- and the first thing they would do is
+                # hand out a registration credential for a route that is
+                # not there.
+                ap.error(f"{name} needs --supervision: this mint would not "
+                         f"serve the Supervision Profile at all.")
+    if args.open_registration and args.registration_token:
+        ap.error("--registration-token with --open-registration is "
+                 "contradictory: --open-registration makes "
+                 "/v3/operator/register accept everyone, so the token would "
+                 "be silently ignored. Pick one.")
+    if args.no_registration and (args.open_registration
+                                 or args.registration_token):
+        ap.error("--no-registration refuses every registration request, so a "
+                 "registration credential (or --open-registration) means "
+                 "nothing next to it. Pick one.")
+    if isinstance(args.registration_token, str) and not args.registration_token.strip():
+        # Same shape as the --admin-token check above, and the same cause:
+        # an unset shell variable expands to a credential every caller can
+        # send. SupervisionServer refuses it too; this says so in the
+        # launcher's own words first, and never echoes the value.
+        ap.error("--registration-token is empty or only whitespace, which is "
+                 "not a credential: /v3/operator/register would be gated on "
+                 "a header anyone can send. Pass a real token, drop the flag "
+                 "to have one derived or generated, or pass "
+                 "--open-registration to run with no credential on purpose.")
+    if (args.supervision and not args.supervision_keys_file
+            and not args.show_supervision_secrets):
+        # A generated registration credential (or a provisioned operator
+        # key) that is never written and never printed is unrecoverable:
+        # re-running generates a DIFFERENT one, and nothing else on the
+        # machine knows it.
+        needs_somewhere = args.provision_operator or not (
+            args.registration_token or args.open_registration
+            or args.no_registration
+            or isinstance(args.admin_token, str) or args.open_issuance
+        )
+        if needs_somewhere:
+            ap.error("--supervision-keys-file '' leaves nowhere to put the "
+                     "generated supervision secrets. Pass "
+                     "--show-supervision-secrets to print them, or keep the "
+                     "file.")
 
     if args.access_log:
         logging.basicConfig(
@@ -453,6 +661,28 @@ def main():
         # bind (see below).
         print("WARNING: /admin/issue is unauthenticated. Anyone who can reach "
               "this mint can mint without limit.", file=sys.stderr)
+    registration_is_open = args.open_registration or (
+        # Inheriting an open issuance decision opens registration too --
+        # but only when nothing else decided it. --open-issuance next to
+        # --registration-token or --no-registration must NOT print this.
+        args.open_issuance and not args.registration_token
+        and not args.no_registration)
+    if args.supervision and registration_is_open:
+        # The profile's own open state, on the same stream and in the same
+        # shape. An unauthenticated registration route is not a smaller
+        # hole than an unauthenticated mint: an agent under an operator a
+        # stranger just created is outside every existing operator's caps,
+        # freeze and flags, which is the control the profile exists to be.
+        print("WARNING: POST /v3/operator/register is unauthenticated. "
+              "Anyone who can reach this mint can create an operator, and "
+              "agents under it are outside every other operator's caps, "
+              "freeze and flags.", file=sys.stderr)
+    elif args.no_issuance:
+        # Same two-values discipline as the open case: the POLICY is the
+        # named sentinel, and there is no CREDENTIAL to hand the console or
+        # print, because nothing can pass this gate.
+        admin_token = None
+        config_admin_token = ADMIN_ISSUANCE_DISABLED
     elif args.admin_token:
         admin_token = args.admin_token
         config_admin_token = admin_token
@@ -484,11 +714,14 @@ def main():
                                exempt_below_mc=args.exempt_below_mc),
         signing_private=private,
         signing_public=public,
-        # Always one of the three named states — a generated credential, one
-        # supplied on the command line, or ADMIN_ISSUANCE_OPEN behind
-        # --open-issuance. This launcher has never been able to produce an
-        # unset one, which is why it was not the source of the open-by-default
-        # hole; it is now structurally impossible rather than merely true.
+        # Always one of the named states — a generated credential, one
+        # supplied on the command line, ADMIN_ISSUANCE_OPEN behind
+        # --open-issuance, or ADMIN_ISSUANCE_DISABLED behind --no-issuance.
+        # This launcher has never been able to produce an unset one, which is
+        # why it was not the source of the open-by-default hole; it is now
+        # structurally impossible rather than merely true. --no-issuance is
+        # new, and is not a smaller mint: with --supervision it still
+        # registers operators, because that gate is no longer this value.
         admin_token=config_admin_token,
         # §8(b) requires the mint to publish its retention policy truthfully.
         # If the prune thread is running — or ever has run for this mint_id —
@@ -499,7 +732,25 @@ def main():
         # ever stops being true.)
         prunes_spent_records=publishes_prunes,
     )
-    server, ledger = make_mint(config, args.db)
+    if args.supervision:
+        if args.open_registration:
+            registration = REGISTRATION_OPEN
+        elif args.no_registration:
+            registration = REGISTRATION_DISABLED
+        elif args.registration_token:
+            registration = args.registration_token
+        else:
+            # Follow the mint's issuance decision where it is a usable
+            # secret, and GENERATE one where it is not. The second half is
+            # the whole point: gating registration on the issuance check
+            # made a mint that deliberately disabled issuance unable to
+            # register an operator, and therefore unable to do anything the
+            # profile exists for.
+            registration = REGISTRATION_INHERITS_ISSUANCE
+        server, ledger = make_supervision_mint(
+            config, args.db, registration_token=registration)
+    else:
+        server, ledger = make_mint(config, args.db)
     try:
         port = server.start(args.port)
     except OSError as exc:
@@ -517,14 +768,18 @@ def main():
     # that holds the RUNNING mint's only copy of its /admin/issue credential,
     # nor pinned a retention claim for a mint that never came up.
     token_path = None
+    sup_path = None
+    provisioned = None
     try:
-        if args.open_issuance and args.admin_token_file:
+        if (args.open_issuance or args.no_issuance) and args.admin_token_file:
             # A stale token file next to an unauthenticated mint tells whoever
             # reads it that /admin/issue is protected. It is not.
             try:
                 os.unlink(args.admin_token_file)
                 print(f"removed stale {os.path.abspath(args.admin_token_file)}: "
-                      f"issuance is open, that credential means nothing now.",
+                      f"issuance is "
+                      f"{'open' if args.open_issuance else 'disabled'}, that "
+                      f"credential means nothing now.",
                       file=sys.stderr)
             except FileNotFoundError:
                 pass
@@ -533,6 +788,32 @@ def main():
                               {"mint_id": args.mint_id,
                                "admin_token": generated_token})
             token_path = os.path.abspath(args.admin_token_file)
+        if args.supervision:
+            # After the bind, for the same reason the issuance credential
+            # is: a launcher that dies during startup must not have
+            # overwritten the secrets of the mint that is actually running.
+            if args.provision_operator:
+                try:
+                    op_id, op_key = server.provision_operator(
+                        args.provision_operator)
+                except Exception as exc:  # sqlite, disk, anything
+                    # A mint that is up but has no operator is the state
+                    # this whole flag exists to prevent, and the caller
+                    # asked for one by name. Stop cleanly rather than serve
+                    # a profile nobody can drive.
+                    server.stop()
+                    sys.exit(f"started, then failed to provision operator "
+                             f"{args.provision_operator!r}: {exc}")
+                provisioned = {"operator_id": op_id, "operator_key": op_key,
+                               "operator_name": args.provision_operator}
+            blob = {"mint_id": args.mint_id}
+            if server.registration_source == "generated":
+                blob["registration_token"] = server.registration_token
+            if provisioned:
+                blob.update(provisioned)
+            if len(blob) > 1 and args.supervision_keys_file:
+                write_secret_json(args.supervision_keys_file, blob)
+                sup_path = os.path.abspath(args.supervision_keys_file)
         if publishes_prunes and not pinned_prunes:
             pin_retention(args.keys)
     except OSError as exc:
@@ -558,12 +839,17 @@ def main():
         "burn_policy": {"rate_ppm": args.rate_ppm, "cap_mc": args.cap_mc,
                         "exempt_below_mc": args.exempt_below_mc},
         "admin_token": (
-            "(NONE - issuance is open to anyone)" if admin_token is None
+            "(NONE - issuance is disabled; /admin/issue refuses everyone)"
+            if args.no_issuance
+            else "(NONE - issuance is open to anyone)" if admin_token is None
             else admin_token if args.show_admin_token
             else "(as supplied on the command line; not written to disk)"
             if generated_token is None
             else f'(written to {token_path}, JSON field "admin_token")'),
         "access_log": os.path.abspath(args.access_log) if args.access_log else None,
+        **({"supervision": supervision_report(args, server, sup_path,
+                                              provisioned)}
+           if args.supervision else {}),
     }, indent=2))
     console = None
     if args.console_port:
@@ -632,12 +918,39 @@ def main():
     # the truth about the endpoint that creates money.
     issue_note = ("NO CREDENTIAL — open to anyone who can reach this port"
                   if config_admin_token is ADMIN_ISSUANCE_OPEN
+                  else "DISABLED — refuses everyone"
+                  if config_admin_token is ADMIN_ISSUANCE_DISABLED
                   else "operator credential")
+    # Off is the default, so the banner SAYS it is off. An operator who
+    # expected a console and is told nothing would go looking for a URL that
+    # was never printed; one line costs nothing and is the difference
+    # between a decision and a surprise.
+    console_line = (f"\n  console     not started (--console-port 0, the "
+                    f"default). --console-port 8080 starts one."
+                    if console is None else "")
+    sup_lines = ""
+    if args.supervision:
+        # Same rule as issue_note: say what the route actually requires on
+        # THIS mint, not what it usually requires.
+        if server.registration_token is None and server.registration_source in (
+                "inherited-open", "explicit-mode") and not args.no_registration:
+            reg_note = "NO CREDENTIAL — open to anyone who can reach this port"
+        elif server.registration_token is None:
+            reg_note = ("DISABLED — bootstrap with --provision-operator")
+        elif server.registration_source == "inherited":
+            reg_note = "operator credential, in X-Admin-Token"
+        else:
+            reg_note = "registration credential, in X-Registration-Token"
+        sup_lines = (f"\n  supervision profile mounted"
+                     f"\n  register    POST {base}/v3/operator/register"
+                     f"  ({reg_note})")
     print(f"\nmint is up. ctrl-c or SIGTERM to stop."
           f"\n  descriptor  GET  {base}/v3/mints"
           f"\n  exchange    POST {base}/v3/exchange"
           f"\n  status      POST {base}/v3/status  (or GET /v3/status/<id>)"
-          f"\n  issue       POST {base}/admin/issue  ({issue_note})",
+          f"\n  issue       POST {base}/admin/issue  ({issue_note})"
+          f"{console_line}"
+          f"{sup_lines}",
           flush=True)
     try:
         # Short timeout rather than a bare wait(): the loop then does not

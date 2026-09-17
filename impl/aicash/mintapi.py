@@ -66,6 +66,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -77,7 +78,12 @@ try:  # POSIX only; the reference build targets Linux (see DEPLOYMENT).
 except ImportError:  # pragma: no cover - no advisory locking available
     fcntl = None
 
-from aicash.burncalc import BurnPolicy, validate_policy
+from aicash.burncalc import (
+    BurnPolicy,
+    is_increase,
+    validate_notice,
+    validate_policy,
+)
 from aicash.clock import system_clock
 from aicash.ledgerstore import (
     ExchangeRejected,
@@ -102,6 +108,17 @@ __all__ = [
     "make_mint",
     "ADMIN_ISSUANCE_OPEN",
     "ADMIN_ISSUANCE_DISABLED",
+    # The request-framing rule, public because it is SHARED. Every HTTP
+    # server in this repository -- this mint, the Supervision Profile, the
+    # operator GUI and the operator console -- decides how long a request
+    # body is by calling `framing_verdict`, and nothing else. It is on the
+    # integrator surface for the same reason: anyone embedding a handler of
+    # their own beside a mint needs the same rule, and the alternative to
+    # exporting it is what already happened three times here -- a private
+    # copy that was right on the day it was written.
+    "FramingVerdict",
+    "framing_verdict",
+    "FRAMING_REASONS",
 ]
 
 logger = logging.getLogger("aicash.mintapi")
@@ -293,6 +310,411 @@ MAX_IDEMPOTENCY_KEY_LEN = 128
 # ordinary shape was refused) rather than closing it; closing it needs a
 # length bound on amounts in C01, which is a protocol question and not a
 # deployment-config one. test_c06 pins both halves of this.
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,19}")
+"""RFC 7230 §3.3.2 ``Content-Length = 1*DIGIT``, and nothing else.
+
+Used instead of handing the header value straight to ``int()``, which is
+a LOOSER parser than HTTP's: it accepts a leading sign, PEP 515 underscore
+separators and surrounding whitespace, so ``+53`` and ``5_3`` both read as
+53 here while an intermediary reads them as malformed or as zero — a
+length two parties compute differently, which is the definition of a
+smuggling primitive. The 19-digit cap is the other half: it keeps ``int()``
+below CPython's int/str conversion limit, so a 5,000-digit Content-Length
+cannot raise a bare ValueError out of a framing decision."""
+
+_FRAMING_FIELD_NAMES = ("content-length", "transfer-encoding")
+"""The only two field names that can change how long a request body is.
+
+Named ONCE, and then only ever used to build the confusion rule below —
+never looked up by name in a header block. ``headers.get("X")`` asks
+"is there a header spelled exactly X", and the answer to that question is
+not the answer this server needs.
+"""
+
+_FRAMING_NAME_SEPARATOR = r"(?:[^a-z0-9]*|.)"
+"""What may stand where a framing header name has its hyphen.
+
+Either a run of any length of non-alphanumeric characters (including none
+at all), or any single character. Those are the two ways a separator is
+rewritten in practice: punctuation-to-punctuation substitution and
+collapsing (``Transfer_Encoding``, ``Transfer.Encoding``,
+``Transfer__Encoding``, ``TransferEncoding``), and one-character confusion
+(``Transfer0Encoding``). Written as a shape rather than as a character
+class so that neither half needs a list."""
+
+_FRAMING_CONFUSABLE_RE = re.compile(
+    "|".join(
+        name.replace("-", _FRAMING_NAME_SEPARATOR)
+        for name in _FRAMING_FIELD_NAMES
+    )
+)
+"""Field names another hop could read as one of the framing headers.
+
+DERIVED from ``_FRAMING_FIELD_NAMES``, not written out, because a list of
+bad spellings is the thing that was wrong the last two times: each hyphen
+becomes ``_FRAMING_NAME_SEPARATOR``, so ``transfer-encoding``,
+``Transfer_Encoding``, ``Transfer.Encoding``, ``Transfer|Encoding``,
+``Transfer__Encoding``, ``TransferaEncoding`` and ``transferencoding`` are
+one rule and so is the spelling nobody has written down yet. Adding a
+framing header to the tuple above extends the rule to every confusion of
+THAT name too, with no second edit and no second list to keep in step.
+
+Why punctuation is the axis: a field name's separator is the part of it
+that other software rewrites. nginx has ``underscores_in_headers``,
+Apache and IIS historically folded ``_`` to ``-``, and a gateway that
+normalises ``Transfer_Encoding`` into ``Transfer-Encoding`` has DECHUNKED
+a body this server then reads as zero octets long — the two parties
+disagree about where the request ends, which is the whole of request
+smuggling. The rule does not try to guess which rewrites are live in any
+particular deployment (that is a fact about someone else's config, not
+about this request); it declines to reuse the connection whenever the
+question can be asked at all.
+
+A name matching this is never READ as framing — a mint that honoured
+``Transfer_Encoding`` would be inventing its own dialect. It is read as
+"this server cannot be certain how long the body is", which is the one
+verdict that is safe whichever way the other hop resolves it."""
+
+_TCHAR = frozenset("!#$%&'*+-.^_`|~0123456789"
+                   "abcdefghijklmnopqrstuvwxyz"
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+"""RFC 7230 §3.2.6 ``tchar`` — every character a header NAME may contain.
+
+A parsed name carrying anything else (``;``, ``"``, ``(``, a control byte)
+is a name no two parsers have to agree on, whatever it turns out to mean,
+so a request carrying one cannot be framed. This is a property of the
+grammar, not a list of bad spellings — which is the whole reason it is
+here: the confusable-name regex below can only express confusion AT a
+separator position, so ``Content-Length;`` and ``Transfer-Encoding.``
+walked straight past it while the Supervision Profile's own rule refused
+them. Four hundred and thirty-five names sat in that gap, and three of
+them reproduced the original report's access-log symptom verbatim."""
+
+
+def _fold_header_name(name: str) -> str:
+    """A header name reduced to what survives any hop's renaming.
+
+    Lowercase, and every non-alphanumeric character dropped. ``-`` and
+    ``_`` are the pair that matters — CGI, WSGI, and every front end that
+    round-trips a header through an environment variable map one to the
+    other, so ``Transfer_Encoding`` is ``Transfer-Encoding`` to them and a
+    header of no consequence to ``email.parser``. ``.``, doubled
+    separators, and a leading or trailing one go the same way, because the
+    fold is not an enumeration of the separators seen so far: it keeps only
+    the characters that carry the NAME and discards everything that merely
+    punctuates it.
+
+    THIS IS THE WIDER OF THE TWO RULES THIS REPOSITORY HAD. It lived in
+    C10 while ``_FRAMING_CONFUSABLE_RE`` lived here, and the promotion
+    round exported the NARROWER one to the other three servers. Both are
+    asked now, and a name refused by either is refused: the regex reaches
+    one-character confusions the fold keeps (``Transfer0Encoding`` folds to
+    itself), the fold reaches every extra or misplaced separator the regex
+    cannot express (``Con-tent-Length``, ``Content-Length-``,
+    ``_Transfer-Encoding``). Neither is a superset of the other, so the
+    union is the rule and there is exactly one union.
+    """
+    return "".join(c for c in name.lower() if c.isascii() and c.isalnum())
+
+
+#: ``_FRAMING_FIELD_NAMES`` under that fold. Precomputed so the hot path
+#: compares against a set rather than rebuilding it per header, and DERIVED
+#: from the same tuple the regex is derived from, so adding a third framing
+#: header extends both halves of the rule with no second edit.
+_FOLDED_FRAMING_NAMES = frozenset(
+    _fold_header_name(n) for n in _FRAMING_FIELD_NAMES
+)
+
+
+@dataclass(frozen=True)
+class FramingVerdict:
+    """What ``framing_verdict`` decided about ONE request's framing.
+
+    Four fields and nothing else:
+
+    * ``length`` — the body length this server can be CERTAIN of, or
+      ``None`` when no length can be trusted. Never negative, never
+      non-numeric: a caller may hand it straight to ``rfile.read``.
+    * ``framed`` — ``False`` exactly when ``length`` is ``None``, i.e.
+      when this request's body cannot be framed at all. Carried as its
+      own field so a caller reads an intent rather than re-deriving one
+      from a sentinel.
+    * ``must_close`` — ``True`` when the connection MUST be closed after
+      answering, whatever the answer is. That is every unframable
+      request, and also a request that IS framed but declares octets the
+      caller has already said it will not read (``body_expected=False``
+      with a non-zero length): those octets stay on the wire and a
+      keep-alive peer frames them as the next request line.
+    * ``reason`` — a short machine string from ``FRAMING_REASONS``, for
+      the caller's logs and its own error vocabulary.
+
+    DELIBERATELY NOT HERE: HTTP status codes and error envelopes. This
+    object is consumed by four servers in this repository with three
+    different error vocabularies — the mint answers §3.8 ``bad_format``
+    at call level, the Supervision Profile answers its own ``rejected``
+    shape, and the two operator consoles answer theirs — so a verdict
+    that carried a status would be a verdict only one of them could use,
+    and the other three would go back to writing their own rule. Framing
+    is the part they must agree on; how they say no is not.
+    """
+
+    length: int | None
+    framed: bool
+    must_close: bool
+    reason: str
+
+
+#: Every value ``FramingVerdict.reason`` can carry, so a caller can map the
+#: set exhaustively and a new one cannot appear unnoticed.
+FRAMING_REASONS = (
+    "ok",
+    "header_block_defective",
+    "header_block_unparsed",
+    "header_shape_unreadable",
+    "header_line_folded",
+    "header_name_not_token",
+    "framing_name_confusable",
+    "framing_name_folded",
+    "content_length_duplicated",
+    "content_length_absent",
+    "content_length_malformed",
+    "declared_body_unread",
+)
+
+_FRAMED_OK = FramingVerdict(length=0, framed=True, must_close=False, reason="ok")
+
+
+def _unframable(reason: str) -> FramingVerdict:
+    """The one verdict that is safe whichever way another hop reads this
+    request: no trusted length, and do not reuse the socket."""
+    return FramingVerdict(
+        length=None, framed=False, must_close=True, reason=reason
+    )
+
+
+def framing_verdict(headers, *, body_expected: bool = True) -> FramingVerdict:
+    """THE request-framing rule, for every HTTP server in this repository.
+
+    ``headers`` is the parsed message object an ``http.server`` handler
+    holds as ``self.headers`` (an ``email.message.Message``). Nothing else
+    about the handler is read, which is the point: the rule is a function
+    of the parsed header block and of one caller fact — whether this
+    caller is about to read a body — so four servers can ask it about
+    identical wire bytes and get identical answers.
+
+    WHY THIS IS SHARED AND NOT COPIED. It was copied. The mint was fixed
+    for one spelling of one header, then fixed properly against the class,
+    and the two other servers in the same repository kept the version that
+    was wrong — nineteen of twenty-five spellings still worked against
+    them. A framing rule that each server re-derives is a framing rule
+    that drifts, and the half that drifts is the smuggleable half.
+    Everything below is the mint's rule, unchanged in behaviour, with its
+    only caller-specific input (``body_expected``) taken as an argument
+    instead of read off a handler.
+
+    The question it answers is the only one that has a safe answer: how
+    many octets of this request belong to its body? A number means the
+    stream can be re-framed after the answer and the connection may be
+    reused. ``None`` means it cannot, whatever the reason, and the caller
+    must hang up.
+
+    Derived from what is definitely known, never from what a header
+    happens to be called:
+
+    * A header block this parser could not read whole — a defect, an
+      unread remainder left in the message payload, or a name or value
+      carrying an obsolete folded continuation. See the code: this is
+      the precondition, not a separate rule.
+    * More than one ``Content-Length`` — the CL.CL smuggling pair. Two
+      stated lengths are not a length; an intermediary may believe the
+      other one. Any duplicate, not only a disagreeing one, because
+      "identical" is a judgement about whitespace and leading zeros
+      that we would have to make the same way as every proxy in the
+      path.
+    * A field name that is not an RFC 7230 ``token`` — ``_TCHAR``. A
+      name carrying ``;``, ``"``, ``(`` or a control byte is a name no
+      two parsers have to agree on, and agreement is the only thing
+      framing rests on.
+    * Any field name that could carry framing meaning to ANY hop, asked
+      TWO ways whose union is the rule: ``_fold_header_name`` (lowercase,
+      every non-alphanumeric character dropped) landing on a framing name
+      without BEING that name, and ``_FRAMING_CONFUSABLE_RE``, derived
+      from the two framing header
+      names by letting each hyphen be any single character or any run
+      of punctuation, including none at all. Neither reaches everything
+      the other does — the regex can only express confusion at the one
+      separator position, so ``Con-tent-Length``, ``Content-Length-`` and
+      ``_Transfer-Encoding`` fell out of it entirely and were IGNORED
+      rather than refused, while the fold cannot see a one-character
+      substitution like ``Transfer0Encoding``. Both halves lived in this
+      repository already, in two different files; the round that promoted
+      one of them to the shared rule promoted the narrower, and 435 names
+      that the Supervision Profile refused were framed by the mint, the
+      GUI and the console. Asking both is what makes "one rule" true
+      rather than merely single-sourced. This
+      clause exists because a stated length can be a LIE: this stack
+      does not dechunk, so ``Transfer-Encoding: chunked`` beside
+      ``Content-Length: 0`` makes the length rule below believe a body
+      that is not there, and the clause that caught it was for one
+      round a lookup of one exact spelling. Sixteen other spellings of
+      the same field name walked past it beside a truthful
+      ``Content-Length: 0`` — and a truthful length is precisely where
+      no other clause can help, because there is nothing wrong with it.
+      The rule is now a property of the NAME rather than a list of
+      names: a field this server cannot be sure is inert is a field it
+      declines to frame a connection around. It is never obeyed, only
+      refused — honouring ``Transfer_Encoding`` would be inventing a
+      dialect, and the safe answer does not require guessing which
+      rewrites are live upstream.
+    * A ``Content-Length`` that is not a bare run of ASCII digits of a
+      plausible size. RFC 7230 §3.3.2 says ``1*DIGIT`` and nothing
+      else, while ``int()`` also accepts a leading ``+``, PEP 515
+      underscore separators and surrounding whitespace: ``+53`` and
+      ``5_3`` both became 53 here and are rejected or read as zero by
+      other parsers, which is a desync with a mint-side body attached.
+      The digit run is length-capped as well, so ``int()`` can never
+      meet CPython's int/str conversion limit and raise out of a
+      framing decision — the D2 defect, met on the D1 path.
+    * No ``Content-Length`` at all, on a request whose body the caller
+      was about to read (``body_expected``). THIS is the clause
+      that closes the class. An absent length on a body-bearing method
+      is not "no body": it is "no statement", and no statement is
+      exactly what every mangled, misspelled or front-end-rewritten
+      framing header degrades into by the time it reaches this parser.
+      The server cannot tell "the peer sent nothing" from "the peer
+      sent something this parser dropped", so it does not try; it
+      declines to reuse the connection either way. The cost is one
+      keep-alive round trip on a request that has no readable JSON
+      body and therefore fails anyway; the benefit is that no spelling
+      of a body-framing header, present or future, can leave octets on
+      a pooled socket.
+
+      ``body_expected`` is False only for a GET-shaped guard, where an
+      absent Content-Length is the ordinary case for every conforming
+      client and means a body length of zero. Closing there would cost
+      keep-alive on every well-formed GET and buy nothing: a route that
+      reads no body has nothing for a dropped header to mis-size. What
+      it buys instead is ``must_close``: a GET that DECLARES octets
+      nobody will read still cannot keep its connection, because the
+      octets are still on the wire.
+    """
+    if headers.defects:
+        # A header block the parser could not read WHOLE. The email
+        # parser drops `Transfer-Encoding : chunked` (one space before
+        # the colon) entirely and records a defect instead, so a length
+        # computed from what survived is a length computed from part of
+        # the request -- and "part of the request" is exactly what an
+        # intermediary and this server then disagree about. This is the
+        # PRECONDITION on everything below rather than a second rule:
+        # "no computable length" only means anything if the header block
+        # was fully computed. Proved necessary by adversarial sweep, not
+        # by argument: `Content-Length: 57` beside a SPACED
+        # Transfer-Encoding survives every clause below (the length is
+        # single, parseable and honest, and the transfer coding is
+        # invisible), frames cleanly, and keeps the connection -- the
+        # CL.TE half of the same smuggling pair, still open after the
+        # length rule alone. RFC 7230 §3.2.4 requires rejecting
+        # whitespace before the colon for precisely this reason.
+        return _unframable("header_block_defective")
+    payload = headers.get_payload()
+    if not isinstance(payload, str) or payload:
+        # The precondition has to be the property it claims, not a
+        # paraphrase of it, because everything below rests on it.
+        # `defects` alone is not "the parser read the whole block":
+        # email's feedparser has a SILENT stop, where a final header
+        # line beginning with `From ` is unread-lined into the message
+        # payload and header parsing simply RETURNS, with no defect
+        # recorded. What is left in the payload is header-block bytes
+        # this server never interpreted, and "bytes we did not read"
+        # is the same situation as a defect however quietly the parser
+        # reached it. C10's own framing rule already checked this while
+        # Layer 0 did not, and Layer 0 asking a weaker question than the
+        # profile layered on top of it is the drift that makes two rules
+        # on one socket disagree. There is no C10 rule now: this clause,
+        # its token check and its hard fold all live here, so the drift
+        # has nowhere to happen.
+        return _unframable("header_block_unparsed")
+    lengths = []
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            # A shape this rule does not read. email can hand back a
+            # non-str for a defective line; "cannot read it" is the
+            # answer, not "it is not a framing header".
+            return _unframable("header_shape_unreadable")
+        if "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+            # Obsolete line folding (RFC 7230 §3.2.4, which lets a
+            # server reject it outright). A folded line is the OTHER way
+            # a framing header disappears without a defect: a
+            # continuation line beginning with a space is swallowed into
+            # the value of whatever preceded it, so
+            # `Host: h` + ` Transfer-Encoding: chunked` registers as one
+            # Host header and no transfer coding at all, with nothing
+            # flagged. Refusing every folded name or value covers that
+            # without naming the header that got swallowed.
+            return _unframable("header_line_folded")
+        if not name or not _TCHAR.issuperset(name):
+            # Not an RFC 7230 token. `Content-Length;`, `Transfer-Encoding.`
+            # and `Content-Length"` parse cleanly here, carry no defect and
+            # no fold, and are read as framing by anything that tokenises
+            # more forgivingly than this parser. A name two parsers need
+            # not agree on cannot frame a connection, whatever it means.
+            return _unframable("header_name_not_token")
+        key = name.strip().lower()
+        if _fold_header_name(name) in _FOLDED_FRAMING_NAMES and (
+            key not in _FRAMING_FIELD_NAMES
+        ):
+            # A framing header wearing a separator we fold and somebody
+            # else folds differently: `Con-tent-Length`, `Content-Length-`,
+            # `_Transfer-Encoding`, `Content__Length`. Refuse ON the fold
+            # rather than deciding which reading is right. See
+            # `_fold_header_name`: this clause and the regex below reach
+            # different names, and the union is the rule.
+            return _unframable("framing_name_folded")
+        if key == "content-length":
+            lengths.append(value)
+        elif _FRAMING_CONFUSABLE_RE.fullmatch(key):
+            # Either a transfer coding (which this stack cannot consume
+            # whatever it says) or a name some other hop may read as one
+            # of the two framing headers. See _FRAMING_CONFUSABLE_RE:
+            # the verdict is "no certain length", never "obey it".
+            return _unframable("framing_name_confusable")
+    if len(lengths) > 1:
+        return _unframable("content_length_duplicated")
+    if not lengths:
+        if body_expected:
+            return _unframable("content_length_absent")
+        return _FRAMED_OK
+    # OWS is SP and HTAB (RFC 7230 §3.2.3) and nothing else. Bare
+    # `str.strip()` is PYTHON's whitespace set, which also eats
+    # \x0b \x0c \x1c \x1d \x1e \x1f \x85 and \xa0 — so
+    # `Content-Length: 5\x0b` was stripped to "5", matched the digit
+    # pattern and framed five octets, while any parser using HTTP's
+    # own definition sees an invalid length and (RFC 7230 §3.3.3 rule
+    # 4) must not recover. \xa0 is legal obs-text, so that header line
+    # is WELL FORMED and only its value is invalid: nothing upstream
+    # rejects the message for us. Handing a spec-strict pattern the
+    # output of a Python-defined strip put the looseness straight back
+    # that the pattern had just removed from int().
+    value = lengths[0].strip(" \t")
+    if not _CONTENT_LENGTH_RE.fullmatch(value):
+        return _unframable("content_length_malformed")
+    length = int(value)
+    if not body_expected and length != 0:
+        # Framed, stated, and about to go unread: the octets are still on
+        # the wire, so the connection cannot carry another request. The
+        # length is still trustworthy and is still reported -- this is a
+        # statement about the CALLER (it said it would not read a body),
+        # not about the request, which is perfectly well formed.
+        return FramingVerdict(
+            length=length,
+            framed=True,
+            must_close=True,
+            reason="declared_body_unread",
+        )
+    return FramingVerdict(
+        length=length, framed=True, must_close=False, reason="ok"
+    )
+
 _FAT_ENTRY_BYTES = 384
 
 # Allowance for everything outside the two entry arrays: the idempotency_key
@@ -400,6 +822,15 @@ class MintConfig:
 
     ``burn_policy_next`` is ``None`` or ``(BurnPolicy, effective_at_ms)``
     (§7.3 change notice, rendered as the §3.6 descriptor field).
+    ``burn_policy_announced_at`` is the mint-clock instant that notice was
+    PUBLISHED, and it is mandatory whenever ``burn_policy_next`` raises the
+    burn for any sum: §7.3 requires such an increase to be announced at
+    least seven days (or ``max_lock_expiry_ms``, whichever is longer)
+    before it takes effect, and that interval is unmeasurable without the
+    announcement time. It is config, not a clock read (L17), and it is not
+    a §3.6 descriptor field — a restarted mint must be able to re-state a
+    notice it gave a week ago without its notice period restarting. A
+    decrease needs none (decreases may be immediate).
     ``performance`` is ``None`` or the §3.6 self-attested dict (rendered
     ``null`` when stale — L11).
 
@@ -420,6 +851,7 @@ class MintConfig:
     signing_public: bytes
     denominations_mc: tuple[int, ...] = (1, 10, 100, 1_000, 10_000, 100_000)
     burn_policy_next: tuple[BurnPolicy, int] | None = None
+    burn_policy_announced_at: int | None = None
     max_batch: int = 256
     anonymous_rate: dict = field(default_factory=_default_rate)
     registered_rate: dict = field(default_factory=_default_rate)
@@ -456,6 +888,18 @@ class MintConfig:
             next_policy, effective_at = self.burn_policy_next
             validate_policy(next_policy)
             _require_plain_int("burn_policy_next effective_at", effective_at, 0)
+        if self.burn_policy_announced_at is not None:
+            _require_plain_int(
+                "burn_policy_announced_at", self.burn_policy_announced_at, 0
+            )
+            if self.burn_policy_next is None:
+                raise ValueError(
+                    "burn_policy_announced_at is set but burn_policy_next is"
+                    " None: an announcement time with nothing announced is a"
+                    " notice the operator believes they gave and this mint"
+                    " publishes nowhere. Set burn_policy_next, or drop the"
+                    " announcement time."
+                )
         _validate_rate("anonymous_rate", self.anonymous_rate)
         _validate_rate("registered_rate", self.registered_rate)
         for kb in ("signing_private", "signing_public"):
@@ -505,6 +949,46 @@ class MintConfig:
         if self.max_lock_expiry_ms is not None:
             _require_plain_int("max_lock_expiry_ms", self.max_lock_expiry_ms, 1)
         _require_plain_int("recovery_window_ms", self.recovery_window_ms, 0)
+        # §7.3 change notice. Placed after max_lock_expiry_ms is known to
+        # be a valid int, because the required notice is
+        # `max(7 days, max_lock_expiry_ms)` — the lock horizon is half the
+        # rule, not a decoration on it: funds locked mid-flight must not be
+        # repriced by surprise, so a mint that lets locks run longer than a
+        # week owes correspondingly longer notice.
+        #
+        # This ran nowhere before. burncalc has carried validate_notice
+        # since C03 and no configuration path called it, so a burn INCREASE
+        # with a hundred SECONDS of notice was accepted at construction and
+        # published in the descriptor as a conforming §7.3 notice. Refused
+        # here, with the other refusals, for the reason the admin-token
+        # block states at length: an operator finds out when they build the
+        # config, not when counterparties' locked funds reprice under them.
+        if self.burn_policy_next is not None:
+            next_policy, effective_at = self.burn_policy_next
+            if is_increase(self.burn_policy, next_policy):
+                if self.burn_policy_announced_at is None:
+                    raise ValueError(
+                        "burn_policy_next %r raises the burn over the current"
+                        " policy %r, and §7.3 requires such an increase to be"
+                        " announced at least 7 days (or max_lock_expiry_ms,"
+                        " whichever is longer) before effective_at. That"
+                        " interval cannot be checked without knowing WHEN the"
+                        " notice was published, so set"
+                        " burn_policy_announced_at to the mint-clock"
+                        " millisecond at which this burn_policy_next was first"
+                        " published. (A burn DECREASE may be immediate and"
+                        " needs no announcement time.)"
+                        % (next_policy, self.burn_policy)
+                    )
+                # Raises burncalc.PolicyError (a ValueError) naming the
+                # notice actually given and the notice required.
+                validate_notice(
+                    self.burn_policy,
+                    next_policy,
+                    self.burn_policy_announced_at,
+                    effective_at,
+                    self.max_lock_expiry_ms,
+                )
         if self.prunes_spent_records and self.max_lock_expiry_ms is None:
             # §8(b): prunes_spent_records: true REQUIRES a finite lock horizon.
             raise ValueError(
@@ -611,6 +1095,113 @@ def _call_rejection(reason: str) -> tuple[int, dict]:
         "status": "rejected",
         "errors": [{"index": None, "kind": "call", "reason": reason}],
     }
+
+
+#: THE STATUS WORD FOR A STATUS CODE, SPELLED HERE.
+#:
+#: These used to be derived from ``BaseHTTPRequestHandler.responses[code]``'s
+#: reason phrase, which handed this mint's MACHINE-READABLE vocabulary to
+#: CPython: python3.12 spells ``HTTPStatus(414).phrase`` "Request-URI Too
+#: Long" and derived ``request_uri_too_long``, and CPython has already
+#: renamed several of these members for RFC 9110 (413, 414, 416, 422), so
+#: the same mint on a different interpreter answered a DIFFERENT word for
+#: the same request. A field a client matches on cannot move with the
+#: interpreter. HTTP does not define these slugs — a table does — so the
+#: table is here, next to the only server that sends them, the way the
+#: operator GUI and the operator console hand-write theirs.
+_TRANSPORT_STATUS = {
+    400: "bad_request",
+    401: "unauthorized",
+    404: "not_found",
+    405: "method_not_allowed",
+    408: "request_timeout",
+    411: "length_required",
+    413: "payload_too_large",
+    414: "uri_too_long",
+    431: "header_fields_too_large",
+    500: "internal_error",
+    501: "not_implemented",
+    505: "http_version_not_supported",
+}
+
+#: WHY, per code, for the refusals the standard library raises itself
+#: through ``send_error`` — a request line it cannot parse (400), one past
+#: 64 KiB (414), a header block past its limits (431), a method with no
+#: handler (501), a version it will not speak (505).
+#:
+#: A separate word from the status, on purpose: ``send_error`` used to pass
+#: the status word in as the reason as well, so ``@@@@`` answered
+#: ``{"reason": "bad_request", "status": "bad_request"}`` — a tautology that
+#: LOOKS parseable, which is worse than no field at all, next to a
+#: ``_refuse_transport`` path that answers a real word (``bad_version``,
+#: ``bad_request_target``) in the same field of the same envelope.
+_TRANSPORT_WHY = {
+    400: "bad_request_line",
+    414: "request_line_too_long",
+    431: "header_block_too_large",
+    501: "unsupported_method",
+    505: "bad_version",
+}
+
+
+def _transport_status(code: int) -> str:
+    """This mint's status word for a status code, never the interpreter's.
+
+    Unknown codes get ``http_<code>``, which is derived from the CODE and
+    so cannot drift either. Nothing here reads ``self.responses``.
+    """
+    return _TRANSPORT_STATUS.get(code, "http_%d" % code)
+
+
+def _transport_why(code: int) -> str:
+    """The reason word for a refusal the library raised on its own."""
+    return _TRANSPORT_WHY.get(code, "transport_refused")
+
+
+def _transport_rejection(code: int, reason: str) -> dict:
+    """A refusal that never reached a route, in this mint's ``status`` shape.
+
+    NOT §3.8. §3.8 rejections are decisions about a CALL — an envelope this
+    mint parsed and declined — and every one of them carries ``errors`` with
+    a ``kind`` and an ``index``. The bodies here answer requests that never
+    became a call at all: a request line the standard library cannot version,
+    a target this mint does not route, a header block past the parser's
+    limits. Giving those a §3.8 body would tell a payer that its CALL was
+    rejected for a reason §9.5 classifies, when in fact nothing this mint
+    could classify was ever read.
+
+    So they get the shape the mint's other transport answers already use —
+    ``{"status": ...}``, as in ``{"status": "not_found"}`` and
+    ``{"status": "unauthorized"}``, whose words are in the table above and
+    are literally what this function produces for 404 and 401.
+
+    ``reason`` is the second field and the only added one: the machine word
+    for WHY, so ``bad_version`` and ``bad_request_target`` can be told apart
+    inside the one status word ``bad_request``. It is ALWAYS a different
+    word from the status — see ``_TRANSPORT_WHY`` — so a caller that
+    matches on ``reason`` never gets a restatement of the code it already
+    has. It is the same field, with the same words, that the operator GUI
+    and the operator console put in their own envelopes for the same two
+    refusals — three vocabularies, one decision, as ``framing_verdict``'s
+    contract has it.
+
+    TWO ENVELOPES IN THIS SERVER, NOT THREE, AND THE LINE IS THE ONE ABOVE.
+    This one answers requests that never reached dispatch, and every one of
+    them carries both fields. The other is a ROUTE's answer —
+    ``{"status": "not_found"}`` for a path no route matches,
+    ``{"status": "unauthorized"}`` for a credential a route refused — where
+    the method dispatched, the target was read, and the status word IS the
+    whole reason; those two are consistent with each other and a ``reason``
+    on one of them and not the other is the drift, not the fix.
+
+    THE CALLER'S OWN BYTES ARE NEVER IN HERE. ``BaseHTTPRequestHandler``
+    builds its message for an unparseable request line as
+    ``"Bad request syntax (%r)" % requestline`` and a request line may be
+    64 KiB, so the library's message is up to 64 KiB of the caller's octets
+    reflected out of a money server's error body. Neither the library's
+    ``message`` nor its reason phrase is read at all.
+    """
+    return {"status": _transport_status(code), "reason": reason}
 
 
 _STATE_SCHEMA = """
@@ -1166,6 +1757,67 @@ class _DeadlineRaw(io.RawIOBase):
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AICashMint/0.4"
     protocol_version = "HTTP/1.1"
+
+    # WHAT THIS HANDLER ASSUMES A REQUEST LINE WITH NO VERSION ON IT IS, and
+    # the reason this mint used to answer some requests with NO STATUS LINE
+    # AT ALL.
+    #
+    # ``BaseHTTPRequestHandler`` makes ``send_response_only()``,
+    # ``send_header()`` and ``end_headers()`` NO-OPS while
+    # ``request_version == "HTTP/0.9"`` — 0.9 has no status line and no
+    # headers — and the class default for ``default_request_version`` is
+    # exactly ``"HTTP/0.9"``. Setting ``protocol_version`` does not touch
+    # it: that field says what this server ANSWERS IN, this one says what it
+    # assumes it was ASKED IN, and the library reads the second when it
+    # cannot read a version off the wire. Measured consequence, on every one
+    # of this mint's seven routes and every one of the supervision profile's
+    # twenty-one:
+    #
+    #   * ``@@@@`` — a request line the library cannot parse — produced the
+    #     library's own HTML error page, naked: no status line, no
+    #     Content-Length, no ``Connection: close``.
+    #   * ``GET /v3/mints`` — a two-word request line — produced this mint's
+    #     OWN SIGNED DESCRIPTOR, about a kilobyte, naked, because the route
+    #     ran and every header it composed was a no-op.
+    #   * ``GET /v3/mints HTTP/9.9`` — a version the library refuses — the
+    #     same naked error page.
+    #
+    # And the consequence that makes it critical rather than untidy: on a
+    # keep-alive connection, a well-formed request followed by a two-word one
+    # was answered with a correct response declaring a Content-Length and
+    # then, past that length, the whole descriptor again — octets that are
+    # not part of that response and carry no framing of their own. That is response splitting, and behind the reverse proxy
+    # DEPLOYMENT.md makes mandatory it is the whole mechanism: the proxy reads
+    # the declared length and the client reads what follows, and the two
+    # disagree about where the response ended.
+    #
+    # The library decides this BEFORE ``parse_request`` below can refuse
+    # anything — a one-word request line and an over-long header block are
+    # both answered from inside ``handle_one_request`` — so the only place to
+    # close it for every one of them is the default it reads. Raising the
+    # default does not make this mint speak 0.9; it makes every ANSWER it
+    # sends a well-framed HTTP/1.x message, and ``parse_request`` below then
+    # refuses the 0.9 REQUEST outright with a real 400.
+    #
+    # This is the operator console's fix, verbatim and for the same reason;
+    # ``send_error`` below is HALF of the operator GUI's, and the GUI's
+    # OTHER half — refusing on ``request_version == "HTTP/0.9"`` in
+    # ``parse_request`` below — is the third piece. All three, because each
+    # covers a door the others do not:
+    #
+    #   * without the default, the GUI's override still composes its JSON
+    #     into no-ops for an unparseable request line;
+    #   * without the override, the library's HTML error page is framed but
+    #     is not this mint's error vocabulary;
+    #   * without the VERSION check, a request line that spells the version
+    #     out — ``GET /v3/mints HTTP/0.9``, three words, a version the
+    #     library can read — sets ``request_version`` from the wire and every
+    #     no-op comes back. The first version of this fix took the console's
+    #     word count and the GUI's ``send_error`` and called it the union of
+    #     the two; it was not, and the descriptor went on the wire naked
+    #     through the door the word count cannot see.
+    default_request_version = "HTTP/1.1"
+
     _route = "<unknown>"  # normalized route pattern, for the access log
 
     # socketserver.StreamRequestHandler.setup() applies this to the accepted
@@ -1243,7 +1895,208 @@ class _Handler(BaseHTTPRequestHandler):
             # parsed as the next request on a keep-alive connection.
             self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        if getattr(self, "command", None) != "HEAD":
+            # getattr, not attribute access: ``send_error`` below can reach
+            # here for an over-long request line before ``parse_request`` has
+            # set ``command`` at all, and an AttributeError between
+            # ``end_headers()`` and this write is a declared Content-Length
+            # with no body after it — a peer reading by length then waits for
+            # octets that are never coming, which is the same desync one
+            # direction over.
+            #
+            # No route here answers HEAD (the library refuses it 501 before
+            # dispatch), so the only response this guard suppresses a body on
+            # is that refusal — and a 501 that carried a body after a HEAD
+            # would be a framing violation in a server whose whole subject is
+            # framing. The operator GUI guards its one write the same way.
+            self.wfile.write(body)
+
+    # ---- request-line refusals: no shape answers without a status line ---
+
+    def _refuse_transport(self, code: int, reason: str) -> None:
+        """Answer a request that never became a call, and hang up.
+
+        One place, so the three refusals below cannot drift into three
+        spellings of "close and answer 400" — which is the shape this round
+        exists to remove. The status word comes from this module's own
+        table, never from ``self.responses``: the library's reason phrases
+        move between interpreter versions and this mint's machine words must
+        not. The library's ``message`` is never read either, because that
+        message quotes the caller's request line back at it.
+        """
+        self.close_connection = True
+        self._send(code, _transport_rejection(code, reason))
+
+    def parse_request(self) -> bool:
+        """Refuse the request lines this mint cannot answer honestly.
+
+        The one hook every request passes through after the request line is
+        read and before anything dispatches — which is why the checks are
+        here and not at the top of ``do_GET``/``do_POST``. ``PUT
+        /v3/exchange`` never runs a ``do_*`` of ours at all, and it is as
+        entitled to a framed answer as a GET is. Returning False is the
+        library's own "stop, do not dispatch" signal, so the refusal is the
+        complete answer to that request.
+
+        THE 0.9 REFUSAL, AND IT HAS TWO SPELLINGS. A request line with two
+        words is HTTP/0.9 by omission; a request line whose version token is
+        literally ``HTTP/0.9`` is HTTP/0.9 by statement. Both have no status
+        line and no headers, both make ``send_response_only``,
+        ``send_header`` and ``end_headers`` no-ops, and a check that catches
+        only one of them leaves the other serving naked bodies — which is
+        precisely what a word count alone did. ``default_request_version``
+        above makes the ANSWER well framed for the lines the library cannot
+        version; this refuses the REQUEST in both spellings, because a mint
+        that answers in a protocol whose responses cannot be told from
+        trailing octets is a mint whose answers an intermediary cannot
+        frame. Nothing that speaks to this mint speaks 0.9 — the reference
+        wallet, the operator console and the operator GUI all send HTTP/1.1
+        — and the operator GUI refuses both spellings with the same reason
+        word, ``bad_version``.
+
+        The word count is read off ``raw_requestline`` BEFORE
+        ``super().parse_request()`` because the library ANSWERS some request
+        lines itself and then reports only True/False; after the call there
+        is no way left to tell what shape the line was. The version is read
+        AFTER, because only the library's own parse puts the wire's version
+        in ``request_version``.
+
+        THE TARGET CHECK. RFC 7230 §5.3 gives a request target four forms.
+        This mint routes on ``self.path`` verbatim, so only origin-form
+        (``/v3/mints``) ever matches a route: absolute-form
+        (``http://host/v3/mints``) has never reached one and never could,
+        and authority-form and asterisk-form name no route either. Being
+        unroutable was never the problem; answering 404 and then INVITING
+        another request on the same connection is the part that is wrong.
+
+        §5.3.2 says an origin server that takes
+        absolute-form must ignore ``Host`` and route on the target's own
+        authority; this mint does neither, so a request that arrives still
+        addressed the way it would be addressed to a proxy is a request whose
+        two statements of "which server is this for" this hop has not
+        resolved — and DEPLOYMENT.md puts a reverse proxy in front of every
+        deployed mint, so there is always a second hop that may resolve them
+        the other way. That is the framing disagreement one field over, so the
+        request is answered once and the socket goes. The operator GUI and the
+        operator console both close on the same bytes; this is the change that
+        makes all four servers reach one decision on them.
+
+        Asterisk-form is refused with the rest rather than exempted: it is
+        defined for ``OPTIONS`` alone, this mint implements no ``OPTIONS``
+        route, and ``GET *`` was answered 404 ON A REUSED CONNECTION, which
+        is the same "answered, then invited another" as the rest of them.
+        """
+        if self.raw_requestline in (b"\r\n", b"\n", b"\r"):
+            # RFC 7230 §3.5: a server SHOULD ignore at least one empty line
+            # received before the request line. The library does not: an
+            # empty request line makes ``words`` empty and ``parse_request``
+            # return False with NOTHING WRITTEN and the socket closed, so
+            # ``\r\nGET /v3/mints HTTP/1.1\r\nHost: h\r\n\r\n`` — a
+            # perfectly well-formed request with one stray CRLF in front of
+            # it, which is exactly what a client that terminated its last
+            # body with an extra CRLF emits — is silently DISCARDED. That is
+            # the "no answer at all" class one door over from the naked-body
+            # one, and behind the reverse proxy DEPLOYMENT.md mandates it is
+            # uniform request loss on a shape the RFC blesses.
+            #
+            # One line, not a loop: "at least one" is what the RFC asks for,
+            # and a loop would let an anonymous peer hold a thread by
+            # trickling CRLFs inside the request deadline.
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                # ``handle_one_request``'s own guard, repeated because this
+                # read is ours: the fields it sets first are the ones
+                # ``send_error`` and ``log_request`` read.
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(414)
+                return False
+            if not self.raw_requestline:
+                # EOF after the empty line. Nothing to answer.
+                self.close_connection = True
+                return False
+        zero_nine = len(self.raw_requestline.split()) == 2
+        if not super().parse_request():
+            # Malformed request line, unsupported version, too many or too
+            # long headers: the library has already answered — with a status
+            # line on it now, which is what ``default_request_version`` and
+            # ``send_error`` below are for.
+            return False
+        if zero_nine or self.request_version == "HTTP/0.9":
+            # ``request_version`` is the test that matters and the word count
+            # is NOT a substitute for it: a THREE-word request line whose
+            # version token is literally ``HTTP/0.9`` is one the library CAN
+            # read, so ``super().parse_request()`` above returns True with
+            # ``request_version == "HTTP/0.9"`` set FROM THE WIRE — and every
+            # answer composed after that goes out naked again, because
+            # ``send_response_only``, ``send_header`` and ``end_headers`` are
+            # no-ops in 0.9. ``default_request_version`` cannot help there
+            # (it is only consulted when the library CANNOT read a version)
+            # and neither can ``send_error`` (it guards its own path only).
+            #
+            # Nor is the version test a substitute for the word count: with
+            # ``default_request_version = "HTTP/1.1"`` a two-word line lands
+            # on ``request_version == "HTTP/1.1"`` and would sail past a
+            # version check alone. Both, or one of the two 0.9 spellings is
+            # served.
+            #
+            # Forcing the field to HTTP/1.1 before answering is what makes
+            # THIS refusal itself framed; it is the operator GUI's guard, in
+            # the GUI's own order, for the reason the GUI wrote down.
+            self.request_version = "HTTP/1.1"
+            self._refuse_transport(400, "bad_version")
+            return False
+        if not self.path.startswith("/"):
+            self._refuse_transport(400, "bad_request_target")
+            return False
+        return True
+
+    def send_error(self, code, message=None, explain=None):
+        """The library's own failures, in this mint's transport envelope.
+
+        ``handle_one_request`` calls this directly for a request line it
+        cannot parse, a request line past 64 KiB, a method with no handler
+        and a version it will not speak. Its default body is an HTML page;
+        every other answer this mint sends is JSON.
+
+        AND IT STILL GETS A STATUS LINE, which is the half that matters.
+        ``parse_request`` sets ``request_version`` to the default BEFORE it
+        tries to read the request line, and for an over-long request line
+        ``handle_one_request`` sets it to ``""`` without going through
+        ``parse_request`` at all — so this override is written to be safe on
+        a handler where neither ``request_version`` nor ``command`` exists
+        yet, and an AttributeError inside an error path is a request answered
+        with nothing at all.
+
+        A failure this mint cannot attribute to a version is answered in
+        HTTP/1.1: a status line, a Content-Length, ``Connection: close``, and
+        then the socket goes. A peer that really did speak HTTP/0.9 gets a
+        response it may not parse — but it has just been refused and hung up
+        on, and the alternative, which is what was here, is octets with no
+        framing at all. This is the operator GUI's override, for the reason
+        the GUI wrote down.
+        """
+        self.close_connection = True
+        if getattr(self, "request_version", "HTTP/0.9") == "HTTP/0.9":
+            self.request_version = "HTTP/1.1"
+        if not getattr(self, "command", None):
+            # ``parse_request`` clears it before reading the request line,
+            # and ``_send`` asks whether this was a HEAD. "Not HEAD" is the
+            # answer that emits the body we are about to frame.
+            self.command = ""
+        try:
+            code = int(code)
+        except (TypeError, ValueError):     # pragma: no cover - defensive
+            code = 500
+        try:
+            self._send(code, _transport_rejection(code, _transport_why(code)))
+        except Exception:                   # pragma: no cover - socket gone
+            # There is nowhere left to answer. Never let an error path raise
+            # into ``handle_error``: that is how a request ends up with no
+            # response at all, which is the defect this override exists
+            # against.
+            pass
 
     def _body_rejection(self):
         """Refuse this request's body and hang up.
@@ -1261,6 +2114,117 @@ class _Handler(BaseHTTPRequestHandler):
         """
         self.close_connection = True
         return None, False
+
+    def _framing_verdict(self, *, body_expected: bool) -> FramingVerdict:
+        """THIS handler's framing verdict — the whole object, one call.
+
+        The single point at which anything in this process turns a parsed
+        header block into a framing decision. ``_framed_body_length`` reads
+        ``.length`` off it and ``_close_if_body_goes_unread`` reads
+        ``.must_close`` off it; neither re-derives the other's field, which
+        is what they used to do. ``must_close`` in particular had NO
+        executing consumer in this package while the GET guard hand-wrote
+        the same decision one method down — a contract field whose own
+        owner re-implements it is a contract field free to drift from its
+        definition on the next change, and it is the field the GUI and the
+        console use to decide whether to hang up.
+
+        Subclasses that need to narrow framing override THIS, and nothing
+        else: every reader in this class reaches the rule through here, so
+        one override reaches the POST reader, the GET guard and the
+        inherited Layer 0 routes together. (C10 no longer needs to —
+        its rule was folded into ``framing_verdict``.)
+        """
+        return framing_verdict(self.headers, body_expected=body_expected)
+
+    def _framed_body_length(self, *, body_expected: bool) -> int | None:
+        """Octets of request body this server is CERTAIN of, or None.
+
+        A DELEGATION, deliberately: the rule itself is the module-level
+        ``framing_verdict``, which is public and which the Supervision
+        Profile, the operator GUI and the operator console all import and
+        call. It used to live here as a private method, and that is the
+        whole reason the other three servers had a copy of a rule that was
+        wrong — nineteen of twenty-five spellings still framed a body on
+        them after this class was closed here. One rule, one place, four
+        callers; anything that grows a second copy fails
+        ``TheFramingRuleIsOneSharedFunctionTest`` in test_c06.
+
+        The verdict's ``length`` IS this method's answer, by construction:
+        ``framing_verdict`` returns ``length=None`` exactly when it returns
+        ``framed=False``, so "no trusted length" and "unframable" are the
+        same fact seen from two sides and cannot disagree. ``must_close``
+        adds the one thing a bare length cannot say — that a GET which
+        DECLARED octets nobody will read must still hang up — and
+        ``_close_if_body_goes_unread`` below READS that field off the same
+        verdict rather than deriving it a second way.
+
+        Subclasses narrow framing by overriding ``_framing_verdict``, not
+        this method: the whole verdict is the override point, so a
+        narrowing reaches ``must_close`` as well as ``length`` and the GET
+        guard cannot end up applying a different rule from the POST reader.
+        """
+        return self._framing_verdict(body_expected=body_expected).length
+
+    def _body_framing_is_unreadable(self, *, body_expected: bool = True) -> bool:
+        """True when this request's body cannot be read off the socket.
+
+        THE framing rule, in one place, because both directions need the
+        same answer. ``BaseHTTPRequestHandler`` does not dechunk, so a
+        request carrying ``Transfer-Encoding`` has a body this layer cannot
+        consume no matter which method it arrives on: the GET guard has
+        always said so (``_close_if_body_goes_unread``), while the POST
+        reader sized the body from ``Content-Length`` alone and read a
+        chunked POST as an EMPTY one. It then answered without hanging up,
+        so the unread chunk octets stayed on a keep-alive socket and were
+        framed as the next request line — the mint's own access log showed
+        three entries for two requests, the middle one a phantom with
+        method None. Found by outside review 2026-09-16; the guard it needed
+        already existed, one method down.
+
+        A CONFLICTING ``Content-Length`` is the second door into the same
+        desync, and Layer 0 still had it open after C10 closed its own:
+        ``headers.get`` silently returns the FIRST of a duplicated header,
+        so ``Content-Length: 2`` followed by ``Content-Length: 46`` read
+        two octets off ``/v3/exchange`` and left forty-four on the wire to
+        be framed as the next request line — one request in, two responses
+        out, connection still pooled. That is the classic CL.CL smuggling
+        pair, and the danger is exactly that an intermediary (the proxy
+        DEPLOYMENT.md makes mandatory) may pick the OTHER value. RFC 7230
+        §3.3.3 requires rejecting such a message. Any duplicate is refused,
+        not only a disagreeing one: "identical" is a judgement about
+        whitespace and leading zeros that we would then have to make the
+        same way as every intermediary in the path, and the safe answer
+        does not depend on getting that right. The single-header spelling
+        ``Content-Length: 2, 46`` needs no clause of its own: it is not a
+        run of digits, so ``_framed_body_length`` has no length for it, and
+        having no length closes.
+
+        C10's ``_read_sup_json`` asks THIS method too, so the two servers
+        reach the identical framing verdict on identical wire bytes while
+        keeping their different §3.8 envelopes. One server, one socket:
+        a rule Layer 0 and the profile computed separately is a rule that
+        drifts, and the half that drifts is smuggleable.
+
+        WHICH REQUESTS ARE UNFRAMABLE IS NO LONGER A LIST OF BAD HEADERS.
+        It was, for one round, and the list was wrong the way every such
+        list is wrong. ``Transfer-Encoding : chunked`` — one space before
+        the colon — is not registered by Python's email parser AT ALL, so
+        ``headers.get("Transfer-Encoding")`` returned None, the framing
+        check saw no transfer coding and no Content-Length, defaulted the
+        length to zero, never read the chunk octets, answered 400 WITHOUT
+        ``Connection: close``, and the chunk octets were then framed as the
+        next request line: two responses on the socket for one request, the
+        second one method-less, which is precisely the access-log symptom
+        the first report described. ``Transfer_Encoding: chunked`` does the
+        same by a different road (the parser registers it under a name that
+        is not the one asked for, and front ends that normalise ``_`` to
+        ``-`` will have dechunked it), and so would a third spelling nobody
+        has written down yet. See ``_framed_body_length``: the verdict is
+        now derived from the length this server can COMPUTE, not from a
+        header it can NAME.
+        """
+        return self._framed_body_length(body_expected=body_expected) is None
 
     def _read_json(self):
         """Returns (parsed, ok). Any trouble with the body → (None, False).
@@ -1287,12 +2251,20 @@ class _Handler(BaseHTTPRequestHandler):
         recovery that does work — split the call — is exactly what a
         permanent reason tells a payer to go find.
         """
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
+        if self._body_framing_is_unreadable():
+            # Nothing is read, and the octets that were never read cannot be
+            # left to frame the next request: `_body_rejection` closes the
+            # connection, exactly as the GET guard does, and the route
+            # answers `bad_format` at call level like any other envelope
+            # this layer declines to read.
             return self._body_rejection()
-        if length < 0:
-            return self._body_rejection()
+        # Not None: the guard above IS `_framed_body_length(...) is None`,
+        # and it is the only source of a length in this reader. Nothing is
+        # re-parsed here, so the number read off the socket and the verdict
+        # that the socket is re-framable cannot disagree. (A negative or
+        # non-numeric length no longer needs its own clause: the framing
+        # rule only ever returns a non-negative int.)
+        length = self._framed_body_length(body_expected=True)
         if length > MAX_BODY_BYTES:
             # Refuse BEFORE allocating: the old code trusted the header and
             # called rfile.read(length), so `Content-Length: 4294967296` was
@@ -1317,7 +2289,24 @@ class _Handler(BaseHTTPRequestHandler):
             return self._body_rejection()
         try:
             return json.loads(raw.decode("utf-8")), True
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # A malformed envelope is a malformed envelope however the
+            # parser says so, and json.loads says so in three ways, only one
+            # of which was handled here:
+            #   * json.JSONDecodeError — a ValueError subclass, syntax;
+            #   * a bare ValueError — CPython's int-string digit limit, so
+            #     an `amount_mc` of 5,000 digits is VALID JSON that raises
+            #     out of int(); it reached the 500 handler, and §3.8 owes an
+            #     enumerated reason, never a bare 500;
+            #   * RecursionError — the same shape one nesting level up:
+            #     `[[[[...` a hundred thousand deep is a 200 KB body, well
+            #     inside MAX_BODY_BYTES, that blew the C parser's stack and
+            #     also answered 500.
+            # All three are permanently bad bytes, which is what bad_format
+            # means (§9.5). The body WAS fully read, so unlike the refusals
+            # above the stream is still framed and the connection survives.
+            # Found by outside review 2026-09-16 (the literal; the nesting
+            # sibling was found looking for the same shape).
             return None, False
 
     # ---- routes ---------------------------------------------------------
@@ -1333,7 +2322,9 @@ class _Handler(BaseHTTPRequestHandler):
         make it), so the request is answered and THEN the connection is
         dropped, rather than reusing a stream that can no longer be
         framed. Transfer-Encoding counts too: the stdlib handler does not
-        dechunk, so a chunked body is equally unconsumed.
+        dechunk, so a chunked body is equally unconsumed — that half of the
+        rule lives in ``_body_framing_is_unreadable`` and the POST reader
+        applies the same one.
 
         Shared rather than duplicated because C10's ``_SupHandler``
         answers its own GET routes without reaching this class's
@@ -1342,11 +2333,14 @@ class _Handler(BaseHTTPRequestHandler):
         leaves the profile's routes smuggleable — one server, one socket,
         so it has to be one rule.
         """
-        try:
-            declared = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            declared = -1  # unparseable is not "no body"
-        if declared != 0 or self.headers.get("Transfer-Encoding"):
+        # ONE field, READ, not re-derived. This used to be two clauses —
+        # "unframable?" and "a declared length that is not zero?" — which
+        # is precisely `FramingVerdict.must_close`'s definition, hand-copied
+        # into the file that defines it while the field itself had no
+        # executing consumer anywhere in the package. The two other servers
+        # act on `must_close`; so does this one now, so there is one
+        # definition of "hang up" and the mint is bound by it.
+        if self._framing_verdict(body_expected=False).must_close:
             self.close_connection = True
 
     def do_GET(self):
@@ -1364,8 +2358,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._route = "<unknown>"
                 code, obj = 404, {"status": "not_found"}
             self._send(code, obj)
-        except Exception:
-            self._safe_500()
+        except Exception as exc:
+            self._safe_500(exc)
 
     def do_POST(self):
         core: _Core = self.server.core
@@ -1402,11 +2396,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self._route = "<unknown>"
                 code, obj = 404, {"status": "not_found"}
             self._send(code, obj)
-        except Exception:
-            self._safe_500()
+        except Exception as exc:
+            self._safe_500(exc)
 
-    def _safe_500(self):
+    def _safe_500(self, exc: BaseException | None = None):
         # Requirement 4: never a stack trace in a response body.
+        #
+        # A write that failed because the PEER went away is not an internal
+        # error, and there is nobody left to tell. Attempting the 500 anyway
+        # writes a second access-log line for a request that was already
+        # answered, or already correctly refused, before the socket died --
+        # so the log claims a 500 no client ever received. That is a lie in
+        # the one record an operator debugs from, and the reviewers reading
+        # this repository would reasonably read those lines as real faults.
+        # A transport failure therefore closes quietly; only a genuine fault
+        # gets the 500.
+        if isinstance(exc, OSError):
+            self.close_connection = True
+            return
         try:
             self._send(500, {"status": "error"})
         except Exception:
@@ -1427,16 +2434,54 @@ class MintServer:
         # hand-wired mismatch would make the mint publish one policy and
         # charge another. ``make_mint`` builds the pair from one source of
         # truth; this check catches everyone who wires by hand.
-        for name in ("burn_policy", "recovery_window_ms", "max_lock_expiry_ms"):
+        #
+        # ``burn_policy_next`` is on this list for the same reason as
+        # ``burn_policy``, and it is the half that was missing: the
+        # descriptor publishes the change notice and every reference client
+        # switches policy the instant ``mint_time`` reaches ``effective_at``,
+        # so a ledger that does not carry the same notice charges the
+        # superseded policy and rejects every client-built exchange with
+        # ``amount_mismatch`` — a plain receive included, fleet-wide, from
+        # the moment an honest operator's scheduled change lands. Checking
+        # only ``burn_policy`` meant this check passed while the two views
+        # disagreed about every future instant.
+        for name in (
+            "burn_policy",
+            "burn_policy_next",
+            "recovery_window_ms",
+            "max_lock_expiry_ms",
+        ):
             cfg_v, led_v = getattr(config, name), getattr(ledger, name)
-            if cfg_v != led_v:
-                raise ValueError(
-                    "config/ledger mismatch on %s: MintConfig has %r but the"
-                    " Ledger was built with %r — the mint would advertise one"
-                    " value and enforce another. Build both from the config"
-                    " via make_mint(config, db_path), or construct the Ledger"
-                    " with the config's values." % (name, cfg_v, led_v)
+            if cfg_v == led_v:
+                continue
+            if name == "burn_policy_next" and led_v is None:
+                # The one disagreement that is not drift: a Ledger built
+                # before the notice existed has no opinion to contradict the
+                # config with, and the config is the source of truth for
+                # what the mint publishes. Adopt rather than refuse — a
+                # ledger silently left behind is the defect; a hand-wired
+                # mint refusing to boot over a constructor argument that did
+                # not exist until now is not the fix for it. Every other
+                # combination, including a Ledger carrying a notice the
+                # config does NOT publish (the mint would charge a policy it
+                # never announced — worse than the reverse), still raises.
+                ledger.adopt_burn_policy_next(cfg_v)
+                logger.warning(
+                    "mint %s: the Ledger was built without the §7.3 change"
+                    " notice this MintConfig publishes (%r); adopting it so"
+                    " the mint charges what it advertises. Pass"
+                    " burn_policy_next to Ledger(...), or build both with"
+                    " make_mint(config, db_path).",
+                    config.mint_id, cfg_v,
                 )
+                continue
+            raise ValueError(
+                "config/ledger mismatch on %s: MintConfig has %r but the"
+                " Ledger was built with %r — the mint would advertise one"
+                " value and enforce another. Build both from the config"
+                " via make_mint(config, db_path), or construct the Ledger"
+                " with the config's values." % (name, cfg_v, led_v)
+            )
         if config.admin_token is ADMIN_ISSUANCE_OPEN:
             # Explicitly chosen, so it is allowed — but never silent. The
             # whole defect class was "no check reads as fine because nothing
@@ -1501,9 +2546,14 @@ def make_mint(
     """Build a Ledger and a MintServer from ONE source of truth.
 
     The Ledger is constructed from the config's ``burn_policy``,
-    ``recovery_window_ms`` and ``max_lock_expiry_ms``, so the values the
-    descriptor advertises are, by construction, the values the ledger
-    enforces — no hand-wired duplication to drift. ``clock`` defaults to
+    ``burn_policy_next``, ``recovery_window_ms`` and ``max_lock_expiry_ms``,
+    so the values the descriptor advertises are, by construction, the values
+    the ledger enforces — no hand-wired duplication to drift.
+    ``burn_policy_next`` is part of that list because the descriptor
+    publishes it and every reference client acts on it the instant
+    ``mint_time`` reaches ``effective_at``: a ledger that never received it
+    would keep charging the superseded policy and fail every client-built
+    exchange with ``amount_mismatch``. ``clock`` defaults to
     the wall-clock ``aicash.clock.system_clock``; tests inject a
     ``FakeClock`` (L17). Returns ``(server, ledger)``; call
     ``server.start()`` to bind a port. The ledger is returned too so
@@ -1517,5 +2567,6 @@ def make_mint(
         config.burn_policy,
         recovery_window_ms=config.recovery_window_ms,
         max_lock_expiry_ms=config.max_lock_expiry_ms,
+        burn_policy_next=config.burn_policy_next,
     )
     return MintServer(config, ledger), ledger

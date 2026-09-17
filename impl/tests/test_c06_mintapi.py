@@ -9,8 +9,10 @@ through the Ledger (L17).
 import contextlib
 import copy
 import dataclasses
+import email.parser
 import hashlib
 import http.client
+import inspect
 import io
 import json
 import os
@@ -26,6 +28,7 @@ from typing import NamedTuple
 
 from aicash import mintapi
 from aicash.burncalc import BurnPolicy
+from aicash.envelope import ERROR_KINDS, ERROR_REASONS
 from aicash.clock import FakeClock
 from aicash.ledgerstore import Ledger, OutputSpec
 from aicash.mintapi import (
@@ -37,6 +40,9 @@ from aicash.mintapi import (
     MintConfig,
     MintServer,
     _FAT_ENTRY_BYTES,
+    _FRAMING_CONFUSABLE_RE,
+    _FRAMING_FIELD_NAMES,
+    _FRAMING_NAME_SEPARATOR,
     _Handler,
     _max_batch_ceiling,
 )
@@ -1340,6 +1346,114 @@ class MakeMintTest(unittest.TestCase):
             self.assertIn(name, str(ctx.exception))
             self.assertIn("make_mint", str(ctx.exception))
 
+    def test_make_mint_hands_the_ledger_the_change_notice_too(self):
+        """The descriptor publishes burn_policy_next and every client acts
+        on it; a ledger that never received it charges the superseded
+        policy from effective_at onwards and rejects everything."""
+        from aicash.mintapi import make_mint
+
+        nxt = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+        effective_at = T0 + 30 * DAY_MS
+        config = self.make_config(
+            burn_policy=BurnPolicy(
+                rate_ppm=1_000, cap_mc=1_000, exempt_below_mc=10
+            ),
+            burn_policy_next=(nxt, effective_at),
+            burn_policy_announced_at=T0,
+        )
+        _server, ledger = make_mint(config, self.tmp_db(), clock=FakeClock(T0))
+        self.assertEqual(ledger.burn_policy_next, (nxt, effective_at))
+
+    def test_a_ledger_carrying_a_notice_the_config_does_not_publish_is_refused(
+        self,
+    ):
+        """The direction that must never be reconciled away: the ledger
+        would charge a §7.3 change the descriptor never announced."""
+        nxt = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+        ledger = Ledger(
+            self.tmp_db(),
+            FakeClock(T0),
+            POLICY,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+            burn_policy_next=(nxt, T0 + 30 * DAY_MS),
+        )
+        config = self.make_config(
+            recovery_window_ms=90 * DAY_MS, max_lock_expiry_ms=30 * DAY_MS
+        )
+        with self.assertRaises(ValueError) as ctx:
+            MintServer(config, ledger)
+        self.assertIn("burn_policy_next", str(ctx.exception))
+
+    def test_two_different_notices_are_refused(self):
+        """Two views of one fact disagreeing is the whole reason this check
+        exists; a second notice is not a reconcilable absence."""
+        a = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+        b = BurnPolicy(rate_ppm=9_000, cap_mc=1_000, exempt_below_mc=10)
+        low = BurnPolicy(rate_ppm=1_000, cap_mc=1_000, exempt_below_mc=10)
+        ledger = Ledger(
+            self.tmp_db(),
+            FakeClock(T0),
+            low,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+            burn_policy_next=(a, T0 + 30 * DAY_MS),
+        )
+        config = self.make_config(
+            burn_policy=low,
+            burn_policy_next=(b, T0 + 30 * DAY_MS),
+            burn_policy_announced_at=T0,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            MintServer(config, ledger)
+        self.assertIn("burn_policy_next", str(ctx.exception))
+
+    def test_a_ledger_built_before_the_notice_existed_adopts_it_loudly(self):
+        """A hand-wired Ledger with no opinion is not drift — it was never
+        told. Refusing to boot over a constructor argument that did not use
+        to exist helps nobody; charging the superseded policy is the defect.
+        So the config (which is what the descriptor publishes) wins, and the
+        operator is told in the log."""
+        low = BurnPolicy(rate_ppm=1_000, cap_mc=1_000, exempt_below_mc=10)
+        nxt = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+        effective_at = T0 + 30 * DAY_MS
+        clock = FakeClock(T0)
+        ledger = Ledger(
+            self.tmp_db(),
+            clock,
+            low,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = self.make_config(
+            burn_policy=low,
+            burn_policy_next=(nxt, effective_at),
+            burn_policy_announced_at=T0,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        with self.assertLogs("aicash.mintapi", level="WARNING") as logs:
+            MintServer(config, ledger)
+        self.assertIn("burn_policy_next", "\n".join(logs.output))
+        self.assertEqual(ledger.burn_policy_next, (nxt, effective_at))
+
+        # and the adopted notice is actually charged
+        secret = new_secret()
+        ledger.issue([{"amount_mc": 10_000, "secret_hash": ledger_key(secret)}])
+        clock.set(effective_at)
+        out = new_secret()
+        from aicash.lockeval import InputForm
+        from aicash.tokencodec import Token
+
+        result = ledger.exchange(
+            "adopted", "d",
+            [InputForm(kind="plain", token=Token(MINT_ID, 10_000, secret))],
+            outputs=[OutputSpec(amount_mc=9_950, secret_hash=ledger_key(out))],
+        )
+        self.assertEqual(result["burn_mc"], 50)  # 0.5%, the announced policy
+
     def test_matching_hand_wiring_still_accepted(self):
         clock = FakeClock(T0)
         config = self.make_config()
@@ -1973,6 +2087,1896 @@ class DeploymentHardeningTest(unittest.TestCase):
         self.assertNotIn(b"smuggled", raw)
 
 
+class ScheduledBurnChangeDoesNotBreakTheFleetTest(unittest.TestCase):
+    """§7.3's change notice, end to end, through a real wallet.
+
+    The descriptor publishes `burn_policy_next` and every reference client
+    switches policy the instant `mint_time` reaches `effective_at`
+    (burncalc.effective_policy — wallet, channels, swap and escrow all do
+    it). The Ledger was built from `config.burn_policy` alone and held it
+    forever, so from `effective_at` onwards the mint and its whole fleet
+    disagreed about §3.3 step 1: every client-built exchange failed
+    `amount_mismatch`, a plain receive of a freshly issued token included.
+    An honest operator using the documented mechanism, exactly as
+    documented, broke its own mint. Reproduced by outside review
+    2026-09-16; this is that reproduction.
+    """
+
+    CURRENT = BurnPolicy(rate_ppm=1_000, cap_mc=1_000, exempt_below_mc=10)
+    ANNOUNCED = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+    # Default max_lock_expiry_ms is 30 days, and §7.3 wants max(7 days,
+    # lock horizon) of notice for an increase — so a conforming notice here
+    # is 30 days, not 7.
+    EFFECTIVE_AT = T0 + 31 * DAY_MS
+
+    def scheduled_mint(self, clock):
+        priv, pub = generate_keypair()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=self.CURRENT,
+            burn_policy_next=(self.ANNOUNCED, self.EFFECTIVE_AT),
+            burn_policy_announced_at=T0,
+            signing_private=priv,
+            signing_public=pub,
+            admin_token=HARNESS_ADMIN_TOKEN,
+        )
+        from aicash.mintapi import make_mint
+
+        server, ledger = make_mint(
+            config, os.path.join(tmp.name, "ledger.sqlite3"), clock=clock
+        )
+        port = server.start()
+        self.addCleanup(server.stop)
+        return port, ledger, tmp.name
+
+    def funded_token(self, ledger, amount_mc):
+        secret = new_secret()
+        ledger.issue([{"amount_mc": amount_mc, "secret_hash": ledger_key(secret)}])
+        return format_token(MINT_ID, amount_mc, secret)
+
+    def test_a_wallet_can_still_receive_and_pay_after_the_change_lands(self):
+        """Thalamus's scenario: schedule the change, advance the mint clock
+        past effective_at, and a plain receive and a plain pay must both
+        still work — at the NEW policy, which is the one the descriptor
+        advertises at that instant."""
+        from aicash.wallet import MintClient, Wallet
+
+        clock = FakeClock(T0)
+        port, ledger, tmpdir = self.scheduled_mint(clock)
+        token = self.funded_token(ledger, 100_000)
+
+        clock.set(self.EFFECTIVE_AT + DAY_MS)  # the change is in force
+
+        wallet = Wallet(
+            os.path.join(tmpdir, "wallet.sqlite3"),
+            MintClient("http://127.0.0.1:%d" % port),
+            MINT_ID,
+        )
+        # 0.5% of 100_000 = 500 under the ANNOUNCED policy (0.1% -> 100
+        # under the superseded one, which is what the ledger used to charge)
+        credited = wallet.receive(token)
+        self.assertEqual(credited, 100_000 - 500)
+        self.assertEqual(wallet.balance(), 99_500)
+
+        paid = wallet.pay(1_000)
+        self.assertEqual(sum(int(t.split(":")[3]) for t in paid), 1_000)
+
+    def test_before_the_change_the_old_policy_is_the_one_charged(self):
+        """The other side of the same clock: nothing flips early."""
+        from aicash.wallet import MintClient, Wallet
+
+        clock = FakeClock(T0)
+        port, ledger, tmpdir = self.scheduled_mint(clock)
+        token = self.funded_token(ledger, 100_000)
+        wallet = Wallet(
+            os.path.join(tmpdir, "wallet.sqlite3"),
+            MintClient("http://127.0.0.1:%d" % port),
+            MINT_ID,
+        )
+        self.assertEqual(wallet.receive(token), 100_000 - 100)  # 0.1%
+
+    def test_the_ledger_and_the_descriptor_agree_at_every_instant(self):
+        """State it as the invariant, not as two numbers that happen to
+        match: whatever burn the descriptor's effective policy implies for
+        a sum is the burn the ledger charges for it, at the instant before
+        the flip and at the instant of the flip."""
+        from aicash.burncalc import compute_burn, effective_policy
+
+        clock = FakeClock(T0)
+        port, ledger, _ = self.scheduled_mint(clock)
+        for when in (T0, self.EFFECTIVE_AT - 1, self.EFFECTIVE_AT,
+                     self.EFFECTIVE_AT + 10**6):
+            with self.subTest(when=when):
+                clock.set(when)
+                _status, desc, _ = http_json(port, "GET", "/v3/mints")
+                bp = desc["burn_policy"]
+                nxt = desc["burn_policy_next"]
+                published = effective_policy(
+                    BurnPolicy(**bp),
+                    (BurnPolicy(**nxt["policy"]), nxt["effective_at"]),
+                    desc["mint_time"],
+                )
+                expected = compute_burn(10_000, published)
+                secret = new_secret()
+                ledger.issue([
+                    {"amount_mc": 10_000, "secret_hash": ledger_key(secret)}
+                ])
+                out = new_secret()
+                status, body, _ = http_json(
+                    port, "POST", "/v3/exchange",
+                    {
+                        "idempotency_key": "agree-%d" % when,
+                        "inputs": [tok(10_000, secret)],
+                        "outputs": [out_hash(10_000 - expected, out)],
+                    },
+                )
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["burn_mc"], expected)
+
+    def test_a_mint_started_after_the_flip_still_boots_and_prices_the_new_policy(self):
+        """The boot-time config/ledger consistency check compares
+        CONFIGURATION to CONFIGURATION, so it must keep passing for a mint
+        whose clock is already past `effective_at` — `Ledger.burn_policy`
+        stays the configured value for the object's whole life, and the
+        instant-dependent answer lives in `effective_burn_policy(now)`.
+        Pinned because collapsing the two (making `burn_policy` itself
+        follow the clock) looks like a tidy fix and would make a mint
+        started after its own announced change refuse to boot."""
+        clock = FakeClock(self.EFFECTIVE_AT + DAY_MS)
+        port, ledger, _ = self.scheduled_mint(clock)  # boots, or this raises
+        self.assertEqual(ledger.burn_policy, self.CURRENT)
+        self.assertEqual(ledger.burn_policy_next,
+                         (self.ANNOUNCED, self.EFFECTIVE_AT))
+        self.assertEqual(ledger.effective_burn_policy(clock()), self.ANNOUNCED)
+
+        secret = new_secret()
+        ledger.issue([{"amount_mc": 10_000, "secret_hash": ledger_key(secret)}])
+        out = new_secret()
+        status, body, _ = http_json(
+            port, "POST", "/v3/exchange",
+            {
+                "idempotency_key": "post-flip-boot",
+                "inputs": [tok(10_000, secret)],
+                "outputs": [out_hash(10_000 - 50, out)],  # 0.5% announced
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["burn_mc"], 50)
+
+    def test_the_mint_side_answer_to_what_does_a_call_cost_is_public(self):
+        """A mint-side caller that pre-computes a burn before calling
+        `ledger.exchange` (C10's supervision profile does, for deposit and
+        withdraw) must be able to ask the ledger what it will charge,
+        rather than reading the frozen private `_burn_policy` or
+        re-assembling the selection rule from the two published halves.
+        `Ledger.effective_burn_policy(now)` is that accessor, and a caller
+        using it agrees with the conservation check on both sides of the
+        flip."""
+        from aicash.burncalc import compute_burn
+
+        clock = FakeClock(T0)
+        port, ledger, _ = self.scheduled_mint(clock)
+        for when, expected in ((T0, 10), (self.EFFECTIVE_AT, 50)):
+            with self.subTest(when=when):
+                clock.set(when)
+                # exactly the shape of a mint-side pre-computing caller
+                burn = compute_burn(10_000, ledger.effective_burn_policy(clock()))
+                self.assertEqual(burn, expected)
+                secret = new_secret()
+                ledger.issue([
+                    {"amount_mc": 10_000, "secret_hash": ledger_key(secret)}
+                ])
+                out = new_secret()
+                status, body, _ = http_json(
+                    port, "POST", "/v3/exchange",
+                    {
+                        "idempotency_key": "mintside-%d" % when,
+                        "inputs": [tok(10_000, secret)],
+                        "outputs": [out_hash(10_000 - burn, out)],
+                    },
+                )
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["burn_mc"], burn)
+
+
+class BurnChangeNoticeIsValidatedTest(unittest.TestCase):
+    """§7.3: "a burn increase MUST be pre-announced ... at least 7 days (or
+    the mint's max_lock_expiry_ms, whichever is longer) before
+    effective_at".
+
+    burncalc has carried `validate_notice` since C03 and no configuration
+    path ever called it, so a mint could be constructed — and would publish
+    in its descriptor as a conforming §7.3 notice — an increase taking
+    effect a hundred seconds from its announcement. Found by outside review
+    2026-09-16.
+    """
+
+    LOW = BurnPolicy(rate_ppm=1_000, cap_mc=1_000, exempt_below_mc=10)
+    HIGH = BurnPolicy(rate_ppm=5_000, cap_mc=1_000, exempt_below_mc=10)
+
+    def make_config(self, **kw):
+        priv, pub = generate_keypair()
+        defaults = dict(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=self.LOW,
+            signing_private=priv,
+            signing_public=pub,
+            admin_token=ADMIN_ISSUANCE_DISABLED,
+        )
+        defaults.update(kw)
+        return MintConfig(**defaults)
+
+    def test_a_hundred_second_notice_on_an_increase_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.make_config(
+                burn_policy_next=(self.HIGH, T0 + 100_000),
+                burn_policy_announced_at=T0,
+            )
+        self.assertIn("notice", str(ctx.exception))
+
+    def test_seven_days_is_not_enough_when_locks_run_longer(self):
+        """The rule is max(7 days, max_lock_expiry_ms) — funds locked
+        mid-flight must not be repriced by surprise."""
+        with self.assertRaises(ValueError):
+            self.make_config(
+                max_lock_expiry_ms=30 * DAY_MS,
+                burn_policy_next=(self.HIGH, T0 + 7 * DAY_MS),
+                burn_policy_announced_at=T0,
+            )
+        self.make_config(  # the lock horizon's worth of notice is enough
+            max_lock_expiry_ms=30 * DAY_MS,
+            burn_policy_next=(self.HIGH, T0 + 30 * DAY_MS),
+            burn_policy_announced_at=T0,
+        )
+
+    def test_seven_days_is_enough_when_there_are_no_locks_to_protect(self):
+        with self.assertRaises(ValueError):
+            self.make_config(
+                max_lock_expiry_ms=None,
+                burn_policy_next=(self.HIGH, T0 + 7 * DAY_MS - 1),
+                burn_policy_announced_at=T0,
+            )
+        self.make_config(
+            max_lock_expiry_ms=None,
+            burn_policy_next=(self.HIGH, T0 + 7 * DAY_MS),
+            burn_policy_announced_at=T0,
+        )
+
+    def test_an_increase_without_an_announcement_time_is_refused(self):
+        """The interval is unmeasurable without it, and silently skipping
+        the check is how it came to be unmeasured for seven rounds. The
+        message says what to set and that a decrease needs none."""
+        with self.assertRaises(ValueError) as ctx:
+            self.make_config(burn_policy_next=(self.HIGH, T0 + 365 * DAY_MS))
+        message = str(ctx.exception)
+        self.assertIn("burn_policy_announced_at", message)
+        self.assertIn("7 days", message)
+        self.assertIn("DECREASE", message)
+
+    def test_a_decrease_may_be_immediate_and_needs_no_announcement(self):
+        """§7.3: "Decreases may be immediate." A mint lowering its burn
+        must not be made to wait a month to do it."""
+        config = self.make_config(
+            burn_policy=self.HIGH, burn_policy_next=(self.LOW, T0)
+        )
+        self.assertEqual(config.burn_policy_next, (self.LOW, T0))
+
+    def test_an_announcement_time_announcing_nothing_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.make_config(burn_policy_announced_at=T0)
+        self.assertIn("burn_policy_next", str(ctx.exception))
+
+    def test_the_announcement_time_must_be_a_plain_int_of_ms(self):
+        for bad in ("yesterday", -1, 1.0, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises((ValueError, TypeError)):
+                    self.make_config(
+                        burn_policy_next=(self.HIGH, T0 + 365 * DAY_MS),
+                        burn_policy_announced_at=bad,
+                    )
+
+    def test_a_conforming_notice_reaches_the_descriptor(self):
+        """The point of the refusal is that what IS published conforms."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        from aicash.mintapi import make_mint
+
+        config = self.make_config(
+            max_lock_expiry_ms=30 * DAY_MS,
+            burn_policy_next=(self.HIGH, T0 + 30 * DAY_MS),
+            burn_policy_announced_at=T0,
+        )
+        server, _ledger = make_mint(
+            config, os.path.join(tmp.name, "l.sqlite3"), clock=FakeClock(T0)
+        )
+        port = server.start()
+        self.addCleanup(server.stop)
+        _status, desc, _ = http_json(port, "GET", "/v3/mints")
+        self.assertEqual(
+            desc["burn_policy_next"],
+            {
+                "policy": {"rate_ppm": 5_000, "cap_mc": 1_000,
+                           "exempt_below_mc": 10},
+                "effective_at": T0 + 30 * DAY_MS,
+            },
+        )
+        # announced_at is config, not a §3.6 field: a restarted mint must
+        # be able to re-state a notice it gave a month ago without the
+        # notice period starting over.
+        self.assertNotIn("burn_policy_announced_at", desc)
+
+
+class BodyThisLayerCannotReadIsRefusedAndFramedTest(
+    MintHarness, unittest.TestCase
+):
+    """Two ways a POST body defeats the reader, both of which used to leave
+    the mint in a worse state than a rejection. Found by outside review
+    2026-09-16, one of them visible in the mint's own access log.
+    """
+
+    def test_a_chunked_post_cannot_frame_a_second_request(self):
+        """D1: `Transfer-Encoding: chunked` with no Content-Length.
+
+        The reader sized the body from Content-Length alone, so it read the
+        chunked POST as EMPTY, answered 400 — and did not hang up. The chunk
+        octets stayed on the keep-alive socket and were parsed as the start
+        of the next request: the access log showed three entries where there
+        should have been two, the middle one a phantom with method None. The
+        GET path has always carried this guard (`_close_if_body_goes_unread`
+        checks Transfer-Encoding explicitly); the POST path now applies the
+        same one.
+        """
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "chunked-1", "inputs": [], "outputs": []}
+        ).encode()
+        chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+        request = (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n" + chunked
+        )
+        raw = raw_request(mint.port, request, timeout=8.0)
+        status, headers, parsed = parse_http(raw)
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            parsed,
+            {"status": "rejected",
+             "errors": [{"index": None, "kind": "call",
+                         "reason": "bad_format"}]},
+        )
+        self.assertEqual(headers.get("connection"), "close")
+        # Exactly one answer: no phantom request was framed out of the
+        # chunk octets the server never read.
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
+        self.assertNotIn(b"Bad request syntax", raw)
+
+    def test_a_chunked_post_to_every_post_route_is_refused_the_same_way(self):
+        """One rule, not one route's rule: §3.8 reasons are a property of
+        the request, and /v3/status and /admin/issue frame bodies off the
+        same socket."""
+        mint = self.start_mint()
+        for path in ("/v3/exchange", "/v3/status"):
+            with self.subTest(path=path):
+                request = (
+                    b"POST " + path.encode() + b" HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"\r\n5\r\nhello\r\n0\r\n\r\n"
+                )
+                raw = raw_request(mint.port, request, timeout=8.0)
+                status, headers, parsed = parse_http(raw)
+                self.assertEqual(status, 400)
+                self.assertEqual(parsed["errors"][0]["reason"], "bad_format")
+                self.assertEqual(headers.get("connection"), "close")
+                self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
+
+    def test_duplicate_content_length_cannot_frame_a_request(self):
+        """The CL.CL smuggling pair, on Layer 0.
+
+        ``self.headers.get("Content-Length")`` silently returns the FIRST
+        of a duplicated header, so `2` then `46` made the reader take two
+        octets off /v3/exchange and leave forty-four on a keep-alive socket
+        to be framed as the next request line: one request in, TWO
+        responses out. C10 closed this door in its own reader; Layer 0 kept
+        it open for another round, which is exactly why the verdict is now
+        one shared method.
+
+        Both orderings are sent, so a "take the LAST value" fix fails here
+        too, and the single-header comma spelling is checked as well.
+        """
+        mint = self.start_mint()
+        smuggled = (
+            b'{"idempotency_key":"smuggle","inputs":[],"outputs":[]}'
+        )
+        shapes = {
+            "low-then-high": b"Content-Length: 2\r\nContent-Length: %d\r\n"
+                             % len(smuggled),
+            "high-then-low": b"Content-Length: %d\r\nContent-Length: 2\r\n"
+                             % len(smuggled),
+            "one-header-comma": b"Content-Length: 2, %d\r\n" % len(smuggled),
+        }
+        for name, cl in shapes.items():
+            with self.subTest(name):
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + cl +
+                    b"\r\n" + smuggled +
+                    b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                )
+                raw = raw_request(mint.port, request, timeout=8.0)
+                status, headers, parsed = parse_http(raw)
+                self.assertEqual(status, 400)
+                self.assertEqual(
+                    parsed["errors"][0]["reason"], "bad_format", parsed
+                )
+                self.assertEqual(headers.get("connection"), "close")
+                # THE assertion: one request accepted, one answer given.
+                self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
+                self.assertNotIn(b"mint_id", raw)
+
+    def test_duplicate_content_length_cannot_frame_a_request_on_a_GET(self):
+        """The GET guard has its own version of the same hole, and it is
+        the nastier spelling: `Content-Length: 0` followed by
+        `Content-Length: 46`. ``headers.get`` returns the FIRST, so the
+        guard concluded there was no body to go unread at all, kept the
+        connection, and the 46 octets behind it were framed as the next
+        request. The verdict moved into ``_body_framing_is_unreadable``
+        precisely so the GET side inherits it rather than needing its own
+        copy."""
+        mint = self.start_mint()
+        request = (
+            b"GET /v3/mints HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 0\r\nContent-Length: 46\r\n\r\n"
+            + b"a" * 46 +
+            b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        raw = raw_request(mint.port, request, timeout=8.0)
+        # The GET itself is well formed and §3.7 says anyone may make it,
+        # so it is ANSWERED -- and then the socket is dropped rather than
+        # reused for octets we never read.
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:400])
+        status, headers, _ = parse_http(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("connection"), "close")
+
+    def test_a_single_content_length_still_frames_a_keep_alive_request(self):
+        """The guard costs ordinary pipelining nothing: two well-formed
+        POSTs on one connection still get two answers."""
+        mint = self.start_mint()
+        def post(key):
+            body = json.dumps(
+                {"idempotency_key": key, "inputs": [], "outputs": []}
+            ).encode()
+            return (
+                b"POST /v3/exchange HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+            ) + body
+        raw = raw_request(
+            mint.port, post("keep-1") + post("keep-2"),
+            shutdown_write=True, timeout=8.0,
+        )
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 2, raw[:600])
+        self.assertNotIn(b"HTTP/1.1 400", raw)
+
+    def test_the_framing_rule_is_one_rule_shared_with_the_get_guard(self):
+        """The GET guard already knew that Transfer-Encoding means an
+        unreadable body. A second, separately-worded copy on the POST side
+        is how the two drift apart again, so both ask the same rule.
+
+        RETARGETED this round, and strengthened. The assertion was that
+        both methods name ``_body_framing_is_unreadable``; the GET guard
+        named it in a docstring while its CODE hand-wrote
+        ``FramingVerdict.must_close``'s definition out in two clauses. Both
+        halves now reach ``_framing_verdict`` -- the one method that turns
+        a header block into a decision -- and each takes the field it needs
+        off the object it returns, so "the same rule" is a fact about the
+        code and not about the prose.
+        """
+        guard = inspect.getsource(
+            _Handler._close_if_body_goes_unread).split('"""')[-1]
+        reader = inspect.getsource(_Handler._read_json).split('"""')[-1]
+        self.assertIn("_framing_verdict", guard)
+        self.assertIn("must_close", guard)
+        self.assertIn("_body_framing_is_unreadable", reader)
+        self.assertIn(
+            "_framing_verdict",
+            inspect.getsource(_Handler._framed_body_length).split('"""')[-1],
+        )
+
+    def test_an_oversized_numeric_literal_is_bad_format_not_500(self):
+        """D2: a body that is valid UTF-8 and valid JSON whose `amount_mc`
+        is a 5,000-digit integer. CPython's int-string digit limit makes
+        int() raise a PLAIN ValueError out of json.loads — not a
+        JSONDecodeError — and the reader caught only UnicodeDecodeError and
+        JSONDecodeError, so it escaped to the 500 handler. §3.8 owes an
+        enumerated reason; a bare 500 is not one."""
+        mint = self.start_mint()
+        body = (
+            b'{"idempotency_key":"big","inputs":[],"outputs":'
+            b'[{"amount_mc":' + b"1" * 5_000 + b',"secret_hash":"x"}]}'
+        )
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", body,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")),
+            {"status": "rejected",
+             "errors": [{"index": None, "kind": "call",
+                         "reason": "bad_format"}]},
+        )
+
+    def test_a_literal_the_parser_can_still_read_is_handled_normally(self):
+        """The boundary is CPython's limit, not "a big number", and the
+        widened handling must not swallow bodies the parser CAN read: a
+        4,299-digit amount still parses, and is then refused by a MONEY
+        rule at its own index rather than as a malformed envelope.
+
+        WHICH money rule moved this round, and the move is the point. It
+        used to be §3.3 conservation, at call level: an amount no entry
+        could hold reached the ledger, could not balance against zero
+        inputs, and came back `amount_mismatch`. That was the accident
+        that hid a real defect — the SAME value through `/admin/issue`
+        has no inputs and therefore no conservation to catch it, so it
+        bound 9999999999999999999 straight into sqlite and answered a
+        bare 500 with no `errors` list at all (§3.8 owes an enumerated
+        reason, always). C04 now bounds an output amount to what the
+        column holds, at the one place both routes resolve an output, so
+        the answer here is `bad_format` at output index 0: the amount is
+        malformed, not merely unbalanced, and it is said the same way on
+        both routes.
+
+        Both halves are asserted below, because "handled normally" means
+        an enumerated per-index answer AND that conservation itself still
+        works for an amount the ledger CAN hold.
+        """
+        mint = self.start_mint()
+        body = (
+            b'{"idempotency_key":"big-ok","inputs":[],"outputs":'
+            b'[{"amount_mc":' + b"1" * 4_299 + b',"secret_hash":"'
+            + ledger_key(new_secret()).encode() + b'"}]}'
+        )
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", body,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        errors = json.loads(raw.decode("utf-8"))["errors"]
+        self.assertEqual([e["reason"] for e in errors], ["bad_format"])
+        # PER-INDEX, not call level: the body was read and this one entry
+        # was judged, which is what "the parser can still read it" means.
+        self.assertEqual(errors[0]["kind"], "output")
+        self.assertEqual(errors[0]["index"], 0)
+        # ...and the conservation rule this test used to land on is still
+        # there, reached by an amount the ledger can actually store.
+        storable = json.dumps({
+            "idempotency_key": "big-ok-2",
+            "inputs": [],
+            "outputs": [{"amount_mc": (1 << 62),
+                         "secret_hash": ledger_key(new_secret())}],
+        }).encode()
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", storable,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        errors = json.loads(raw.decode("utf-8"))["errors"]
+        self.assertEqual([e["reason"] for e in errors], ["amount_mismatch"])
+        self.assertEqual(errors[0]["kind"], "call")
+
+    def test_a_deeply_nested_body_is_bad_format_not_500(self):
+        """The same uncaught shape one level up, found looking for it: a
+        200 KB body of nothing but `[` blows the JSON parser's stack with a
+        RecursionError, which is not a ValueError at all. Well inside
+        MAX_BODY_BYTES, so nothing else stopped it either."""
+        mint = self.start_mint()
+        body = b"[" * 100_000 + b"]" * 100_000
+        self.assertLess(len(body), MAX_BODY_BYTES)
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", body,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8"))["errors"][0]["reason"],
+            "bad_format",
+        )
+
+    def test_the_mint_still_serves_after_each_of_them(self):
+        """A refusal is not a wound: the server takes the next request."""
+        mint = self.start_mint()
+        for body in (
+            b'{"amount_mc":' + b"1" * 5_000 + b"}",
+            b"[" * 100_000 + b"]" * 100_000,
+            b"{not json",
+        ):
+            http_raw(mint.port, "POST", "/v3/exchange", body,
+                     {"Content-Type": "application/json"})
+        status, desc, _ = http_json(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+    def test_no_traceback_reaches_any_of_those_callers(self):
+        """Requirement 4, restated over the bodies that used to 500."""
+        mint = self.start_mint()
+        for body in (
+            b'{"amount_mc":' + b"1" * 5_000 + b"}",
+            b"[" * 100_000 + b"]" * 100_000,
+        ):
+            _status, raw, _ = http_raw(
+                mint.port, "POST", "/v3/exchange", body,
+                {"Content-Type": "application/json"},
+            )
+            self.assertNotIn(b"Traceback", raw)
+            self.assertNotIn(b"aicash/", raw)
+
+
+class FramingDoesNotDependOnSpellingAHeaderTest(
+    MintHarness, unittest.TestCase
+):
+    """D1's variation: the fix that named a header, and the class it missed.
+
+    The first fix asked ``self.headers`` for ``Transfer-Encoding``. Python's
+    email parser does not register ``Transfer-Encoding : chunked`` — one
+    space before the colon — as a field AT ALL, so the lookup returned
+    None, the framing check saw neither a transfer coding nor a
+    Content-Length, defaulted the body to zero octets, never read the chunk
+    data, answered 400 WITHOUT ``Connection: close``, and the chunk octets
+    were then framed as the next request line: a second response on the
+    socket for one request, with no status line on it at all, and two
+    access-log entries for one request, the second with a null method. RFC
+    7230 §3.2.4 requires a server to REJECT whitespace before the colon for
+    exactly this reason. ``Transfer_Encoding:`` did the same by a different
+    road, and front ends that normalise ``_`` to ``-`` make it likelier
+    than the spaced spelling, not more exotic.
+
+    Adding those two spellings to the lookup would have been the same
+    mistake one level down. The rule is now derived from the length the
+    server can COMPUTE (``_framed_body_length``): a request whose body this
+    layer was about to read, carrying no Content-Length it can parse, is
+    unframable whatever the reason — including a reason nobody has thought
+    of. That property is checked below over every spelling anyone has
+    produced so far, and the point of stating it this way is that the list
+    below is evidence, not the specification.
+    """
+
+    def assert_refused_and_hung_up(self, port, request, *, path="/v3/exchange"):
+        """One answer, an announced close, and no second payload.
+
+        The trailing GET is the smuggle: if the server keeps the connection
+        after failing to read the body, the unread octets are framed as a
+        request line and something ELSE appears on the wire — either a
+        second HTTP response or the stdlib's status-line-less "Bad request
+        syntax" page (HTTP/0.9 fallback, which is why counting status lines
+        alone was not enough to see this).
+        """
+        raw = raw_request(port, request, timeout=8.0)
+        status, headers, parsed = parse_http(raw)
+        self.assertEqual(status, 400, raw[:400])
+        self.assertEqual(
+            parsed["errors"][0]["reason"], "bad_format", parsed
+        )
+        self.assertEqual(headers.get("connection"), "close", raw[:400])
+        self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+        self.assertNotIn(b"Bad request syntax", raw)
+        self.assertNotIn(b"<!DOCTYPE HTML>", raw)
+        self.assertNotIn(b"mint_id", raw)  # the smuggled GET never answered
+
+    # -- the reported spelling, its variations, and its neighbours -------
+
+    SMUGGLE = (
+        b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    )
+
+    def chunked_post(self, header_line, path=b"/v3/exchange"):
+        body = json.dumps(
+            {"idempotency_key": "te", "inputs": [], "outputs": []}
+        ).encode()
+        return (
+            b"POST " + path + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + header_line +
+            b"\r\n"
+            b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+        ) + self.SMUGGLE
+
+    def test_every_spelling_of_a_transfer_coded_post_is_refused_and_closed(self):
+        """The reported one, the two the verifier found, and the ones found
+        by asking what else the parser does with a field name."""
+        spellings = {
+            # Already held before this round; must not regress.
+            "canonical": b"Transfer-Encoding: chunked\r\n",
+            "lowercase": b"transfer-encoding: chunked\r\n",
+            "tab-separated value": b"Transfer-Encoding:\tchunked\r\n",
+            "obsolete line folding": b"Transfer-Encoding: \r\n chunked\r\n",
+            "identity then chunked":
+                b"Transfer-Encoding: identity, chunked\r\n",
+            "chunked beside a zero length":
+                b"Transfer-Encoding: chunked\r\nContent-Length: 0\r\n",
+            # THE REPORTED VARIATION and its family: the parser registers
+            # no field at all, so no lookup by name can ever see them.
+            "one space before the colon":
+                b"Transfer-Encoding : chunked\r\n",
+            "two spaces before the colon":
+                b"Transfer-Encoding  : chunked\r\n",
+            "a tab before the colon": b"Transfer-Encoding\t: chunked\r\n",
+            "no colon at all": b"Transfer-Encoding chunked\r\n",
+            # Registered, but under a name the lookup does not ask for.
+            # A front end that normalises `_` to `-` has already dechunked.
+            "underscore": b"Transfer_Encoding: chunked\r\n",
+            "dot": b"Transfer.Encoding: chunked\r\n",
+            # Not a header the mint knows at all: the class says the
+            # verdict must not depend on recognising the name.
+            "a name nobody has reserved yet":
+                b"X-Body-Framing-2031: chunked\r\n",
+        }
+        mint = self.start_mint()
+        for name, header_line in spellings.items():
+            with self.subTest(name):
+                self.assert_refused_and_hung_up(
+                    mint.port, self.chunked_post(header_line)
+                )
+
+    def test_the_same_spellings_are_refused_on_every_post_route(self):
+        """§3.8 reasons are a property of the request, and /v3/status frames
+        its body off the same socket /v3/exchange does."""
+        mint = self.start_mint()
+        for path in (b"/v3/exchange", b"/v3/status"):
+            for header_line in (b"Transfer-Encoding : chunked\r\n",
+                                b"Transfer_Encoding: chunked\r\n"):
+                with self.subTest(path=path, header=header_line):
+                    self.assert_refused_and_hung_up(
+                        mint.port, self.chunked_post(header_line, path)
+                    )
+
+    def test_a_stated_length_beside_a_dropped_framing_header_is_refused(self):
+        """The hole the length rule ALONE left, found by sweeping this fix
+        rather than by re-reading the report.
+
+        ``Content-Length: 57`` beside ``Transfer-Encoding : chunked`` passes
+        every length clause: the length is single, parseable, honest, and
+        the transfer coding is invisible to the parser. So the body framed
+        cleanly, the connection stayed pooled, and the pipelined request
+        behind it was answered — the CL.TE half of the same smuggling pair,
+        still open after the header-name lookup had been replaced by a
+        length rule. A header block the parser could not read WHOLE is now
+        the precondition on every length it computes: no defect, no obsolete
+        folding, or there is no length at all.
+        """
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "cl-te", "inputs": [], "outputs": []}
+        ).encode()
+        hidden = {
+            "spaced transfer-encoding":
+                b"Transfer-Encoding : chunked\r\n",
+            "tabbed transfer-encoding":
+                b"Transfer-Encoding\t: chunked\r\n",
+            "a colonless line": b"Transfer-Encoding chunked\r\n",
+            "folded onto the line above": b" Transfer-Encoding: chunked\r\n",
+        }
+        for name, header_line in hidden.items():
+            with self.subTest(name):
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: %d\r\n" % len(body)
+                    + header_line + b"\r\n" + body + self.SMUGGLE
+                )
+                self.assert_refused_and_hung_up(mint.port, request)
+
+    def test_a_get_whose_header_block_did_not_parse_whole_hangs_up(self):
+        """The GET side of the same precondition. A GET reads no body, so
+        the request is ANSWERED (§3.7 says anyone may make it) and THEN the
+        socket is dropped — without this, `GET` + a spaced Transfer-Encoding
+        answered 200, kept the connection, and framed the chunk octets as
+        the next request line: the reporter's two-log-lines-for-one-request
+        symptom, on the route that reads nothing at all."""
+        mint = self.start_mint()
+        body = b'{"x":1}'
+        chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+        for name, header_line in {
+            "spaced transfer-encoding": b"Transfer-Encoding : chunked\r\n",
+            "spaced content-length": b"Content-Length : 7\r\n",
+            "folded onto the line above": b" Transfer-Encoding: chunked\r\n",
+        }.items():
+            with self.subTest(name):
+                request = (
+                    b"GET /v3/mints HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    + header_line + b"\r\n" + chunked + self.SMUGGLE
+                )
+                raw = raw_request(mint.port, request, timeout=8.0)
+                status, headers, _ = parse_http(raw)
+                self.assertEqual(status, 200, raw[:300])
+                self.assertEqual(headers.get("connection"), "close", raw[:300])
+                self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+                self.assertNotIn(b"Bad request syntax", raw)
+
+    def test_a_post_that_states_no_length_at_all_is_unframable(self):
+        """The class rule itself, with no misspelled header in sight.
+
+        A POST carrying a body and no Content-Length is not "a POST with an
+        empty body": it is a POST whose framing was never stated, which is
+        what every dropped, misspelled or front-end-rewritten framing header
+        degrades into by the time this parser is done with it. The server
+        cannot tell the two apart, so it refuses to reuse the connection
+        either way — and that, not any list of header names, is what closes
+        the spellings above.
+        """
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "nolen", "inputs": [], "outputs": []}
+        ).encode()
+        request = (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"\r\n" + body + self.SMUGGLE
+        )
+        self.assert_refused_and_hung_up(mint.port, request)
+
+    def test_a_post_with_no_length_and_no_body_is_closed_too(self):
+        """Even with nothing behind it. The server does not get to decide
+        after the fact that there was no body: it never knew."""
+        mint = self.start_mint()
+        request = (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"\r\n" + self.SMUGGLE
+        )
+        self.assert_refused_and_hung_up(mint.port, request)
+
+    # -- the neighbouring field: Content-Length itself -------------------
+
+    def test_content_length_is_read_the_way_http_defines_it(self):
+        """``int()`` is a LOOSER parser than RFC 7230 §3.3.2's ``1*DIGIT``.
+
+        It accepts a leading sign, PEP 515 underscore separators, and
+        surrounding whitespace, so ``Content-Length: +53`` and
+        ``Content-Length: 5_3`` both read as 53 HERE while an intermediary
+        reads them as malformed or as nothing — a length two parties
+        compute differently, which is the same smuggling primitive as the
+        duplicated header, reached through the neighbouring field rather
+        than through Transfer-Encoding.
+        """
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "cl", "inputs": [], "outputs": []}
+        ).encode()
+        spellings = {
+            "leading plus": b"+%d" % len(body),
+            "underscore separator":
+                b"%d_%d" % (len(body) // 10, len(body) % 10),
+            "leading minus": b"-%d" % len(body),
+            "not a number": b"abc",
+            "empty": b"",
+            "the comma form": b"2, %d" % len(body),
+            "a digit run past the conversion limit": b"1" * 5_000,
+            "twenty digits": b"9" * 20,
+            "a float": b"%d.0" % len(body),
+            "hex": b"0x%x" % len(body),
+        }
+        for name, value in spellings.items():
+            with self.subTest(name):
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + value + b"\r\n"
+                    b"\r\n" + body + self.SMUGGLE
+                )
+                self.assert_refused_and_hung_up(mint.port, request)
+
+    def test_a_spaced_content_length_is_unframable_too(self):
+        """The reported variation, moved to the neighbouring field. The
+        parser drops `Content-Length : 53` exactly as it drops the spaced
+        Transfer-Encoding, and before this round that request read as a
+        zero-length body and kept its connection."""
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "cl-sp", "inputs": [], "outputs": []}
+        ).encode()
+        for header_line in (b"Content-Length : %d\r\n" % len(body),
+                            b"Content_Length: %d\r\n" % len(body),
+                            b"Content-Length\t: %d\r\n" % len(body)):
+            with self.subTest(header_line):
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + header_line + b"\r\n" + body + self.SMUGGLE
+                )
+                self.assert_refused_and_hung_up(mint.port, request)
+
+    # -- and the cost of all that, which must be nothing ----------------
+
+    def test_the_spellings_http_actually_allows_still_keep_alive(self):
+        """The guard must not become a keep-alive tax. Optional whitespace
+        after the colon and leading zeros are both ``1*DIGIT`` with OWS, so
+        both still frame, and the pipelined GET behind them is answered."""
+        mint = self.start_mint()
+        def post(key, length_value):
+            body = json.dumps(
+                {"idempotency_key": key, "inputs": [], "outputs": []}
+            ).encode()
+            return (
+                b"POST /v3/exchange HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length:" + length_value + b"\r\n\r\n"
+            ) + body
+        cases = {
+            "one space": b" %d",
+            "several spaces": b"   %d",
+            "a tab": b"\t%d",
+            "leading zeros": b" 00000%d",
+            "no space at all": b"%d",
+        }
+        body_len = len(json.dumps(
+            {"idempotency_key": "x" * 5, "inputs": [], "outputs": []}
+        ).encode())
+        for name, template in cases.items():
+            with self.subTest(name):
+                key = "ka%03d" % len(name)
+                body = json.dumps(
+                    {"idempotency_key": key, "inputs": [], "outputs": []}
+                ).encode()
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length:" + (template % len(body)) +
+                    b"\r\n\r\n" + body + self.SMUGGLE
+                )
+                raw = raw_request(mint.port, request, shutdown_write=True,
+                                  timeout=8.0)
+                self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:600])
+                self.assertIn(b"mint_id", raw)  # the pipelined GET answered
+
+    def test_an_ordinary_get_still_keeps_its_connection(self):
+        """`body_expected` is False on the GET guard for a reason: no
+        conforming client sends `Content-Length: 0` on a GET, so treating an
+        absent length as unframable there would close every well-formed
+        connection this mint serves."""
+        mint = self.start_mint()
+        request = (
+            b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        raw = raw_request(mint.port, request, shutdown_write=True,
+                          timeout=8.0)
+        self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:600])
+        self.assertNotIn(b"Connection: close", raw)
+
+    # -- the shape of the rule, not just its answers ---------------------
+
+    def test_the_framing_rule_yields_a_length_or_nothing(self):
+        """The verdict and the number come from ONE method, so the length
+        a reader acts on and the verdict that the socket is re-framable
+        cannot disagree — which is how the two used to drift apart."""
+        self.assertIn(
+            "_framed_body_length",
+            inspect.getsource(_Handler._body_framing_is_unreadable),
+        )
+        self.assertIn(
+            "_framed_body_length", inspect.getsource(_Handler._read_json)
+        )
+        # The GET guard READS ``FramingVerdict.must_close``; it does not
+        # re-derive it. RETARGETED, and strengthened, this round: the
+        # assertion used to be that this method mentions
+        # `_body_framing_is_unreadable`, and it did -- in a docstring,
+        # while its code spelled out `must_close`'s own definition
+        # ("unframable, OR framed with a declared length that is not
+        # zero") by hand, in the file that DEFINES the field, and
+        # `must_close` itself had no executing consumer anywhere in the
+        # package. The other three servers act on that field. A contract
+        # field its owner re-implements is a contract field free to drift
+        # from its definition, so the guard reads it now and this says so.
+        guard_code = inspect.getsource(
+            _Handler._close_if_body_goes_unread).split('"""')[-1]
+        self.assertIn("must_close", guard_code)
+        self.assertIn("_framing_verdict", guard_code)
+        for rederived in ("_framed_body_length",
+                          "_body_framing_is_unreadable", "!= 0"):
+            self.assertNotIn(rederived, guard_code, rederived)
+        # The reader must not re-parse Content-Length behind the rule's
+        # back: that duplicate parse is exactly what the rule replaced.
+        self.assertNotIn(
+            'int(self.headers.get("Content-Length"',
+            inspect.getsource(_Handler._read_json),
+        )
+        # And the precondition lives in the same ONE rule, so the GET
+        # guard, the POST reader and C10's reader all inherit it together.
+        # That rule is now the exported `framing_verdict`, because three
+        # other servers in this repository need it too and the private
+        # method they could not import is why they each had a copy of a
+        # WRONG one; `_framed_body_length` is the delegation, asserted
+        # here so the arithmetic cannot quietly move back in beside it.
+        source = inspect.getsource(mintapi.framing_verdict)
+        self.assertIn("headers.defects", source)
+        # The handler-side chokepoint is `_framing_verdict`: ONE method
+        # turns `self.headers` into a decision, and both readers take a
+        # field off what it returns. RETARGETED from
+        # `_framed_body_length`, which is where the delegation used to sit
+        # -- it still delegates, but through the verdict method now, so a
+        # subclass narrowing framing narrows `must_close` and `length`
+        # together instead of only the number. Both are asserted, so
+        # neither can grow the arithmetic back.
+        chokepoint = inspect.getsource(_Handler._framing_verdict)
+        self.assertIn("framing_verdict(", chokepoint.split('"""')[-1])
+        self.assertIn("self.headers", chokepoint.split('"""')[-1])
+        delegator = inspect.getsource(_Handler._framed_body_length)
+        self.assertIn("_framing_verdict", delegator.split('"""')[-1])
+        self.assertIn(".length", delegator.split('"""')[-1])
+        for method in (chokepoint, delegator):
+            self.assertNotIn("headers.defects", method.split('"""')[-1])
+            self.assertNotIn("_FRAMING_CONFUSABLE_RE", method)
+            self.assertNotIn("_FOLDED_FRAMING_NAMES", method)
+            self.assertNotIn("_TCHAR", method)
+
+    def test_a_body_expecting_reader_gets_the_strict_verdict_by_default(self):
+        """C10's ``_read_sup_json`` calls ``_body_framing_is_unreadable()``
+        with no arguments and lives in a file this change does not touch, so
+        the DEFAULT has to be the body-expecting one. If that default ever
+        flips, the Supervision routes — including the authenticated deposit
+        route the same token reaches — go back to framing a chunked POST as
+        empty while Layer 0 does not: one server, one socket, two answers.
+        """
+        signature = inspect.signature(_Handler._body_framing_is_unreadable)
+        self.assertIs(
+            signature.parameters["body_expected"].default, True
+        )
+        self.assertIs(
+            signature.parameters["body_expected"].kind,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+
+    def test_the_mint_still_serves_after_every_refusal(self):
+        """A hang-up is not a wound: a fresh connection still works."""
+        mint = self.start_mint()
+        for header_line in (b"Transfer-Encoding : chunked\r\n",
+                            b"Transfer_Encoding: chunked\r\n",
+                            b""):
+            raw_request(mint.port, self.chunked_post(header_line),
+                        timeout=8.0)
+        status, desc, _ = http_json(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+
+class AFramingHeaderCannotHideBehindItsOwnNameTest(
+    MintHarness, unittest.TestCase
+):
+    """D1, one step past the fix that was supposed to close it.
+
+    The previous round replaced a list of bad header spellings with a rule
+    about the length the server can COMPUTE — and then kept one literal
+    name lookup, ``self.headers.get("Transfer-Encoding")``, described in
+    its own comment as a belt over the braces whose every miss "is caught
+    by the no-computable-length rule instead". That sentence is true
+    everywhere except the one place the clause was load-bearing:
+    ``Content-Length: 0`` beside an invisible transfer coding. A truthful,
+    single, well-formed ``Content-Length`` is a computable length, so no
+    other clause can fire, and the verdict fell through to a comparison
+    against one spelling of one name. Every other spelling — and RFC 7230
+    §3.2.4 makes a field name any run of tchars, so there are as many as
+    anyone cares to type — framed as a zero-octet body, answered WITHOUT
+    ``Connection: close``, and left the chunk data to be read as the next
+    request line: two access-log entries for one request, the second with
+    a null method, which is the reporter's original evidence reproduced by
+    changing one character of a header name.
+
+    The rule is no longer a name. ``_FRAMING_CONFUSABLE_RE`` is DERIVED
+    from ``_FRAMING_FIELD_NAMES`` by letting every hyphen be any character
+    or none, so the question asked of each field is "could any hop read
+    this as framing?" rather than "is this spelled the way we expect?".
+    The sweeps below are evidence for that property; the property is what
+    is being tested, and ``test_the_rule_is_generated_from_the_names`` is
+    the test that fails if someone turns it back into a list.
+    """
+
+    SMUGGLE = b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+
+    # RFC 7230 §3.2.6 tchar, minus the characters that cannot appear here:
+    # the field name is delimited by a colon, and CR/LF end the line.
+    TCHARS = (
+        "!#$%&'*+-.^_`|~"
+        "0123456789"
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+
+    def assert_refused_and_hung_up(self, port, request):
+        raw = raw_request(port, request, timeout=8.0)
+        status, headers, parsed = parse_http(raw)
+        self.assertEqual(status, 400, raw[:400])
+        self.assertEqual(parsed["errors"][0]["reason"], "bad_format", parsed)
+        self.assertEqual(headers.get("connection"), "close", raw[:400])
+        self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+        self.assertNotIn(b"Bad request syntax", raw)
+        self.assertNotIn(b"mint_id", raw)  # the smuggled GET never answered
+
+    def chunked_post_with_a_truthful_length(self, field_name,
+                                            path=b"/v3/exchange"):
+        """The exact shape the length rule cannot help with.
+
+        ``Content-Length: 0`` is single, parseable and defect-free, so it
+        IS a computable length; the only thing wrong with the request is a
+        field name this server does not recognise as framing and some
+        other hop might.
+        """
+        return (
+            b"POST " + path + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 0\r\n"
+            + field_name + b": chunked\r\n"
+            b"\r\n"
+            b"3d\r\n" + b"A" * 61 + b"\r\n0\r\n\r\n"
+        ) + self.SMUGGLE
+
+    def test_every_tchar_in_place_of_the_hyphen_is_refused_and_closed(self):
+        """The whole substitution class, not the three spellings reported.
+
+        Each of these is a DIFFERENT field name to Python's email parser,
+        so no lookup can see them; each is a name an intermediary may
+        normalise back into ``Transfer-Encoding`` (nginx has
+        ``underscores_in_headers``; Apache and IIS historically folded
+        ``_`` to ``-``) and then dechunk on this server's behalf.
+        """
+        mint = self.start_mint()
+        names = ["Transfer%sEncoding" % c for c in self.TCHARS]
+        names.append("TransferEncoding")  # the separator removed entirely
+        names.append("transfer_encoding")  # and lowercased
+        names.append("TRANSFER.ENCODING")
+        # Separator RUNS, for a gateway that rewrites punctuation with a
+        # substitution rather than character by character.
+        names.append("Transfer__Encoding")
+        names.append("Transfer--Encoding")
+        names.append("Transfer-_.Encoding")
+        names.append("Transfer~~~Encoding")
+        for name in names:
+            with self.subTest(name):
+                self.assert_refused_and_hung_up(
+                    mint.port,
+                    self.chunked_post_with_a_truthful_length(name.encode()),
+                )
+
+    def test_the_same_names_are_refused_on_every_post_route(self):
+        """One server, one socket: the verdict is a property of the
+        request, not of the route it was aimed at."""
+        mint = self.start_mint()
+        for path in (b"/v3/exchange", b"/v3/status", b"/admin/issue"):
+            for name in (b"Transfer_Encoding", b"TransferaEncoding",
+                         b"Transfer~Encoding"):
+                with self.subTest(path=path, name=name):
+                    raw = raw_request(
+                        mint.port,
+                        self.chunked_post_with_a_truthful_length(name, path),
+                        timeout=8.0,
+                    )
+                    status, headers, _ = parse_http(raw)
+                    self.assertEqual(headers.get("connection"), "close",
+                                     raw[:400])
+                    self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+                    self.assertNotIn(b"mint_id", raw)
+
+    def test_the_get_side_needs_no_content_length_at_all(self):
+        """The same class where there is no length to be truthful about.
+
+        A GET reads no body, so an absent Content-Length is the ordinary
+        case and cannot be the trigger; the misspelled transfer coding is
+        the ONLY thing to go on. Answered (§3.7 lets anyone ask) and then
+        hung up, so the chunk octets are never framed as a request.
+        """
+        mint = self.start_mint()
+        for c in self.TCHARS:
+            name = ("Transfer%sEncoding" % c).encode()
+            with self.subTest(name):
+                request = (
+                    b"GET /v3/mints HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    + name + b": chunked\r\n\r\n"
+                    b"3d\r\n" + b"A" * 61 + b"\r\n0\r\n\r\n"
+                ) + self.SMUGGLE
+                raw = raw_request(mint.port, request, timeout=8.0)
+                status, headers, _ = parse_http(raw)
+                self.assertEqual(status, 200, raw[:300])
+                self.assertEqual(headers.get("connection"), "close",
+                                 raw[:300])
+                self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+
+    def test_the_neighbouring_framing_field_gets_the_same_treatment(self):
+        """``Content-Length`` is the other name in ``_FRAMING_FIELD_NAMES``,
+        and the rule is derived from the tuple rather than written for one
+        entry of it. A hop that normalises ``Content_Length: 53`` has a
+        length this server does not, which is the same disagreement read
+        from the other side — and it is a disagreement even when a real
+        ``Content-Length`` sits beside it."""
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "cl-conf", "inputs": [], "outputs": []}
+        ).encode()
+        for c in self.TCHARS:
+            name = ("Content%sLength" % c).encode()
+            if name.lower() == b"content-length":
+                continue  # that one IS the framing header, read below
+            for extra in (b"", b"Content-Length: %d\r\n" % len(body)):
+                with self.subTest(name=name, real_length=bool(extra)):
+                    request = (
+                        b"POST /v3/exchange HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Content-Type: application/json\r\n"
+                        + extra + name + b": %d\r\n" % len(body)
+                        + b"\r\n" + body + self.SMUGGLE
+                    )
+                    self.assert_refused_and_hung_up(mint.port, request)
+
+    # -- the rule's shape, so it cannot quietly become a list again ------
+
+    def test_the_rule_is_generated_from_the_names(self):
+        """THE test for this round's failure mode.
+
+        A pattern built by hand is a list with better punctuation: it can
+        be complete on the day it is written and stale the day a framing
+        header is added. This asserts the pattern is a FUNCTION of
+        ``_FRAMING_FIELD_NAMES`` by rebuilding it here from the tuple and
+        requiring the same answers, and asserts the framing decision
+        contains no name lookup of its own.
+        """
+        source = inspect.getsource(mintapi.framing_verdict)
+        self.assertNotIn('get("Transfer-Encoding")', source)
+        self.assertNotIn('get_all("Content-Length")', source)
+        self.assertIn("_FRAMING_CONFUSABLE_RE", source)
+        punctuation = "".join(c for c in self.TCHARS if not c.isalnum())
+        for name in _FRAMING_FIELD_NAMES:
+            self.assertTrue(_FRAMING_CONFUSABLE_RE.fullmatch(name), name)
+            for i, ch in enumerate(name):
+                if ch != "-":
+                    continue
+                separators = list(self.TCHARS)          # one character
+                separators.append("")                   # removed entirely
+                separators.append(punctuation)          # a run of it
+                separators.extend(c * 3 for c in punctuation)
+                for sep in separators:
+                    spelling = name[:i] + sep + name[i + 1:]
+                    self.assertTrue(
+                        _FRAMING_CONFUSABLE_RE.fullmatch(spelling),
+                        "a hop could read %r as %r" % (spelling, name),
+                    )
+        # And it must still be a rule about CONFUSION, not about everything
+        # with a familiar-looking word in it: a name that is genuinely a
+        # different header keeps its keep-alive.
+        for innocent in ("content-type", "content-encoding", "accept-encoding",
+                         "x-transfer-encoding", "transfer-encodings",
+                         "content-length-hint", "user-agent"):
+            self.assertIsNone(_FRAMING_CONFUSABLE_RE.fullmatch(innocent),
+                              innocent)
+
+    def test_adding_a_framing_header_extends_the_rule_with_no_second_edit(
+        self
+    ):
+        """The tuple is the specification and the pattern is its shadow. If
+        a future round has to treat another header as framing, adding it
+        here must cover every confusion of it too — otherwise the next
+        maintainer is back to writing spellings down."""
+        import re as _re
+
+        extended = _re.compile(
+            "|".join(
+                n.replace("-", _FRAMING_NAME_SEPARATOR)
+                for n in _FRAMING_FIELD_NAMES + ("content-encoding",)
+            )
+        )
+        for spelling in ("content-encoding", "content_encoding",
+                         "content.encoding", "contentXencoding",
+                         "content__encoding", "contentencoding"):
+            self.assertTrue(extended.fullmatch(spelling), spelling)
+        # The existing entries keep working; extending is not replacing.
+        for spelling in ("transfer_encoding", "content--length"):
+            self.assertTrue(extended.fullmatch(spelling), spelling)
+
+    # -- and the cost of all of it, which must still be nothing ----------
+
+    def test_ordinary_headers_do_not_lose_keep_alive(self):
+        """A rule that refused everything it did not recognise would be a
+        keep-alive tax on every proxy, client and credential header this
+        mint actually sees. The axis is confusability with a framing name,
+        not unfamiliarity."""
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "ka-ord", "inputs": [], "outputs": []}
+        ).encode()
+        extra = (
+            b"User-Agent: curl/8.4.0\r\n"
+            b"Accept: */*\r\n"
+            b"Accept-Encoding: gzip, deflate\r\n"
+            b"X-Forwarded-For: 203.0.113.7\r\n"
+            b"X-Real-IP: 203.0.113.7\r\n"
+            b"Via: 1.1 gateway\r\n"
+            b"X-Admin-Token: not-the-one\r\n"
+            b"X-Transfer-Encoding-Notes: none\r\n"
+            b"Content-Encoding: identity\r\n"
+            b"Transfer-Encodings-Supported: none\r\n"
+        )
+        request = (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + extra +
+            b"Content-Length: %d\r\n\r\n" % len(body)
+            + body + self.SMUGGLE
+        )
+        raw = raw_request(mint.port, request, shutdown_write=True,
+                          timeout=8.0)
+        self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:800])
+        self.assertIn(b"mint_id", raw)  # the pipelined GET was answered
+        self.assertNotIn(b"Connection: close", raw)
+
+
+class ContentLengthIsStrippedTheWayHttpDefinesItTest(
+    MintHarness, unittest.TestCase
+):
+    """D1's other step: a spec-strict pattern fed a Python-defined strip.
+
+    ``_CONTENT_LENGTH_RE`` was introduced last round precisely because
+    ``int()`` is looser than RFC 7230 §3.3.2 — and then it was handed
+    ``value.strip()``. Bare ``str.strip()`` removes Python's whitespace
+    set, which is not HTTP's OWS (SP and HTAB, §3.2.3): it also eats
+    \x0b \x0c \x1c \x1d \x1e \x1f \x85 and \xa0. So
+    ``Content-Length: 5\x0b`` framed five octets and kept the connection,
+    while the sibling rule that then lived in the same process
+    (C10's ``_sup_framing_is_unreadable``, which stripped " \t")
+    refused the identical bytes. That sibling is gone now -- its token
+    check and its hard fold were folded into ``framing_verdict`` and the
+    method deleted -- which is what makes "the same bytes get one verdict"
+    structural rather than a coincidence two rules had to keep achieving. \xa0 is legal obs-text, so the header
+    LINE is well formed and nothing upstream rejects the message for us —
+    only its value is invalid, and RFC 7230 §3.3.3 rule 4 says an invalid
+    Content-Length is unrecoverable.
+
+    The sweep below is over all 256 octets rather than the eight that were
+    reported, because the question is which octets HTTP calls whitespace,
+    and the answer is two.
+    """
+
+    # NOTE ON THE SIBLING RULE, AND WHY THERE ISN'T ONE ANY MORE. C10 used
+    # to carry `_sup_framing_is_unreadable`, a second framing rule in the
+    # same process, and the note that used to stand here said C10 "may
+    # refuse MORE; it cannot accept an octet Layer 0 refuses". That was
+    # true and it was the problem: the two rules were incomparable, not
+    # nested. C10's hard fold reached 435 names C06's regex did not, so
+    # when framing was lifted into one shared function the LAXER of the two
+    # was the one exported -- to the operator GUI and the operator console,
+    # which had had no rule at all. Both halves are inside
+    # `framing_verdict` now and their union is the rule; C10 refuses
+    # exactly what Layer 0 refuses because it asks the same function.
+
+    SMUGGLE = b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+
+    def request_with(self, raw_length_value):
+        body = b'{"idempotency_key":"ows","inputs":[],"outputs":[]}'
+        return (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + raw_length_value + b"\r\n"
+            b"\r\n" + body + self.SMUGGLE
+        ), body
+
+    def test_only_sp_and_htab_are_whitespace_around_a_length(self):
+        """Every octet a value could end with, swept. CR and LF are left
+        out because they end the header line rather than sit inside it."""
+        mint = self.start_mint()
+        body_len = len(b'{"idempotency_key":"ows","inputs":[],"outputs":[]}')
+        for octet in range(256):
+            if octet in (0x0A, 0x0D):
+                continue
+            trailer = bytes([octet])
+            request, body = self.request_with(
+                b"%d" % body_len + trailer
+            )
+            with self.subTest(octet="0x%02x" % octet):
+                raw = raw_request(mint.port, request, shutdown_write=True,
+                                  timeout=8.0)
+                if octet in (0x20, 0x09):
+                    # Real OWS: the length is legal, so the body frames and
+                    # the pipelined GET behind it is answered. The guard is
+                    # not allowed to become a keep-alive tax.
+                    self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:600])
+                    self.assertIn(b"mint_id", raw)
+                else:
+                    status, headers, _ = parse_http(raw)
+                    self.assertEqual(status, 400, raw[:400])
+                    self.assertEqual(headers.get("connection"), "close",
+                                     raw[:400])
+                    self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+                    self.assertNotIn(b"mint_id", raw)
+
+    def test_leading_and_repeated_whitespace_is_read_the_same_way(self):
+        """OWS is allowed on both sides and in runs; the non-OWS octets are
+        refused on both sides too. Which side the octet sits on is not a
+        property anything in HTTP distinguishes."""
+        mint = self.start_mint()
+        body_len = len(b'{"idempotency_key":"ows","inputs":[],"outputs":[]}')
+        legal = [b" \t %d" % body_len, b"%d \t " % body_len,
+                 b"\t%d\t" % body_len]
+        illegal = [b"\x0b%d" % body_len, b"%d\x0b" % body_len,
+                   b"\xa0%d" % body_len, b"%d\xa0" % body_len,
+                   b"\x1e %d" % body_len, b"%d \x85" % body_len]
+        for value in legal:
+            with self.subTest(value=value):
+                request, _ = self.request_with(value)
+                raw = raw_request(mint.port, request, shutdown_write=True,
+                                  timeout=8.0)
+                self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:600])
+        for value in illegal:
+            with self.subTest(value=value):
+                request, _ = self.request_with(value)
+                raw = raw_request(mint.port, request, shutdown_write=True,
+                                  timeout=8.0)
+                status, headers, _ = parse_http(raw)
+                self.assertEqual(status, 400, raw[:400])
+                self.assertEqual(headers.get("connection"), "close",
+                                 raw[:400])
+
+    def test_the_two_framing_rules_in_this_process_agree(self):
+        """The disagreement is the defect, so the assertion is agreement.
+
+        C10 read the same socket in the same process with a rule of its
+        own that stripped " \t" with an explicit digit walk. If Layer 0
+        accepts an octet C10 refuses, the same wire bytes get two verdicts
+        depending on which route they were aimed at, and the half that is
+        laxer is the smuggleable one -- which is what happened, in the
+        other direction, on 435 header NAMES. There is one rule now and
+        this pins the octet half of it: the OWS strip stays HTTP's.
+        """
+        source = inspect.getsource(mintapi.framing_verdict)
+        self.assertIn('lengths[0].strip(" \\t")', source)
+        # The Python-defined strip is what reintroduced the looseness the
+        # digit pattern had just removed; it must not come back on the
+        # value the length is parsed from.
+        self.assertNotIn("lengths[0].strip()", source)
+        # And the arithmetic stays in ONE place, which is what makes the
+        # agreement structural rather than a coincidence two files have to
+        # keep re-achieving: C10 reaches this same method through
+        # `_body_framing_is_unreadable` instead of counting digits again.
+        # Asserted against C06's own source rather than C10's, so this test
+        # pins the property it owns and not another file's wording.
+        self.assertIn(
+            "_framed_body_length",
+            inspect.getsource(_Handler._body_framing_is_unreadable),
+        )
+        # ...and `_framed_body_length` is itself a delegation to the ONE
+        # exported rule, so "one arithmetic" is now a property of the whole
+        # repository and not only of this class: the GUI and the console
+        # call `framing_verdict` directly.
+        self.assertIn(
+            "framing_verdict(",
+            inspect.getsource(_Handler._framed_body_length),
+        )
+
+
+class TheHeaderBlockPreconditionIsThePropertyItClaimsTest(
+    MintHarness, unittest.TestCase
+):
+    """The precondition everything else in the framing rule rests on.
+
+    ``_framed_body_length`` documents its first clause as "a header block
+    this parser could not read WHOLE", and tested only ``defects``.
+    email's feedparser has a silent stop that records no defect at all: a
+    final header line beginning with ``From `` is unread-lined into the
+    message PAYLOAD and header parsing simply returns. The bytes are real,
+    they were never interpreted, and ``defects`` is empty — so the clause
+    passed and the socket was kept.
+
+    Not exploitable on its own today (a ``From `` line anywhere but last
+    raises MisplacedEnvelopeHeaderDefect), which is exactly why it is
+    worth closing now: the whole argument for the rest of the rule is that
+    this precondition is total, and a precondition that is only accidentally
+    total is one parser change away from not being. C10's sibling rule
+    already checked the payload; Layer 0 asking the weaker question is the
+    drift that puts two answers on one socket.
+    """
+
+    SMUGGLE = b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+
+    def test_bytes_the_header_parser_silently_stopped_on_close_the_socket(
+        self
+    ):
+        mint = self.start_mint()
+        for trailing in (b"From nobody\r\n",
+                         b"From nobody Sat Sep 13 00:00:00 2026\r\n",
+                         b"From \r\n"):
+            with self.subTest(trailing):
+                request = (
+                    b"POST /v3/exchange HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 0\r\n"
+                    + trailing + b"\r\n"
+                    b"3d\r\n" + b"A" * 61 + b"\r\n0\r\n\r\n"
+                ) + self.SMUGGLE
+                raw = raw_request(mint.port, request, timeout=8.0)
+                status, headers, _ = parse_http(raw)
+                self.assertEqual(status, 400, raw[:400])
+                self.assertEqual(headers.get("connection"), "close",
+                                 raw[:400])
+                self.assertEqual(raw.count(b"HTTP/1."), 1, raw[:400])
+                self.assertNotIn(b"mint_id", raw)
+
+    def test_the_precondition_asks_about_the_payload_as_well(self):
+        """Stated in the code, not only in behaviour: the next parser
+        change must fail this, not pass it by luck."""
+        source = inspect.getsource(mintapi.framing_verdict)
+        self.assertIn("headers.defects", source)
+        self.assertIn("get_payload()", source)
+
+    def test_an_ordinary_request_leaves_no_payload_and_keeps_alive(self):
+        """The precondition must not fire on well-formed traffic: a normal
+        request block has an empty payload, so this costs nothing."""
+        mint = self.start_mint()
+        body = json.dumps(
+            {"idempotency_key": "payload-ok", "inputs": [], "outputs": []}
+        ).encode()
+        request = (
+            b"POST /v3/exchange HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(body)
+            + body + self.SMUGGLE
+        )
+        raw = raw_request(mint.port, request, shutdown_write=True,
+                          timeout=8.0)
+        self.assertEqual(raw.count(b"HTTP/1."), 2, raw[:600])
+        self.assertIn(b"mint_id", raw)
+
+
+class ABodyTheDigestCannotRenderIsAnEnumeratedRejectionTest(
+    MintHarness, unittest.TestCase
+):
+    """D2, one converter over, over real HTTP.
+
+    D2's root cause was "the pattern admitted values the conversion could
+    not represent, and the conversion raised an error type the route does
+    not catch". ``/v3/exchange`` computes ``body_digest(body)`` inside an
+    ``except TokenError``, and two converters reachable from that one line
+    still raised something else:
+
+    * an unpaired surrogate anywhere in the body — ``json.loads`` decodes
+      the escape ``\\ud800`` happily, and ``str.encode("utf-8")`` then
+      raises ``UnicodeEncodeError``;
+    * a body nested a few hundred levels deep — ``json.loads`` survives it
+      (only ~50,000 levels reaches the RecursionError guard in the body
+      reader), and ``_canon``'s own recursion raises ``RecursionError``.
+
+    Both produced the byte-identical original symptom from an anonymous
+    caller: HTTP 500, ``{"status":"error"}``, no errors list, no §3.8
+    reason. C01 now refuses both as ``TokenError``; these tests assert the
+    wire answer, because the wire answer is what the reporter saw.
+    """
+
+    def post_raw(self, port, body, path="/v3/exchange"):
+        status, raw, headers = http_raw(
+            port, "POST", path, body,
+            {"Content-Type": "application/json"},
+        )
+        return status, json.loads(raw.decode("utf-8"))
+
+    def assert_enumerated_rejection(self, port, body, path="/v3/exchange"):
+        status, parsed = self.post_raw(port, body, path)
+        self.assertEqual(status, 400, parsed)
+        self.assertEqual(parsed["status"], "rejected", parsed)
+        self.assertEqual(parsed["errors"][0]["reason"], "bad_format", parsed)
+        self.assertNotEqual(parsed.get("status"), "error")
+
+    def test_an_unpaired_surrogate_anywhere_in_the_body_is_bad_format(self):
+        mint = self.start_mint()
+        bodies = {
+            "idempotency_key":
+                b'{"idempotency_key":"\\ud800","inputs":[],"outputs":[]}',
+            "an extra top-level field":
+                b'{"idempotency_key":"s2","inputs":[],"outputs":[],'
+                b'"j":"\\udfff"}',
+            "an object key":
+                b'{"idempotency_key":"s3","inputs":[],"outputs":[],'
+                b'"\\ud800":1}',
+            "an input string":
+                b'{"idempotency_key":"s5","inputs":["\\ud800"],'
+                b'"outputs":[]}',
+            "nested inside an extra field":
+                b'{"idempotency_key":"s7","inputs":[],"outputs":[],'
+                b'"p":{"q":[{"r":"\\udc00"}]}}',
+            "the low end of the block":
+                b'{"idempotency_key":"s8","inputs":[],"outputs":[],'
+                b'"j":"\\udc00"}',
+        }
+        for name, body in bodies.items():
+            with self.subTest(name):
+                self.assert_enumerated_rejection(mint.port, body)
+
+    def test_a_legal_surrogate_pair_is_still_an_ordinary_call(self):
+        """The rejection is about MALFORMED input. An escaped PAIR is a
+        legal spelling of an astral character and must pay normally."""
+        mint = self.start_mint()
+        secret = new_secret()
+        self.issue(mint, 1_000, secret)
+        status, parsed = self.post_raw(
+            mint.port,
+            json.dumps({
+                "idempotency_key": "emoji-\U0001F600",
+                "inputs": [tok(1_000, secret)],
+                "outputs": [out_hash(990, new_secret())],
+            }).encode("utf-8"),
+        )
+        self.assertEqual(status, 200, parsed)
+
+    def test_a_deeply_nested_body_is_bad_format_not_an_internal_error(self):
+        """The reported window was 500-2000 levels — deep enough that
+        ``json.loads`` succeeds and shallow enough that the body reader's
+        RecursionError guard never fires. Swept across and past it."""
+        mint = self.start_mint()
+        for depth in (150, 400, 500, 600, 1_000, 2_000, 5_000):
+            with self.subTest(depth=depth):
+                body = (
+                    b'{"idempotency_key":"d%d","inputs":[],"outputs":[],'
+                    b'"p":' % depth
+                    + b"[" * depth + b"1" + b"]" * depth + b"}"
+                )
+                self.assert_enumerated_rejection(mint.port, body)
+
+    def test_the_depth_sweep_has_no_gap_that_answers_500(self):
+        """The defect was a WINDOW between two guards, so the assertion is
+        over a range rather than at a point: every depth from shallow to
+        past the old json.loads limit answers with a §3.8 reason."""
+        mint = self.start_mint()
+        for depth in list(range(1, 12)) + [50, 99, 100, 101, 250, 3_000,
+                                           20_000, 60_000]:
+            with self.subTest(depth=depth):
+                body = (
+                    b'{"idempotency_key":"g%d","inputs":[],"outputs":[],'
+                    b'"p":' % depth
+                    + b"[" * depth + b"1" + b"]" * depth + b"}"
+                )
+                status, parsed = self.post_raw(mint.port, body)
+                self.assertNotEqual(status, 500, (depth, parsed))
+                self.assertIn(status, (200, 400), (depth, parsed))
+
+    def test_nothing_in_the_sweep_reaches_the_500_handler(self):
+        """The handler that produces ``{"status":"error"}`` exists for
+        genuine internal faults; a malformed anonymous body is not one, and
+        the reporter's evidence was that exact object."""
+        mint = self.start_mint()
+        hostile = [
+            b'{"idempotency_key":"\\ud800","inputs":[],"outputs":[]}',
+            b'{"idempotency_key":"z","inputs":[],"outputs":[],'
+            b'"p":' + b"[" * 900 + b"1" + b"]" * 900 + b"}",
+            b'{"idempotency_key":"z2","inputs":[],"outputs":[],'
+            b'"n":' + b"9" * 5_000 + b"}",
+            b'{"idempotency_key":"z3","inputs":[],"outputs":[],"f":1.5}',
+        ]
+        for body in hostile:
+            with self.subTest(body[:48]):
+                status, parsed = self.post_raw(mint.port, body)
+                self.assertNotEqual(status, 500, parsed)
+                self.assertNotEqual(parsed.get("status"), "error", parsed)
+
+    def test_the_same_bodies_are_answered_on_the_other_layer_0_routes(self):
+        """A converter defect is not a property of one route. /v3/status
+        and /admin/issue read bodies off the same socket and must not turn
+        a malformed one into an unenumerated 500 either."""
+        mint = self.start_mint()
+        deep = b"[" * 900 + b"1" + b"]" * 900
+        for path, body in (
+            ("/v3/status", b'{"hashes":["\\ud800"]}'),
+            ("/v3/status", b'{"hashes":' + deep + b"}"),
+            ("/admin/issue",
+             b'{"outputs":[{"amount_mc":1,"secret_hash":"\\ud800"}]}'),
+            ("/admin/issue", b'{"outputs":' + deep + b"}"),
+        ):
+            with self.subTest(path=path, body=body[:40]):
+                status, raw, _ = http_raw(
+                    mint.port, "POST", path, body,
+                    {"Content-Type": "application/json",
+                     "X-Admin-Token": mint.config.admin_token},
+                )
+                parsed = json.loads(raw.decode("utf-8"))
+                self.assertNotEqual(status, 500, parsed)
+                self.assertNotEqual(parsed.get("status"), "error", parsed)
+
+    def test_the_mint_still_serves_after_every_refusal(self):
+        """A refusal is not a wound."""
+        mint = self.start_mint()
+        self.post_raw(
+            mint.port,
+            b'{"idempotency_key":"\\ud800","inputs":[],"outputs":[]}',
+        )
+        status, desc, _ = http_json(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200)
+        self.assertEqual(desc["mint_id"], MINT_ID)
+
+
+class AnOversizedAmountIsBadFormatInEveryFieldTest(
+    MintHarness, unittest.TestCase
+):
+    """D2's variation: the same 5,000 digits, one field over.
+
+    The first fix widened the exception handling at the JSON reader, which
+    covers every shape where the digits sit in a JSON NUMBER — the reported
+    output ``amount_mc`` among them. Move them into the INPUT TOKEN's amount
+    and they are a JSON STRING: ``json.loads`` is perfectly happy, and the
+    bare ValueError comes out of ``int()`` inside ``parse_token`` instead,
+    past every ``except TokenError`` on the route, to the generic 500 with
+    an empty error list — byte-identical to the behaviour the fix was
+    supposed to have removed.
+
+    Fixed in C01 where the type discipline breaks (``_AMOUNT_RE`` is now
+    length-bounded and the module states its own ``MAX_AMOUNT_MC``), so
+    every caller of that parser is covered rather than this one route.
+    These tests check the route, because the route is where the 500 was.
+    """
+
+    SECRET_B64U = "A" * 43
+
+    def token_with_amount(self, digits, mint_id=MINT_ID):
+        return "aicash:v3:%s:%s:%s" % (mint_id, digits, self.SECRET_B64U)
+
+    def assert_enumerated_rejection(self, mint, body, *, kind=None):
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", body,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400, raw[:200])
+        parsed = json.loads(raw.decode("utf-8"))
+        self.assertEqual(parsed["status"], "rejected", parsed)
+        self.assertTrue(parsed["errors"], "a 500 answers no reason at all")
+        for err in parsed["errors"]:
+            self.assertEqual(err["reason"], "bad_format", parsed)
+            if kind is not None:
+                self.assertEqual(err["kind"], kind, parsed)
+        self.assertNotIn(b"Traceback", raw)
+        return parsed
+
+    def test_the_reported_variation_an_input_tokens_amount(self):
+        """5,000 digits in the INPUT token's amount. Before this round:
+        HTTP 500, ``{"status": "error"}``, no errors list at all."""
+        mint = self.start_mint()
+        body = json.dumps({
+            "idempotency_key": "in-big",
+            "inputs": [self.token_with_amount("1" * 5_000)],
+            "outputs": [],
+        }).encode()
+        self.assert_enumerated_rejection(mint, body, kind="input")
+
+    def test_every_input_form_that_carries_a_token(self):
+        """§3.3 has two token-bearing input forms and the claim form parses
+        its token by the same call. A fix at one form is the same mistake
+        one level down."""
+        mint = self.start_mint()
+        digits = "1" * 5_000
+        forms = {
+            "plain string": self.token_with_amount(digits),
+            "claim form": {"token": self.token_with_amount(digits),
+                           "witness": b64u_encode(b"\x00" * 32)},
+        }
+        for name, form in forms.items():
+            with self.subTest(name):
+                body = json.dumps({
+                    "idempotency_key": "form-%s" % name.replace(" ", "-"),
+                    "inputs": [form],
+                    "outputs": [],
+                }).encode()
+                self.assert_enumerated_rejection(mint, body, kind="input")
+
+    def test_every_length_of_digit_run_in_an_input_token(self):
+        """The boundary must be the protocol's bound, not the interpreter's.
+        4,299 digits gave a clean refusal before the fix and 5,000 gave a
+        500; every length now gives the same enumerated reason, and so does
+        a 20-digit amount that fits in a JSON number but not in a ledger
+        column."""
+        mint = self.start_mint()
+        lengths = (20, 25, 100, 4_299, 4_300, 4_301, 5_000, 20_000)
+        for digits in lengths:
+            with self.subTest(digits=digits):
+                body = json.dumps({
+                    "idempotency_key": "len-%d" % digits,
+                    "inputs": [self.token_with_amount("9" * digits)],
+                    "outputs": [],
+                }).encode()
+                self.assert_enumerated_rejection(mint, body, kind="input")
+
+    def test_an_amount_that_fits_the_ledger_is_still_an_ordinary_amount(self):
+        """The bound is 2**63-1 because that is what the entries column
+        holds. An unspent token for that amount is not malformed; it is
+        simply unknown to this mint, and must answer so."""
+        mint = self.start_mint()
+        biggest = (1 << 63) - 1
+        body = json.dumps({
+            "idempotency_key": "in-max",
+            "inputs": [self.token_with_amount(str(biggest))],
+            "outputs": [],
+        }).encode()
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange", body,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        errors = json.loads(raw.decode("utf-8"))["errors"]
+        self.assertEqual([e["reason"] for e in errors], ["unknown"])
+
+    def test_the_digits_in_a_status_lookup_hash_and_in_the_output_field(self):
+        """The neighbouring fields on the neighbouring routes, checked
+        because the last fix passed its tests and failed this question."""
+        mint = self.start_mint()
+        digits = b"1" * 5_000
+        # The output amount_mc: the LITERAL the first fix closed. Still
+        # closed, and now closed in C01 as well as at the JSON reader.
+        self.assert_enumerated_rejection(
+            mint,
+            b'{"idempotency_key":"out","inputs":[],"outputs":'
+            b'[{"amount_mc":' + digits + b',"secret_hash":"x"}]}',
+            kind="call",
+        )
+        # A batch status lookup takes hashes, not amounts, but it is the
+        # other route that reads a body off this socket.
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/status",
+            b'{"hashes":[' + b'"' + digits + b'"]}',
+            {"Content-Type": "application/json"},
+        )
+        self.assertIn(status, (200, 400), raw[:200])
+        self.assertNotIn(b"Traceback", raw)
+        self.assertNotIn(b'"status":"error"', raw)
+
+    def test_no_body_carrying_those_digits_ever_answers_a_bare_500(self):
+        """The class assertion at the HTTP surface: sweep the digits through
+        every field of the envelope that a §3.8 reason could attach to, and
+        assert no request answers 500 with an empty error list."""
+        mint = self.start_mint()
+        digits = "1" * 5_000
+        tok_big = self.token_with_amount(digits)
+        bodies = [
+            {"idempotency_key": "s1", "inputs": [tok_big], "outputs": []},
+            {"idempotency_key": "s2",
+             "inputs": [{"token": tok_big, "witness": "AA"}], "outputs": []},
+            {"idempotency_key": "s3", "inputs": [tok_big, tok_big],
+             "outputs": []},
+            {"idempotency_key": "s4", "inputs": [],
+             "outputs": [{"amount_mc": 1, "secret_hash": digits}]},
+            {"idempotency_key": digits[:64], "inputs": [], "outputs": []},
+            {"idempotency_key": "s6",
+             "inputs": [self.token_with_amount(digits, mint_id="other")],
+             "outputs": []},
+        ]
+        for i, body in enumerate(bodies):
+            with self.subTest(i=i):
+                status, raw, _ = http_raw(
+                    mint.port, "POST", "/v3/exchange",
+                    json.dumps(body).encode(),
+                    {"Content-Type": "application/json"},
+                )
+                self.assertNotEqual(status, 500, raw[:200])
+                self.assertNotIn(b'"status":"error"', raw)
+                self.assertNotIn(b"Traceback", raw)
+
+
 class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
     """max_batch is PUBLISHED; MAX_BODY_BYTES is not — so they must agree.
 
@@ -2112,15 +4116,27 @@ class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
         forgotten or quietly claimed shut.
 
         §3.1 pins an amount's FORM but not its LENGTH, so an output with a
-        1000-digit amount is an entry the mint READS — it answers
-        `amount_mismatch`, a call-level arithmetic complaint, not the
-        `bad_format` it gives an entry it cannot parse — at nearly 3x
-        _FAT_ENTRY_BYTES. So max_batch entries of this shape still exceed
-        the body cap at a max_batch the ceiling admits: the cross-check
-        narrows that, it does not close it. Closing it needs an amount
-        length bound in C01, which is protocol, not deployment config.
-        If that bound ever lands, this test fails and _FAT_ENTRY_BYTES can
-        be promoted from an allowance to a real upper bound.
+        1000-digit amount is an entry the mint READS — it answers at THIS
+        ENTRY'S INDEX, which is only possible for a body it parsed, rather
+        than refusing the whole call — at nearly 3x _FAT_ENTRY_BYTES. So
+        max_batch entries of this shape still exceed the body cap at a
+        max_batch the ceiling admits: the cross-check narrows that, it
+        does not close it. Closing it needs an amount length bound in C01,
+        which is protocol, not deployment config. If that bound ever
+        lands, this test fails and _FAT_ENTRY_BYTES can be promoted from
+        an allowance to a real upper bound.
+
+        The per-index REASON changed this round and the hole did not. C04
+        now bounds an output amount to what its sqlite column holds (a
+        1000-digit amount does not fit), so this entry is `bad_format` at
+        index 0 where it used to be `amount_mismatch` at call level. That
+        is a VALUE bound in C04, not the LENGTH bound in C01 the paragraph
+        above is waiting for: the entry is still one a caller can put in a
+        body, still parsed, still enumerated per index, and still fatter
+        than the allowance — so the arithmetic this class checks is
+        untouched. The assertions below therefore pin the property that
+        actually matters here (read, and answered per index) and no longer
+        lean on which money rule does the refusing.
         """
         entry = {"amount_mc": int("9" * 1000), "secret_hash": self.big()}
         self.assertGreater(len(canonical_json(entry)), _FAT_ENTRY_BYTES)
@@ -2136,11 +4152,14 @@ class MaxBatchFitsTheBodyCapTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 400, body)
-        reasons = {e["reason"] for e in body["errors"]}
-        # Parsed, and complained about the ARITHMETIC: a bad_format here
-        # would mean the mint rejects the shape and the entry is not one a
-        # caller can actually put in a body.
-        self.assertEqual(reasons, {"amount_mismatch"}, body)
+        # Parsed, and judged AT ITS INDEX. A call-level error with a null
+        # index would mean the mint refused the body whole and the entry
+        # is not one a caller can actually put in a body — which is the
+        # thing this class's arithmetic would then be excused from.
+        self.assertEqual(len(body["errors"]), 1, body)
+        self.assertEqual(body["errors"][0]["kind"], "output", body)
+        self.assertEqual(body["errors"][0]["index"], 0, body)
+        self.assertEqual(body["errors"][0]["reason"], "bad_format", body)
 
     def test_the_largest_accepted_max_batch_actually_fits(self):
         """The ceiling is not merely arithmetic: a real request at exactly
@@ -3328,6 +5347,1644 @@ class DescriptorCompletenessTest(MintHarness, unittest.TestCase):
             "lock_params", "retention", "profiles", "activity",
         ):
             self.assertIn(key, desc, key)
+
+
+# ======================================================================== #
+# JOB 1 — the framing rule is ONE exported function, and the mint's own    #
+# handlers are among its callers.                                          #
+# ======================================================================== #
+
+
+class TheFramingRuleIsOneSharedFunctionTest(MintHarness, unittest.TestCase):
+    """The defect this class exists for is not a framing defect.
+
+    It is the third time in this repository that a defect was fixed where
+    it was found while its siblings sat untouched. The framing rule was
+    fixed in the mint for ONE spelling, fixed again properly against the
+    class, and the two other HTTP servers in the same tree kept the broken
+    version: nineteen of twenty-five spellings still framed a body on the
+    operator GUI, on every POST route AND on its GET routes.
+
+    So the rule is now ``aicash.mintapi.framing_verdict`` — public,
+    importable, and called by all four servers. These tests assert the
+    property that makes that structural rather than aspirational: THE
+    MINT'S OWN HANDLERS GO THROUGH IT. Written against the exported
+    function's observed CALLS, not against anybody's source text, so an
+    internal refactor (a new private helper, a different override point, a
+    renamed method) keeps passing and a handler that grows its own private
+    copy of the rule fails — which is the only failure mode worth a test
+    here.
+    """
+
+    def install_recorder(self):
+        """Replace the module global with a recording pass-through.
+
+        Returns the list it records into. Restored on cleanup. The
+        replacement must be looked up as a module global at CALL time for
+        this to see anything, which is itself part of what is asserted: a
+        handler holding its own bound copy records nothing.
+        """
+        calls = []
+        real = mintapi.framing_verdict
+
+        def recorder(headers, **kwargs):
+            verdict = real(headers, **kwargs)
+            calls.append(
+                {
+                    "probe": headers.get("X-Framing-Probe"),
+                    "kwargs": kwargs,
+                    "verdict": verdict,
+                }
+            )
+            return verdict
+
+        mintapi.framing_verdict = recorder
+        self.addCleanup(setattr, mintapi, "framing_verdict", real)
+        return calls
+
+    def probe(self, port, method, path, probe, extra=b"", body=b""):
+        """One hand-built request carrying a unique probe header."""
+        request = (
+            ("%s %s HTTP/1.1\r\n" % (method, path)).encode("ascii")
+            + b"Host: 127.0.0.1\r\n"
+            + b"X-Framing-Probe: " + probe.encode("ascii") + b"\r\n"
+            + extra
+            + b"Content-Length: %d\r\n" % len(body)
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        return raw_request(port, request, timeout=8.0)
+
+    # -- the handlers are callers ---------------------------------------
+
+    def test_the_post_handler_routes_through_the_exported_function(self):
+        """A real POST /v3/exchange, and the exported rule saw THIS
+        request's headers. The probe header is what makes it this request
+        and not a coincidental call from somewhere else in the process."""
+        mint = self.start_mint()
+        calls = self.install_recorder()
+        body = json.dumps(
+            {"idempotency_key": "job1-post", "inputs": [], "outputs": []}
+        ).encode()
+        raw = self.probe(mint.port, "POST", "/v3/exchange", "post-1", body=body)
+        self.assertIn(b"200", raw.split(b"\r\n")[0], raw[:200])
+        seen = [c for c in calls if c["probe"] == "post-1"]
+        self.assertTrue(
+            seen,
+            "the POST body reader did not ask mintapi.framing_verdict:"
+            " a handler is deciding framing on its own again",
+        )
+        # The body-bearing question, which is the one whose default the
+        # whole class turns on.
+        self.assertTrue(
+            any(c["kwargs"].get("body_expected", True) for c in seen), seen
+        )
+
+    def test_the_get_handler_routes_through_the_exported_function(self):
+        """The GET guard too. It is the half an earlier round left behind:
+        a rule that only covers POST leaves every GET route smuggleable on
+        the same socket."""
+        mint = self.start_mint()
+        calls = self.install_recorder()
+        raw = self.probe(mint.port, "GET", "/v3/mints", "get-1")
+        self.assertIn(b"200", raw.split(b"\r\n")[0], raw[:200])
+        seen = [c for c in calls if c["probe"] == "get-1"]
+        self.assertTrue(
+            seen,
+            "the GET guard did not ask mintapi.framing_verdict:"
+            " a handler is deciding framing on its own again",
+        )
+        self.assertTrue(
+            any(c["kwargs"].get("body_expected") is False for c in seen),
+            seen,
+        )
+
+    def test_every_route_on_this_server_asks_it(self):
+        """Not two handlers: every route. A route that answers without
+        asking is a route with its own framing rule, whatever its source
+        looks like."""
+        mint = self.start_mint()
+        calls = self.install_recorder()
+        routes = [
+            ("POST", "/v3/exchange",
+             b'{"idempotency_key":"j1","inputs":[],"outputs":[]}'),
+            ("POST", "/v3/status", b'{"hashes":[]}'),
+            ("POST", "/admin/issue", b'{"outputs":[]}'),
+            ("GET", "/v3/mints", b""),
+            ("GET", "/v3/status/" + "A" * 43, b""),
+            ("GET", "/nope", b""),
+            ("POST", "/nope", b'{}'),
+        ]
+        for i, (method, path, body) in enumerate(routes):
+            with self.subTest(route=path, method=method):
+                tag = "r%d" % i
+                self.probe(mint.port, method, path, tag, body=body)
+                self.assertTrue(
+                    [c for c in calls if c["probe"] == tag],
+                    "%s %s answered without asking framing_verdict" % (
+                        method, path),
+                )
+
+    # -- what the function may and may not carry -------------------------
+
+    def test_the_verdict_carries_the_pinned_fields_and_no_http(self):
+        """The contract its four callers share. It decides FRAMING: no
+        status codes, no error envelopes, because the mint answers §3.8
+        `bad_format`, the supervision profile answers its own shape, and
+        the two operator consoles answer theirs. A verdict carrying a
+        status would be usable by exactly one of them."""
+        message = email.parser.Parser().parsestr(
+            "Host: h\r\nContent-Length: 7\r\n\r\n"
+        )
+        verdict = mintapi.framing_verdict(message)
+        for field in ("length", "framed", "must_close", "reason"):
+            self.assertTrue(hasattr(verdict, field), field)
+        self.assertEqual(verdict.length, 7)
+        self.assertIs(verdict.framed, True)
+        self.assertIs(verdict.must_close, False)
+        self.assertIsInstance(verdict.reason, str)
+        self.assertIn(verdict.reason, mintapi.FRAMING_REASONS)
+        # No HTTP anywhere in it: no int that could be read as a status,
+        # no "errors" list, no "status" key.
+        values = [getattr(verdict, f) for f in dir(verdict)
+                  if not f.startswith("_")]
+        for value in values:
+            self.assertNotIsInstance(value, (list, dict))
+        self.assertFalse(hasattr(verdict, "status"))
+        self.assertFalse(hasattr(verdict, "errors"))
+        self.assertFalse(hasattr(verdict, "code"))
+
+    def test_the_pinned_call_shape_works_with_one_argument(self):
+        """`framing_verdict(headers)` is the pinned spelling, so the
+        body-expecting verdict has to be the DEFAULT — a caller that
+        forgets the keyword must get the strict answer, never the lax
+        one."""
+        signature = inspect.signature(mintapi.framing_verdict)
+        self.assertEqual(
+            [p for p in signature.parameters], ["headers", "body_expected"]
+        )
+        self.assertIs(
+            signature.parameters["body_expected"].default, True
+        )
+        self.assertIs(
+            signature.parameters["body_expected"].kind,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        no_length = email.parser.Parser().parsestr("Host: h\r\n\r\n")
+        self.assertIs(mintapi.framing_verdict(no_length).framed, False)
+
+    def test_length_and_framed_are_the_same_fact(self):
+        """`length is None` iff `not framed`, on every verdict this rule
+        can produce. A caller that reads one and a caller that reads the
+        other must never disagree — that disagreement is what the two
+        halves of the mint had."""
+        for raw_headers in (
+            "Host: h\r\n\r\n",
+            "Host: h\r\nContent-Length: 0\r\n\r\n",
+            "Host: h\r\nContent-Length: 12\r\n\r\n",
+            "Host: h\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            "Host: h\r\nContent-Length: +5\r\n\r\n",
+            "Host: h\r\nTransfer_Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+            "Host: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "Host: h\r\nContent-Length : 5\r\n\r\n",
+        ):
+            for expected in (True, False):
+                with self.subTest(headers=raw_headers, body=expected):
+                    message = email.parser.Parser().parsestr(raw_headers)
+                    v = mintapi.framing_verdict(
+                        message, body_expected=expected
+                    )
+                    self.assertIs(v.framed, v.length is not None, v)
+                    self.assertIn(v.reason, mintapi.FRAMING_REASONS, v)
+                    if not v.framed:
+                        self.assertIs(v.must_close, True, v)
+
+    def test_must_close_is_what_the_mint_actually_does(self):
+        """`must_close` is the field the other three servers act on, so it
+        has to agree with the mint's own wire behaviour rather than merely
+        exist. Driven over a socket: the connection header the mint sends
+        IS the assertion."""
+        mint = self.start_mint()
+        cases = [
+            # (method, path, extra headers, body, probe)
+            ("GET", "/v3/mints", b"", b""),
+            ("GET", "/v3/mints", b"Content-Length: 4\r\n", b"junk"),
+            ("GET", "/v3/mints", b"Transfer-Encoding: chunked\r\n", b""),
+            ("GET", "/v3/mints", b"Content_Length: 4\r\n", b""),
+            ("GET", "/v3/mints",
+             b"Content-Length: 0\r\nContent-Length: 0\r\n", b""),
+        ]
+        for i, (method, path, extra, body) in enumerate(cases):
+            with self.subTest(extra=extra):
+                request = (
+                    ("%s %s HTTP/1.1\r\n" % (method, path)).encode("ascii")
+                    + b"Host: 127.0.0.1\r\n" + extra + b"\r\n" + body
+                )
+                message = email.parser.Parser().parsestr(
+                    (b"Host: 127.0.0.1\r\n" + extra + b"\r\n"
+                     ).decode("latin-1")
+                )
+                verdict = mintapi.framing_verdict(
+                    message, body_expected=False
+                )
+                raw = raw_request(mint.port, request, shutdown_write=True,
+                                  timeout=8.0)
+                _, headers, _ = parse_http(raw)
+                closed = headers.get("connection") == "close"
+                self.assertIs(
+                    closed, verdict.must_close,
+                    "verdict %r vs wire %r" % (verdict, headers),
+                )
+
+    # -- and it is exported the way the other integrator names are -------
+
+    def test_the_rule_is_on_the_package_root(self):
+        """Three other servers import it. A rule that can only be reached
+        by reaching into a private method of a private handler class is a
+        rule that gets copied instead, which is the whole history here."""
+        import aicash
+
+        self.assertIn("framing_verdict", mintapi.__all__)
+        self.assertIn("FramingVerdict", mintapi.__all__)
+        self.assertIn("FRAMING_REASONS", mintapi.__all__)
+        self.assertIs(aicash.framing_verdict, mintapi.framing_verdict)
+        self.assertIs(aicash.FramingVerdict, mintapi.FramingVerdict)
+        ns = {}
+        exec("from aicash.mintapi import framing_verdict", ns)
+        self.assertIs(ns["framing_verdict"], mintapi.framing_verdict)
+
+    #: Every RFC 7230 ``tchar``. The corpus below is BUILT from these
+    #: rather than listed, for the reason the rule itself is: a list of bad
+    #: spellings is what was wrong the first two times, and the third time
+    #: it was a list of bad spellings wearing a regex.
+    TCHAR = ("!#$%&'*+-.^_`|~0123456789"
+             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    #: The tchars that are SEPARATORS — punctuation, i.e. every tchar that
+    #: is not alphanumeric. This is the axis along which other software
+    #: rewrites a field name (``_``/``-`` through CGI and WSGI, doubling,
+    #: stripping), so a framing name wearing one of these anywhere folds
+    #: back onto the framing name for somebody and must be refused here.
+    #: Alphanumerics are deliberately NOT on this axis at insertion
+    #: positions: ``Content-Length2`` and ``0Content-Length`` are different
+    #: field names, not renamings, and refusing them would mean refusing
+    #: ``X-Content-Length`` too — see
+    #: ``test_the_rule_does_not_refuse_ordinary_traffic``.
+    SEPARATORS = "!#$%&'*+-.^_`|~"
+
+    #: Characters a header NAME may not contain at all (RFC 7230 §3.2.6).
+    #: A name carrying one is either refused as a non-token or never
+    #: reaches the loop because the parser recorded a defect; both are
+    #: unframable, and which one fires is not the assertion.
+    NON_TOKEN = ';"(),/<=>?@[\\]{} \t'
+
+    def mechanical_confusions(self):
+        """Every mechanical renaming of a framing header name, generated.
+
+        THIS IS THE SWEEP THAT WAS MISSING. The corpus this class shipped
+        with was nineteen names and every one of them was a separator
+        SUBSTITUTION at the hyphen — the one axis
+        ``_FRAMING_CONFUSABLE_RE`` can express. So it could not see that
+        435 other names (``Content-Length;``, ``Transfer-Encoding.``,
+        ``Con-tent-Length``, ``Content-Length-``, ``_Transfer-Encoding``)
+        fell out of that pattern entirely and were neither read as a
+        length nor refused: they were IGNORED, on every mint route
+        including anonymous GETs, and the mint's own access log showed the
+        unread octets framed as the next request line — the original
+        report's symptom, reproduced through the rule that was supposed to
+        have closed it. The Supervision Profile refused all 435 with a
+        rule that lived twenty feet away in the same repository.
+
+        Four generators, one per way a name gets rewritten:
+
+        * a separator PREPENDED or APPENDED (``_Transfer-Encoding``,
+          ``Content-Length-``);
+        * a separator INSERTED at any interior position
+          (``Con-tent-Length``, ``Trans-fer-Encoding``);
+        * the hyphen SUBSTITUTED by any single tchar, removed, doubled, or
+          replaced by a pair (``Transfer_Encoding``, ``Transfer0Encoding``,
+          ``TransferEncoding``, ``Content--Length``, ``Content_.Length``);
+        * a NON-TOKEN character in any of those positions
+          (``Content-Length;``, ``Transfer"Encoding``).
+
+        A corpus generated from the grammar cannot have the shape of hole
+        the hand-written one had: it does not know which axis the
+        implementation happens to cover.
+        """
+        names = set()
+        for base in ("Content-Length", "Transfer-Encoding"):
+            hyphen = base.index("-")
+            for c in self.SEPARATORS:
+                names.add(c + base)
+                names.add(base + c)
+                for i in range(1, len(base)):
+                    names.add(base[:i] + c + base[i:])
+            for c in self.TCHAR:
+                names.add(base[:hyphen] + c + base[hyphen + 1:])
+            names.add(base.replace("-", ""))
+            names.add(base.replace("-", "--"))
+            names.add(base.replace("-", "_."))
+            for c in self.NON_TOKEN:
+                names.add(c + base)
+                names.add(base + c)
+                names.add(base[:hyphen] + c + base[hyphen + 1:])
+        return sorted(names)
+
+    def test_every_mechanical_confusion_of_a_framing_name_is_refused(self):
+        """Seven hundred and fifty-nine generated names, and not one of
+        them may frame a body.
+
+        Each is parsed in a real header block beside an honest
+        ``Content-Length: 0`` — the case where no other clause can help,
+        because there is nothing wrong with the length. A name the parser
+        itself cannot read (it lands in defects or in the payload) is
+        unframable for that reason and still counts; what must never
+        happen is ``framed=True`` with the connection kept.
+        """
+        corpus = self.mechanical_confusions()
+        self.assertGreater(len(corpus), 700, "the generator stopped working")
+        kept = []
+        for name in corpus:
+            message = email.parser.Parser().parsestr(
+                "Host: h\r\n%s: chunked\r\nContent-Length: 0\r\n\r\n" % name
+            )
+            for expected in (True, False):
+                verdict = mintapi.framing_verdict(
+                    message, body_expected=expected
+                )
+                if verdict.framed or not verdict.must_close:
+                    kept.append((name, expected, verdict.reason))
+        self.assertEqual(
+            kept[:12], [],
+            "%d of %d generated spellings still frame a body"
+            % (len(kept), 2 * len(corpus)),
+        )
+
+    def test_the_rule_does_not_refuse_ordinary_traffic(self):
+        """The bound on the generator above. "Refuse everything" passes
+        every confusion test ever written, so the over-refusal cost is
+        asserted here and the two tests are read together.
+
+        A header that merely CONTAINS a framing word, an ordinary vendor
+        extension, and a name whose only oddity is an alphanumeric all
+        keep their keep-alive. ``X-Content-Length`` is the one that
+        matters: it is why the fold keeps alphanumerics, and therefore why
+        ``0Content-Length`` and ``Content-Length2`` are framed rather than
+        refused. Those are different field names; no front end renames a
+        header by inserting a digit, and refusing them would cost real
+        traffic for no reduction in the confusion class.
+        """
+        for innocent in ("Content-Type", "Content-Encoding",
+                         "Accept-Encoding", "X-Transfer-Encoding",
+                         "X-Content-Length", "Content-Length-Hint",
+                         "Content-Language", "Content-Disposition",
+                         "X-Trace-Id", "X-Underscored_Name",
+                         "0Content-Length", "Content-Length2",
+                         "User-Agent", "Authorization"):
+            with self.subTest(innocent=innocent):
+                message = email.parser.Parser().parsestr(
+                    "Host: h\r\n%s: x\r\n\r\n" % innocent
+                )
+                verdict = mintapi.framing_verdict(
+                    message, body_expected=False
+                )
+                self.assertIs(verdict.framed, True, verdict)
+                self.assertIs(verdict.must_close, False, verdict)
+
+    def test_the_twenty_five_spellings_reach_one_verdict(self):
+        """The sweep that found the siblings, run against the exported
+        rule so a fifth server inherits the answer instead of re-deriving
+        it. Every spelling of a framing header that another hop could read
+        must be unframable, and an innocent neighbour must not be.
+
+        The named half of the corpus. The generated half is
+        ``test_every_mechanical_confusion_of_a_framing_name_is_refused``
+        above; these are kept by name because each one was reported,
+        argued about, or fixed at some point and a named regression is
+        worth reading.
+        """
+        confusable = [
+            # The punctuation axis the regex could not express: a
+            # separator ADDED rather than substituted, at a position that
+            # is not the hyphen. All of these framed a body on the mint,
+            # the GUI and the console while the supervision profile
+            # refused them.
+            "Content-Length;", "Content-Length.", "Content-Length-",
+            "Content-Length_", "Content_Length_", "-Content-Length",
+            "_Content-Length", "Con-tent-Length", "ContentLength-",
+            "Transfer-Encoding;", "Transfer-Encoding.", "Transfer-Encoding_",
+            "Transfer-Encoding'", 'Transfer-Encoding"', "_Transfer-Encoding",
+            "Trans-fer-Encoding", "Transfer-Encod-ing", ".Transfer-Encoding",
+            "Transfer-Encoding", "transfer-encoding", "TRANSFER-ENCODING",
+            "Transfer_Encoding", "Transfer.Encoding", "TransferEncoding",
+            "Transfer__Encoding", "Transfer0Encoding", "transfer|encoding",
+            "Transfer--Encoding", "TRANSFER_ENCODING", "transfer.encoding",
+            "Content_Length", "Content.Length", "ContentLength",
+            "Content--Length", "content_length", "CONTENT_LENGTH",
+            "Content0Length",
+        ]
+        for name in confusable:
+            with self.subTest(name=name):
+                message = email.parser.Parser().parsestr(
+                    "Host: h\r\n%s: chunked\r\nContent-Length: 0\r\n\r\n"
+                    % name
+                )
+                for expected in (True, False):
+                    verdict = mintapi.framing_verdict(
+                        message, body_expected=expected
+                    )
+                    self.assertIs(verdict.framed, False, verdict)
+                    self.assertIs(verdict.must_close, True, verdict)
+        # Whitespace before the colon, which the parser drops entirely.
+        for name in ("Transfer-Encoding ", "Content-Length\t"):
+            with self.subTest(name=name):
+                message = email.parser.Parser().parsestr(
+                    "Host: h\r\n%s: 5\r\n\r\n" % name
+                )
+                self.assertIs(
+                    mintapi.framing_verdict(message).framed, False
+                )
+        # ...and the rule stays a rule about confusion. A genuinely
+        # different header keeps its keep-alive on a GET.
+        for innocent in ("Content-Type", "Content-Encoding",
+                         "Accept-Encoding", "X-Transfer-Encoding",
+                         "Content-Length-Hint", "User-Agent"):
+            with self.subTest(innocent=innocent):
+                message = email.parser.Parser().parsestr(
+                    "Host: h\r\n%s: x\r\n\r\n" % innocent
+                )
+                verdict = mintapi.framing_verdict(
+                    message, body_expected=False
+                )
+                self.assertIs(verdict.framed, True, verdict)
+                self.assertIs(verdict.must_close, False, verdict)
+
+
+# ======================================================================== #
+# JOB 1 (acceptance) — ALL FOUR SERVERS, IDENTICAL BYTES, ONE VERDICT      #
+# ======================================================================== #
+
+
+class FourServersOneFramingRuleTest(unittest.TestCase):
+    """The test the round was convened to produce, and the one that was
+    missing when it shipped.
+
+    There are four HTTP servers in this repository: the mint, the
+    supervision profile, the operator GUI and the older operator console.
+    Three times now a framing defect has been fixed where it was found
+    while its siblings sat untouched, and the third time the fix itself
+    was the vector: the rule that got promoted to
+    ``aicash.mintapi.framing_verdict`` was the NARROWER of the two rules
+    the repository already contained, so promoting it made the GUI and the
+    console — which previously had no rule at all — adopt one with a
+    435-name hole, while the supervision profile kept the wider rule
+    privately. "One rule everywhere" was true of the source and false of
+    the behaviour, and nothing in the suite could see the difference,
+    because the only cross-server test drove four inputs both sides
+    already refused.
+
+    So this drives all four servers over real sockets with byte-identical
+    requests and asserts they reach the same framing decision. It does not
+    assert they send the same RESPONSE: the mint answers §3.8
+    ``bad_format``, the supervision profile answers its own ``rejected``
+    shape, the GUI answers ``unframable_request`` and the console answers
+    ``bad_framing``. Three vocabularies, one decision — which is exactly
+    the split ``framing_verdict``'s contract draws.
+
+    A fifth server inherits this or fails it.
+    """
+
+    #: Names the shared rule must refuse, spanning BOTH axes it is built
+    #: from: separator substitution at the hyphen (which the regex half
+    #: covers) and an added, moved or misplaced separator anywhere else
+    #: (which only the fold half covers, and which nothing covered when
+    #: this round shipped).
+    REFUSED = (
+        "Transfer-Encoding", "Transfer_Encoding", "Transfer.Encoding",
+        "Transfer0Encoding", "TransferEncoding",
+        "Transfer-Encoding.", "Transfer-Encoding;", "Transfer-Encoding_",
+        "_Transfer-Encoding", "Trans-fer-Encoding",
+        "Content_Length", "Content--Length", "Content0Length",
+        "Content-Length;", "Content-Length-", "Con-tent-Length",
+        "-Content-Length",
+    )
+
+    #: ...and names it must NOT refuse, so "refuse everything" cannot pass.
+    #: Asserted by the ABSENCE of each server's own framing word, because
+    #: the four disagree about keep-alive on a 404 for reasons that have
+    #: nothing to do with framing.
+    INNOCENT = (
+        "Content-Type", "Content-Encoding", "X-Content-Length",
+        "Content-Length-Hint", "X-Trace-Id", "X-Underscored_Name",
+    )
+
+    #: Every word one of the four servers puts in a body when IT decides a
+    #: request is unframable. Three vocabularies; the union is what "this
+    #: server refused the framing" looks like from the wire.
+    FRAMING_WORDS = (b"bad_format", b"unframable_request", b"bad_framing")
+
+    # -- the four servers, started for real ------------------------------
+
+    def load_operator_servers(self):
+        """Import the GUI and the console, which live above ``impl/``.
+
+        Deliberately a hard failure rather than a skip. A cross-server
+        acceptance test that quietly does not run is worse than no test:
+        it is the same false assurance that let 435 spellings through.
+        """
+        import sys
+        repo = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        try:
+            import gui.app as gui_app
+            import mint_console
+        except Exception as exc:          # pragma: no cover - diagnostic
+            self.fail(
+                "the operator GUI and console could not be imported from %r,"
+                " so this acceptance test cannot drive all four servers: %r"
+                % (repo, exc)
+            )
+        return gui_app, mint_console
+
+    def build_mint(self, cls):
+        from aicash.supervision import SupervisionServer  # noqa: F401
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        priv, pub = generate_keypair()
+        ledger = Ledger(
+            os.path.join(tmp.name, "ledger.sqlite3"),
+            FakeClock(T0),
+            POLICY,
+            recovery_window_ms=90 * DAY_MS,
+            max_lock_expiry_ms=30 * DAY_MS,
+        )
+        config = MintConfig(
+            mint_id=MINT_ID,
+            baseline_model_class="frontier-2026",
+            burn_policy=POLICY,
+            signing_private=priv,
+            signing_public=pub,
+            profiles=(),
+            admin_token=HARNESS_ADMIN_TOKEN,
+        )
+        server = cls(config, ledger)
+        port = server.start()
+        self.addCleanup(server.stop)
+        return port
+
+    def start_four(self):
+        """(name -> port) for the mint, the profile, the GUI, the console."""
+        from aicash.supervision import SupervisionServer
+
+        gui_app, mint_console = self.load_operator_servers()
+        ports = {
+            "mint": self.build_mint(MintServer),
+            "supervision": self.build_mint(SupervisionServer),
+        }
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        gui = gui_app.serve(0, os.path.join(tmp.name, "gui"))
+        self.addCleanup(gui.server_close)
+        self.addCleanup(gui.shutdown)
+        threading.Thread(target=gui.serve_forever, daemon=True).start()
+        ports["gui"] = gui.server_address[1]
+
+        console = mint_console.serve(
+            0, ports["mint"], MINT_ID, HARNESS_ADMIN_TOKEN,
+            announce=False, stream=io.StringIO(),
+        )
+        self.addCleanup(console.server_close)
+        self.addCleanup(console.shutdown)
+        threading.Thread(target=console.serve_forever, daemon=True).start()
+        ports["console"] = console.server_address[1]
+        return ports
+
+    # -- identical bytes --------------------------------------------------
+
+    def request_bytes(self, method, path, name, value, *, pipeline=True):
+        """One request carrying ONE suspicious header, with a complete
+        second request pipelined behind it. A server that mis-frames the
+        first swallows or replays the second, and both show up on the
+        wire."""
+        tail = (b"GET /v3/mints HTTP/1.1\r\nHost: smuggled\r\n\r\n"
+                if pipeline else b"")
+        close = b"" if pipeline else b"Connection: close\r\n"
+        return (
+            ("%s %s HTTP/1.1\r\n" % (method, path)).encode("ascii")
+            + b"Host: 127.0.0.1\r\n"
+            + b"Content-Length: 0\r\n"
+            + close
+            + name.encode("ascii") + b": " + value + b"\r\n\r\n"
+            + tail
+        )
+
+    def test_all_four_servers_refuse_the_same_spellings(self):
+        """Identical bytes on four servers: one answer each, connection
+        closed each, and nothing smuggled out of the octets that follow.
+        The bytes never change between servers -- that is the whole
+        assertion.
+
+        On the POST half each server must also SAY it refused the framing,
+        in its own word, which is where the three vocabularies show and
+        where the single decision has to show through them.
+        """
+        ports = self.start_four()
+        for method, path in (("POST", "/v3/exchange"), ("GET", "/v3/mints")):
+            for name in self.REFUSED:
+                request = self.request_bytes(method, path, name, b"chunked")
+                verdict = mintapi.framing_verdict(
+                    email.parser.Parser().parsestr(
+                        "Host: h\r\nContent-Length: 0\r\n%s: chunked\r\n\r\n"
+                        % name
+                    ),
+                    body_expected=(method == "POST"),
+                )
+                self.assertIs(
+                    verdict.framed, False,
+                    "the shared rule itself frames %r" % name)
+                for server, port in sorted(ports.items()):
+                    with self.subTest(server=server, name=name,
+                                      method=method):
+                        raw = raw_request(port, request, timeout=8.0)
+                        head = raw.partition(b"\r\n\r\n")[0]
+                        self.assertEqual(
+                            raw.count(b"HTTP/1."), 1,
+                            "%s answered twice: the pipelined request was"
+                            " framed out of unread octets: %r"
+                            % (server, raw[:400]))
+                        self.assertIn(
+                            b"Connection: close", head,
+                            "%s kept the socket on an unframable request:"
+                            " %r" % (server, head[:300]))
+                        if method == "POST":
+                            self.assertTrue(
+                                any(w in raw for w in self.FRAMING_WORDS),
+                                "%s answered %r without naming a framing"
+                                " refusal" % (server, raw[:300]))
+
+    def test_all_four_servers_accept_the_same_innocents(self):
+        """The other half, without which "refuse everything" passes. A
+        header that merely contains a framing word, or that is an ordinary
+        vendor extension, must reach the route on every one of the four --
+        so the shared rule cannot be widened into a denial of service the
+        way it was once too narrow to be a rule.
+
+        Asserted by the ABSENCE of each server's own framing word rather
+        than by keep-alive: the four disagree about reusing a connection
+        after a 404 for reasons that have nothing to do with framing, and
+        a cross-server test must assert the thing that is actually shared.
+        """
+        ports = self.start_four()
+        for name in self.INNOCENT:
+            request = self.request_bytes(
+                "GET", "/v3/mints", name, b"7", pipeline=False)
+            verdict = mintapi.framing_verdict(
+                email.parser.Parser().parsestr(
+                    "Host: h\r\nContent-Length: 0\r\n%s: 7\r\n\r\n" % name),
+                body_expected=False,
+            )
+            self.assertIs(verdict.framed, True, name)
+            self.assertIs(verdict.must_close, False, name)
+            for server, port in sorted(ports.items()):
+                with self.subTest(server=server, name=name):
+                    raw = raw_request(port, request, timeout=8.0)
+                    self.assertTrue(raw, "%s answered nothing" % server)
+                    for word in self.FRAMING_WORDS:
+                        self.assertNotIn(
+                            word, raw,
+                            "%s refused the framing of an innocent header"
+                            " %r: %r" % (server, name, raw[:300]))
+
+    #: Request lines the standard library cannot version, plus the two
+    #: target forms none of the four routes on. Every one of them used to
+    #: be answered by the mint and the supervision profile with NO STATUS
+    #: LINE AT ALL, because their ``default_request_version`` was the
+    #: library's ``"HTTP/0.9"`` and in 0.9 ``send_response_only``,
+    #: ``send_header`` and ``end_headers`` are no-ops. The console and the
+    #: GUI had each already closed it, one with the default and one with a
+    #: ``send_error`` override; the two servers underneath them never had.
+    #: Driven at all four here for the same reason the header spellings
+    #: are: a defect fixed where it was found, three times running, is a
+    #: defect still live on its siblings.
+    REQUEST_LINES = {
+        "unparseable": b"@@@@\r\n\r\n",
+        "one word": b"GET\r\n\r\n",
+        "two words": b"GET /v3/mints\r\n\r\n",
+        "two words POST": b"POST /v3/exchange\r\n\r\n",
+        "four words": b"GET / HTTP/1.1 spare\r\nHost: 127.0.0.1\r\n\r\n",
+        "bad version": b"GET / HTTP/9.9\r\nHost: 127.0.0.1\r\n\r\n",
+        "absolute form": (b"GET http://127.0.0.1/v3/mints HTTP/1.1\r\n"
+                          b"Host: 127.0.0.1\r\n\r\n"),
+        "authority form": b"GET 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "over-long target": (b"GET /" + b"a" * 70000
+                             + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+    }
+
+    def assert_one_framed_answer(self, server, where, raw):
+        """One well-formed response, nothing after its declared length.
+
+        Both halves matter and the second is the one a status-line count
+        cannot see: the defect these shapes exist against wrote bodies with
+        NO status line, so when they landed behind a previous response they
+        were invisible to any check that counts answers.
+        """
+        self.assertTrue(raw, "%s answered %s with nothing at all" % (server, where))
+        self.assertTrue(
+            raw.startswith(b"HTTP/1."),
+            "%s answered %s with NO STATUS LINE: %r"
+            % (server, where, raw[:160]))
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        self.assertTrue(sep, "%s / %s: no header block: %r"
+                        % (server, where, raw[:160]))
+        declared = None
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                declared = int(value.strip())
+        self.assertIsNotNone(
+            declared, "%s / %s: no Content-Length: %r"
+            % (server, where, head[:200]))
+        self.assertEqual(
+            body[declared:], b"",
+            "%s / %s: %d octets FOLLOW the declared Content-Length of %d,"
+            " carrying no framing of their own: %r"
+            % (server, where, len(body) - declared, declared,
+               body[declared:][:160]))
+        self.assertIn(
+            b"Connection: close", head,
+            "%s / %s kept the socket: %r" % (server, where, head[:200]))
+
+    def test_all_four_servers_frame_every_request_line(self):
+        """Identical bytes, four servers, one decision — on the REQUEST
+        LINE this time, not on a header.
+
+        The header half of this rule reached ``framing_verdict`` and all
+        four already agree on it. This is the layer underneath, where the
+        standard library decides what protocol it was spoken to in before
+        any of these four gets a say, and where two of the four were still
+        answering with naked bodies.
+        """
+        ports = self.start_four()
+        for name, request in self.REQUEST_LINES.items():
+            for server, port in sorted(ports.items()):
+                with self.subTest(server=server, shape=name):
+                    raw = raw_request(port, request, timeout=8.0)
+                    self.assert_one_framed_answer(server, name, raw)
+
+    #: THE SPELLED-OUT 0.9 VERSION, and the reason it is not in
+    #: ``REQUEST_LINES`` above: THREE of the four frame it, not four.
+    #:
+    #: Every shape in ``REQUEST_LINES`` is either well-versioned HTTP/1.1 or
+    #: a version the standard library REFUSES, so none of them reaches the
+    #: state this one does: a version the library ACCEPTS
+    #: (``request_version == "HTTP/0.9"``, read off the wire) in which
+    #: ``send_response_only``, ``send_header`` and ``end_headers`` are all
+    #: no-ops. On the mint and the supervision profile that state served the
+    #: signed descriptor naked until the version check in
+    #: ``_Handler.parse_request`` closed it.
+    #:
+    #: MEASURED ON ALL FOUR, AFTER THAT FIX. The mint, the supervision
+    #: profile and the operator GUI answer a framed 400 ``bad_version`` and
+    #: hang up. THE OPERATOR CONSOLE DOES NOT: its refusal is a word count
+    #: (``mint_console.py``, ``_handle``), the same heuristic this handler
+    #: carried, so ``GET / HTTP/0.9`` still returns 845 octets of its
+    #: not-authorised HTML page with no status line, ``FROB /v3/mints
+    #: HTTP/0.9`` 357 octets of the library's HTML page naked, and
+    #: ``GET /v3/mints HTTP/0.9`` a naked 169-octet JSON body. That is the
+    #: SAME defect in the same shape, one file over — reported, not fixed,
+    #: because ``mint_console.py`` is not this round's file to edit. When it
+    #: takes the version check, these shapes move into ``REQUEST_LINES``
+    #: and this test goes away.
+    REQUEST_LINES_SPELLED_OUT_0_9 = {
+        "0.9 on a route": b"GET /v3/mints HTTP/0.9\r\nHost: 127.0.0.1\r\n\r\n",
+        "0.9 on no route": b"GET /nope HTTP/0.9\r\nHost: 127.0.0.1\r\n\r\n",
+        "0.9 POST with a body": (b"POST /v3/exchange HTTP/0.9\r\n"
+                                 b"Host: 127.0.0.1\r\nContent-Length: 2\r\n"
+                                 b"\r\n{}"),
+        "0.9 absolute form": (b"GET http://127.0.0.1/v3/mints HTTP/0.9\r\n"
+                              b"Host: 127.0.0.1\r\n\r\n"),
+    }
+
+    def test_the_spelled_out_0_9_version_is_framed_wherever_it_is_refused(self):
+        """The other 0.9 spelling, on the three servers that frame it.
+
+        The mint and the profile are this round's; the GUI is here because
+        it is where the fix came from — it refuses on
+        ``request_version == "HTTP/0.9"`` and has done since the round that
+        found "the other way to emit a response with no status line". Three
+        servers, one decision, identical bytes; the console's absence is
+        documented on the fixture above and is a finding, not an exemption.
+        """
+        ports = self.start_four()
+        for name, request in self.REQUEST_LINES_SPELLED_OUT_0_9.items():
+            for server in ("gui", "mint", "supervision"):
+                with self.subTest(server=server, shape=name):
+                    raw = raw_request(ports[server], request, timeout=8.0)
+                    self.assert_one_framed_answer(server, name, raw)
+
+    def test_the_two_servers_this_round_owns_say_the_same_word_for_both_0_9s(self):
+        """Two spellings of one protocol, one refusal word.
+
+        A word count and a version check are different tests and it would
+        be easy to answer them differently; the mint and the profile must
+        reach ``_refuse_transport(400, "bad_version")`` from both, because a
+        caller that matches on ``reason`` is matching on the DECISION, not
+        on which branch took it.
+        """
+        ports = self.start_four()
+        for server in ("mint", "supervision"):
+            for name, request in (
+                    ("two words", b"GET /v3/mints\r\n\r\n"),
+                    ("explicit 0.9",
+                     b"GET /v3/mints HTTP/0.9\r\nHost: 127.0.0.1\r\n\r\n"),
+            ):
+                with self.subTest(server=server, shape=name):
+                    raw = raw_request(ports[server], request, timeout=8.0)
+                    self.assert_one_framed_answer(server, name, raw)
+                    status, _headers, body = parse_http(raw)
+                    self.assertEqual(status, 400, raw[:200])
+                    self.assertEqual(
+                        body, {"status": "bad_request",
+                               "reason": "bad_version"}, body)
+                    self.assertNotIn(b"signature", raw)
+
+    def test_all_four_servers_refuse_to_splice_past_a_declared_length(self):
+        """The keep-alive regression, driven at all four.
+
+        A well-formed request and then a two-word one down the same socket.
+        On the mint and the supervision profile this produced a correct
+        response declaring a Content-Length and then, past it, the mint's
+        own signed descriptor — about a kilobyte that was not part of that
+        response and carried no framing at all. That is response splitting, and behind
+        the reverse proxy DEPLOYMENT.md mandates it is the entire
+        mechanism.
+
+        What is asserted is the property, not the answer: whatever each
+        server says to the second request, it says it with a status line,
+        so nothing on the socket is ever unattributable to a response.
+        """
+        ports = self.start_four()
+        # BOTH 0.9 SPELLINGS as the second request. The two-word one is what
+        # this fixture drove at first, and it is the one the handler already
+        # refused; the spelled-out one is the one it SERVED — 200 with a
+        # declared length, then that many octets of signed descriptor with
+        # no framing of their own. A splice fixture that never sends it
+        # cannot see the splice.
+        seconds = {
+            "two words": b"GET /v3/mints\r\n\r\n",
+            "explicit 0.9": (b"GET /v3/mints HTTP/0.9\r\n"
+                             b"Host: 127.0.0.1\r\n\r\n"),
+        }
+        for label, second in seconds.items():
+            request = (b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                       + second)
+            for server, port in sorted(ports.items()):
+                if server == "console" and label == "explicit 0.9":
+                    # The console answers this shape with no status line at
+                    # all (fixture REQUEST_LINES_SPELLED_OUT_0_9 above has
+                    # the measurements); its word-count refusal is the
+                    # defect this round closed one file over and could not
+                    # edit here. Its two-word cell is still driven.
+                    continue
+                with self.subTest(server=server, second=label):
+                    raw = raw_request(port, request, timeout=8.0)
+                    head, sep, rest = raw.partition(b"\r\n\r\n")
+                    self.assertTrue(sep, "%s: %r" % (server, raw[:200]))
+                    declared = int(re.search(
+                        rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head).group(1))
+                    trailing = rest[declared:]
+                    self.assertTrue(
+                        trailing == b"" or trailing.startswith(b"HTTP/1."),
+                        "%s: %d octets follow a declared Content-Length of %d"
+                        " with no framing of their own: %r"
+                        % (server, len(trailing), declared, trailing[:200]))
+                    self.assertNotIn(
+                        b"signature", trailing,
+                        "%s spliced signed mint state in past a declared"
+                        " Content-Length" % server)
+
+    def test_all_four_servers_call_the_same_function_object(self):
+        """Behaviour can agree by coincidence; identity cannot. Each of
+        the four reaches ``aicash.mintapi.framing_verdict`` itself -- not a
+        copy, not a wrapper with its own clauses -- so a fifth server that
+        imports it inherits every future widening, and one that does not
+        fails here."""
+        import aicash
+        from aicash import supervision
+
+        gui_app, mint_console = self.load_operator_servers()
+        for where, func in (
+            ("aicash package root", aicash.framing_verdict),
+            ("supervision profile", supervision.framing_verdict),
+            ("operator GUI", gui_app.framing_verdict),
+            ("operator console", mint_console.framing_verdict),
+        ):
+            with self.subTest(server=where):
+                self.assertIs(func, mintapi.framing_verdict, where)
+        # ...and the wider half of the rule is shared the same way: the
+        # fold was C10's alone, and being C10's alone is what made the
+        # promotion export the laxer answer to the other three.
+        self.assertIs(
+            supervision._fold_header_name, mintapi._fold_header_name
+        )
+        # No server may hold its own bound copy: the recorder in
+        # TheFramingRuleIsOneSharedFunctionTest only sees callers that
+        # look the name up on the module at call time, and these two do.
+        for module in (gui_app, mint_console):
+            self.assertIn(
+                "framing_verdict",
+                inspect.getsource(module).split("def ", 1)[0]
+                + inspect.getsource(module),
+            )
+
+
+# ======================================================================== #
+# JOB 2 — the issuance route owes an enumerated reason, at the route       #
+# ======================================================================== #
+
+
+class IssuanceNeverAnswersABare500Test(MintHarness, unittest.TestCase):
+    """The route half of C04's range bound.
+
+    ``POST /admin/issue`` with ``{"amount_mc": 9999999999999999999}`` — one
+    digit more than a signed 64-bit column holds — bound the value straight
+    into sqlite, raised ``OverflowError`` past every ``except
+    ExchangeRejected`` on the way out, and answered HTTP 500
+    ``{"status":"error"}``. §3.8 promises an enumerated reason for every
+    value a mint refuses, and a bare 500 with no ``errors`` list is not
+    one: a caller cannot tell "this amount is too large" from "the mint is
+    broken", and the second reading gets retried forever.
+
+    The identical body on ``/v3/exchange`` answered correctly, because
+    conservation cannot balance an amount no entry can hold. That is the
+    accident this class exists to stop relying on — so it asserts the two
+    routes, on identical amounts, both answer enumerated.
+    """
+
+    UNSTORABLE = (
+        int("9" * 19),          # the reported value: nineteen nines
+        1 << 63,                # the boundary itself
+        (1 << 63) + 1,
+        10 ** 25,
+        10 ** 600,              # far past anything a column could hold
+    )
+
+    def issue_amount(self, mint, amount, key="i"):
+        return http_raw(
+            mint.port, "POST", "/admin/issue",
+            json.dumps({
+                "outputs": [{"amount_mc": amount,
+                             "secret_hash": ledger_key(new_secret())}],
+            }).encode(),
+            {"Content-Type": "application/json",
+             "X-Admin-Token": HARNESS_ADMIN_TOKEN},
+        )
+
+    def assert_enumerated(self, status, raw):
+        self.assertEqual(status, 400, raw[:300])
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body["status"], "rejected", body)
+        self.assertTrue(body.get("errors"), body)
+        for err in body["errors"]:
+            self.assertIn(err["reason"], ERROR_REASONS, err)
+            self.assertIn(err["kind"], ERROR_KINDS, err)
+        return body
+
+    def test_an_amount_no_column_can_hold_is_enumerated_not_500(self):
+        mint = self.start_mint()
+        for amount in self.UNSTORABLE:
+            with self.subTest(amount=str(amount)[:14]):
+                status, raw, _ = self.issue_amount(mint, amount)
+                body = self.assert_enumerated(status, raw)
+                self.assertEqual(
+                    body["errors"],
+                    [{"index": 0, "kind": "output", "reason": "bad_format"}],
+                )
+
+    def test_the_two_routes_agree_on_the_same_amount(self):
+        """One value, two routes, one answer. They disagreed before: a
+        bare 500 on issuance and a call-level `amount_mismatch` on
+        exchange, which is exactly why nobody saw the 500."""
+        mint = self.start_mint()
+        amount = int("9" * 19)
+        status, raw, _ = self.issue_amount(mint, amount)
+        issue_body = self.assert_enumerated(status, raw)
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/v3/exchange",
+            json.dumps({
+                "idempotency_key": "two-routes",
+                "inputs": [],
+                "outputs": [{"amount_mc": amount,
+                             "secret_hash": ledger_key(new_secret())}],
+            }).encode(),
+            {"Content-Type": "application/json"},
+        )
+        exchange_body = self.assert_enumerated(status, raw)
+        self.assertEqual(
+            [(e["kind"], e["reason"]) for e in issue_body["errors"]],
+            [(e["kind"], e["reason"]) for e in exchange_body["errors"]],
+        )
+
+    def test_a_lock_expiry_no_column_can_hold_is_enumerated_too(self):
+        """The neighbouring number on the same row, over the wire. Driven
+        against a mint with NO finite lock horizon, because a mint that
+        has one refuses that expiry for an unrelated reason — the same
+        accidental cover that hid the amount."""
+        mint = self.start_mint(max_lock_expiry_ms=None)
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/admin/issue",
+            json.dumps({
+                "outputs": [{
+                    "amount_mc": 5,
+                    "secret_hash": ledger_key(new_secret()),
+                    "lock": {"preimage_hash": ledger_key(new_secret()),
+                             "expiry": 10 ** 19,
+                             "refund_hash": ledger_key(new_secret())},
+                }],
+            }).encode(),
+            {"Content-Type": "application/json",
+             "X-Admin-Token": HARNESS_ADMIN_TOKEN},
+        )
+        self.assert_enumerated(status, raw)
+
+    def test_a_batch_whose_sum_overflows_is_enumerated_too(self):
+        """Every amount storable, the total not. No per-value bound
+        reaches this one; the route must still answer §3.8."""
+        mint = self.start_mint()
+        biggest = (1 << 63) - 1
+        status, raw, _ = http_raw(
+            mint.port, "POST", "/admin/issue",
+            json.dumps({
+                "outputs": [
+                    {"amount_mc": biggest,
+                     "secret_hash": ledger_key(new_secret())},
+                    {"amount_mc": biggest,
+                     "secret_hash": ledger_key(new_secret())},
+                ],
+            }).encode(),
+            {"Content-Type": "application/json",
+             "X-Admin-Token": HARNESS_ADMIN_TOKEN},
+        )
+        body = self.assert_enumerated(status, raw)
+        self.assertEqual(
+            body["errors"],
+            [{"index": 1, "kind": "output", "reason": "bad_format"}],
+        )
+
+    def test_the_mint_still_issues_an_amount_it_can_hold(self):
+        """The bound is the column's: a fix that refused the largest
+        storable amount would be worse than the defect."""
+        mint = self.start_mint()
+        status, raw, _ = self.issue_amount(mint, (1 << 63) - 1)
+        self.assertEqual(status, 200, raw[:200])
+        self.assertEqual(
+            json.loads(raw.decode("utf-8"))["status"], "ok"
+        )
+
+    def test_the_route_survives_every_one_of_them(self):
+        """A refusal is not a wound, and no traceback ever reaches a
+        caller."""
+        mint = self.start_mint()
+        for amount in self.UNSTORABLE:
+            status, raw, _ = self.issue_amount(mint, amount)
+            self.assertNotIn(b"Traceback", raw)
+            self.assertNotIn(b'"status":"error"', raw)
+        status, raw, _ = http_raw(mint.port, "GET", "/v3/mints")
+        self.assertEqual(status, 200, raw[:200])
+
+
+# ======================================================================== #
+# THE REQUEST LINE — no shape of one may answer without a status line      #
+# ======================================================================== #
+
+
+class EveryRequestLineGetsAStatusLineTest(MintHarness, unittest.TestCase):
+    """The framing rule reached every HEADER. These are the REQUEST LINES.
+
+    The verification pass that closed the header family drove 58 framing
+    spellings at 55 routes across this repository's four HTTP servers and
+    found 51 of them perfect everywhere. The seven that were not are all
+    the same defect, one layer below the shared rule: this handler set
+    ``protocol_version`` (what it answers IN) and never set
+    ``default_request_version`` (what it assumes it was asked IN), whose
+    class default is ``"HTTP/0.9"`` — and in HTTP/0.9 the standard
+    library makes ``send_response_only()``, ``send_header()`` and
+    ``end_headers()`` NO-OPS, because 0.9 has no status line and no
+    headers.
+
+    So for any request line the library could not version, everything this
+    mint composed went onto the socket as a NAKED BODY. Measured, on every
+    one of the mint's seven routes and every one of the supervision
+    profile's twenty-one:
+
+      * ``@@@@`` — the library's own HTML error page, 359 octets in this
+        harness, with no status line in front of it.
+      * ``GET /v3/mints`` with no version — this mint's OWN SIGNED
+        DESCRIPTOR, roughly a kilobyte, naked. (The exact count moves with
+        the mint_id and the signature; the verification pass measured 1,087
+        on its mint and this harness measures 1,067 on its own.)
+      * ``GET /v3/mints HTTP/9.9`` — the naked error page again.
+
+    ``test_keep_alive_never_splices_a_second_body_past_a_declared_length``
+    below is why that is critical and not untidy.
+
+    AND IT HAS A SECOND SPELLING, which the first fix here missed: a
+    request line whose version token is literally ``HTTP/0.9`` is one the
+    library CAN read, so it sets ``request_version`` from the wire and the
+    no-ops come back — on every route, for the descriptor, for the §3.8
+    bodies, and for the transport refusals themselves. The first fix
+    refused 0.9 by WORD COUNT, which that shape walks straight past, and
+    the sweep could not see it because every shape the sweep built said
+    HTTP/1.1 or a version the library REFUSES. ``explicit 0.9`` below is
+    that shape and it is why the shape list, not only the handler, had to
+    change.
+
+    The fix is not invented here: the operator console set
+    ``default_request_version``, and the operator GUI both overrode
+    ``send_error`` AND refused on ``request_version == "HTTP/0.9"`` in its
+    own ``_handle``. All three are what this handler now carries — the
+    console's default alone leaves the GUI's two doors open, and the GUI's
+    ``send_error`` alone leaves the route path open. Measured across all
+    four servers in ``FourServersOneFramingRuleTest``: the GUI frames the
+    spelled-out 0.9 shapes too, and the operator CONSOLE does not — it
+    still answers them with no status line, because its refusal is the
+    same word count this handler has just stopped relying on
+    (``REQUEST_LINES_SPELLED_OUT_0_9`` carries the measurements and says
+    why that server is reported rather than changed here).
+    """
+
+    #: Every route this handler answers, so a fix that reached one of them
+    #: cannot pass. ``<unknown>`` paths are here on purpose: the 404 branch
+    #: composes a response too, and a naked 404 is as unframed as a naked
+    #: 200.
+    ROUTES = (
+        ("GET", "/v3/mints"),
+        ("GET", "/v3/status/abc"),
+        ("GET", "/no-such-route"),
+        ("POST", "/v3/exchange"),
+        ("POST", "/v3/status"),
+        ("POST", "/admin/issue"),
+        ("POST", "/no-such-route"),
+    )
+
+    def request_line_shapes(self, method, path):
+        """Request lines the standard library cannot version, one way each.
+
+        Each is a DIFFERENT door into the same room, which is why they are
+        swept rather than sampled: the two-word line reaches ``do_GET`` and
+        is answered by the ROUTE, the unparseable line and the bad version
+        are answered by the LIBRARY before ``parse_request`` returns, and
+        the over-long line is answered by ``handle_one_request`` before
+        ``parse_request`` is even called — three different pieces of code
+        composing a response, all of them silenced by the same field.
+
+        AND ONE OF THEM IS A VERSION THE LIBRARY CAN READ. Every shape in
+        the first version of this list was either HTTP/1.1 or a version the
+        library refuses outright (``HTTP/9.9``, ``HTTPX``), so the list had
+        the same blind spot the code had: nothing here spelled a version
+        the library ACCEPTS and that nonetheless disables header writing.
+        ``explicit 0.9`` is that shape, and the sweep is only a sweep with
+        it in.
+        """
+        return {
+            "unparseable": b"@@@@\r\n\r\n",
+            "one word": b"GET\r\n\r\n",
+            "two words": ("%s %s\r\n\r\n" % (method, path)).encode(),
+            # THE SPELLING THE FIRST FIX MISSED, and the one the sweep
+            # could not see because every other shape here is either
+            # HTTP/1.1 or a version the library REFUSES. This one the
+            # library ACCEPTS: three words, a well-formed version token,
+            # ``request_version`` set to ``"HTTP/0.9"`` FROM THE WIRE — and
+            # from that moment ``send_response_only``, ``send_header`` and
+            # ``end_headers`` are no-ops again, so the route runs and writes
+            # its body naked. Measured on this handler before the version
+            # check: ``GET /v3/mints HTTP/0.9`` returned 1,067 octets of the
+            # mint's own signed descriptor with no status line.
+            "explicit 0.9": (
+                "%s %s HTTP/0.9\r\nHost: h\r\n\r\n"
+                % (method, path)).encode(),
+            "four words": (
+                "%s %s HTTP/1.1 spare\r\nHost: h\r\n\r\n"
+                % (method, path)).encode(),
+            "bad version": (
+                "%s %s HTTP/9.9\r\nHost: h\r\n\r\n"
+                % (method, path)).encode(),
+            "versionless junk": (
+                "%s %s HTTPX\r\nHost: h\r\n\r\n"
+                % (method, path)).encode(),
+            "over-long target": (
+                ("%s /" % method).encode() + b"a" * 70000
+                + b" HTTP/1.1\r\nHost: h\r\n\r\n"),
+            "absolute form": (
+                "%s http://127.0.0.1%s HTTP/1.1\r\nHost: h\r\n\r\n"
+                % (method, path)).encode(),
+            "authority form": (
+                "%s 127.0.0.1:80 HTTP/1.1\r\nHost: h\r\n\r\n"
+                % (method,)).encode(),
+            "unknown method": (
+                "FROB %s HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+                % (path,)).encode(),
+        }
+
+    def assert_one_framed_response(self, raw, where):
+        """Exactly one well-formed response, and nothing after its length.
+
+        THE ABSOLUTE BAR, and both halves of it are load-bearing. A status
+        line alone is not enough: the defect this class exists against
+        produced bytes with no status line, and the same field produced
+        them APPENDED past a previous response's declared Content-Length,
+        which is the half a status-line count cannot see.
+        """
+        self.assertTrue(raw, "%s: no answer at all" % where)
+        self.assertTrue(
+            raw.startswith(b"HTTP/1."),
+            "%s: a response with NO STATUS LINE: %r" % (where, raw[:160]))
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        self.assertTrue(sep, "%s: no header block: %r" % (where, raw[:160]))
+        declared = None
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                declared = int(value.strip())
+        self.assertIsNotNone(
+            declared, "%s: no Content-Length: %r" % (where, head[:200]))
+        self.assertEqual(
+            body[declared:], b"",
+            "%s: %d octets FOLLOW the declared Content-Length of %d, with"
+            " no framing of their own: %r"
+            % (where, len(body) - declared, declared, body[declared:][:160]))
+        self.assertIn(
+            b"Connection: close", head,
+            "%s: the socket was kept after a refused request line: %r"
+            % (where, head[:200]))
+
+    def test_no_request_line_shape_answers_without_a_status_line(self):
+        """The sweep. Seventy-seven cells on this server: seven routes,
+        eleven shapes, one framed answer each."""
+        mint = self.start_mint()
+        for method, path in self.ROUTES:
+            for name, request in self.request_line_shapes(method, path).items():
+                with self.subTest(route="%s %s" % (method, path), shape=name):
+                    raw = raw_request(mint.port, request, timeout=8.0)
+                    self.assert_one_framed_response(
+                        raw, "%s %s / %s" % (method, path, name))
+
+    def test_the_two_word_request_line_no_longer_serves_the_descriptor(self):
+        """The loudest cell, named on its own because of WHAT it leaked.
+
+        ``GET /v3/mints`` with no version reached ``do_GET``, built the
+        descriptor, and then wrote it to the socket raw: the whole of this
+        mint's signed state, about a kilobyte, with no status line, no
+        Content-Length and no ``Connection: close``. Feeding those bytes to ``http.client``
+        raises ``BadStatusLine``; feeding them to a proxy that is reading
+        by length appends them to whatever came before.
+        """
+        mint = self.start_mint()
+        raw = raw_request(mint.port, b"GET /v3/mints\r\n\r\n", timeout=8.0)
+        self.assert_one_framed_response(raw, "two-word GET /v3/mints")
+        status, headers, body = parse_http(raw)
+        self.assertEqual(status, 400, raw[:200])
+        self.assertEqual(body["reason"], "bad_version", body)
+        # The descriptor is not in the answer at all -- not merely framed.
+        self.assertNotIn(b"signature", raw)
+        self.assertNotIn(MINT_ID.encode("ascii"), raw)
+
+    def test_keep_alive_never_splices_a_second_body_past_a_declared_length(self):
+        """THE REGRESSION. Response splitting, in five lines of bytes.
+
+        One socket, two requests: a well-formed GET, then a two-word one.
+        What came back was a correct response declaring a Content-Length
+        and then that many MORE octets after it — this mint's own signed
+        descriptor — which are not part of that response and carry no
+        framing of their own.
+
+        Behind the reverse proxy DEPLOYMENT.md makes mandatory, that is the
+        whole mechanism: the proxy reads the declared length and stops, the
+        client reads what follows, and the two disagree about where the
+        response ended. The injected octets are attacker-chosen in the
+        sense that matters — the attacker picks which route produces them.
+
+        The assertion is on the FIRST response's frame, not on a count of
+        status lines: the injected bytes had no status line, so a count saw
+        one response and nothing wrong.
+        """
+        mint = self.start_mint()
+        # BOTH SPELLINGS OF THE SECOND REQUEST. The first fixture here said
+        # only ``GET /v3/mints`` (two words), so this test drove the one 0.9
+        # spelling the handler refused and never the one it served: with the
+        # version token spelled out the splice was still live — 200,
+        # ``Content-Length: 1067``, then 1,067 further octets containing
+        # ``signature`` and no framing of their own.
+        for label, second in (
+                ("two words", b"GET /v3/mints\r\n\r\n"),
+                ("explicit 0.9",
+                 b"GET /v3/mints HTTP/0.9\r\nHost: 127.0.0.1\r\n\r\n"),
+        ):
+            with self.subTest(second=label):
+                self.assert_no_splice(mint.port, second)
+
+    def assert_no_splice(self, port, second_request):
+        """A good request, then ``second_request``, down one socket: the
+        first answer is framed and NOTHING that follows its declared length
+        is unattributable to a response of its own."""
+        raw = raw_request(
+            port,
+            b"GET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            + second_request,
+            timeout=8.0,
+        )
+        head, sep, rest = raw.partition(b"\r\n\r\n")
+        self.assertTrue(sep, raw[:200])
+        self.assertTrue(head.startswith(b"HTTP/1.1 200"), head[:120])
+        declared = int(re.search(
+            rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head).group(1))
+        first, trailing = rest[:declared], rest[declared:]
+        self.assertIn(b"signature", first)          # the honest answer
+        # Whatever answers the second request, it is a RESPONSE: it has a
+        # status line of its own. Naked octets here are the defect.
+        self.assertTrue(
+            trailing.startswith(b"HTTP/1.1 "),
+            "%d octets follow the declared length with no framing of their"
+            " own: %r" % (len(trailing), trailing[:200]))
+        self.assertNotIn(
+            b"signature", trailing,
+            "the descriptor was spliced in past a declared Content-Length")
+        self.assertIn(
+            b"Connection: close", trailing.partition(b"\r\n\r\n")[0])
+
+    def test_one_empty_line_before_the_request_line_is_ignored(self):
+        """A perfectly well-formed request, preceded by one CRLF, used to
+        get NO ANSWER AT ALL.
+
+        RFC 7230 §3.5: a server SHOULD ignore at least one empty line
+        received before the request line — the shape a client emits when it
+        terminates a body with an extra CRLF. The standard library does not
+        ignore it: an empty request line makes ``words`` empty and
+        ``parse_request`` return False with nothing written, so the request
+        was silently DISCARDED and the socket closed. Behind the reverse
+        proxy DEPLOYMENT.md mandates that is uniform request loss on a shape
+        the RFC blesses — the "no response at all" class, which is the other
+        half of this class's subject.
+        """
+        mint = self.start_mint()
+        raw = raw_request(
+            mint.port,
+            b"\r\nGET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Connection: close\r\n\r\n",
+            timeout=8.0)
+        self.assert_one_framed_response(raw, "one CRLF then a good request")
+        status, _headers, _body = parse_http(raw)
+        self.assertEqual(status, 200, raw[:200])
+        self.assertIn(b"signature", raw)
+
+        # The skip does not skip the REFUSALS: the request line behind the
+        # empty line is judged exactly as if it had arrived first.
+        raw = raw_request(
+            mint.port,
+            b"\r\nGET /v3/mints HTTP/0.9\r\nHost: 127.0.0.1\r\n\r\n",
+            timeout=8.0)
+        self.assert_one_framed_response(raw, "one CRLF then a 0.9 line")
+        status, _headers, body = parse_http(raw)
+        self.assertEqual(status, 400, raw[:200])
+        self.assertEqual(body, {"status": "bad_request",
+                                "reason": "bad_version"}, body)
+        self.assertNotIn(b"signature", raw)
+
+        # ONE line, which is what the RFC asks for, and deliberately not a
+        # loop: a loop lets an anonymous peer hold a thread by trickling
+        # CRLFs inside the request deadline. Two empty lines are still not
+        # answered — what is asserted is the bar, not the answer: whatever
+        # comes back is either nothing or a response with a status line on
+        # it, never a naked body.
+        raw = raw_request(
+            mint.port,
+            b"\r\n\r\nGET /v3/mints HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Connection: close\r\n\r\n",
+            timeout=8.0)
+        self.assertTrue(
+            raw == b"" or raw.startswith(b"HTTP/1."),
+            "two empty lines produced octets with no status line: %r"
+            % (raw[:160],))
+
+    def test_the_transport_vocabulary_is_this_mints_and_not_the_interpreters(self):
+        """The machine words in ``status`` and ``reason`` are spelled in
+        this module, not derived from ``BaseHTTPRequestHandler.responses``.
+
+        They were derived from the library's reason phrase, so a 414
+        answered ``request_uri_too_long`` on python3.12 — and CPython has
+        already renamed several of those members for RFC 9110 (413, 414,
+        416, 422), which means the same mint on a different interpreter
+        answered a different machine word for the same request. A field a
+        client matches on may not move with the interpreter, so the words
+        are asserted here against the table and NOT against
+        ``HTTPStatus(code).phrase``.
+        """
+        from http import HTTPStatus
+
+        # ON THE WIRE FIRST: the words a client actually receives.
+        mint = self.start_mint()
+        raw = raw_request(
+            mint.port,
+            b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\nHost: h\r\n\r\n",
+            timeout=8.0)
+        self.assert_one_framed_response(raw, "over-long request line")
+        status, _headers, body = parse_http(raw)
+        self.assertEqual(status, 414, raw[:200])
+        self.assertEqual(body, {"status": "uri_too_long",
+                                "reason": "request_line_too_long"}, body)
+        raw = raw_request(
+            mint.port,
+            b"GET /v3/mints HTTP/1.1\r\nHost: h\r\n"
+            + b"".join(b"X-Pad-%d: 1\r\n" % i for i in range(300))
+            + b"\r\n",
+            timeout=8.0)
+        self.assert_one_framed_response(raw, "300 header lines")
+        status, _headers, body = parse_http(raw)
+        self.assertEqual(status, 431, raw[:200])
+        self.assertEqual(body, {"status": "header_fields_too_large",
+                                "reason": "header_block_too_large"}, body)
+
+        self.assertEqual(mintapi._transport_status(414), "uri_too_long")
+        self.assertEqual(mintapi._transport_status(431),
+                         "header_fields_too_large")
+        self.assertEqual(mintapi._transport_status(404), "not_found")
+        self.assertEqual(mintapi._transport_status(401), "unauthorized")
+        # An unknown code is still interpreter-independent.
+        self.assertEqual(mintapi._transport_status(599), "http_599")
+        # And the reason is never a restatement of the status word.
+        for code, why in mintapi._TRANSPORT_WHY.items():
+            self.assertNotEqual(
+                why, mintapi._transport_status(code),
+                "%d answers its own status word in the reason field" % code)
+        # The interpreter's phrase for 414 is what used to be shipped; if
+        # this ever equals the word above again, the table has been removed.
+        self.assertNotEqual(
+            mintapi._transport_status(414),
+            HTTPStatus(414).phrase.lower().replace(" ", "_").replace("-", "_"),
+            "the status word is the interpreter's phrase again")
+
+    def test_the_librarys_html_error_page_never_reaches_the_wire(self):
+        """An unparseable request line used to send 359 octets of the
+        standard library's HTML, naked. Now it is this mint's own JSON,
+        framed — and it does not quote the caller's request line back at
+        it, which the library's message (``Bad request syntax (%r)``, on a
+        line that may be 64 KiB) does."""
+        mint = self.start_mint()
+        for line in (b"@@@@", b"GET", b"GET / HTTP/1.1 spare"):
+            with self.subTest(line=line):
+                raw = raw_request(mint.port, line + b"\r\n\r\n", timeout=8.0)
+                self.assert_one_framed_response(raw, repr(line))
+                self.assertNotIn(b"<!DOCTYPE", raw)
+                self.assertNotIn(b"<html", raw)
+                self.assertNotIn(b"Error response", raw)
+                status, _, body = parse_http(raw)
+                self.assertEqual(status, 400, raw[:200])
+                # NOT ``{"reason": "bad_request"}``: that restated the
+                # status word in the field a caller reads for WHY, which
+                # looks parseable and says nothing. This is the library's
+                # own refusal class, named.
+                self.assertEqual(body, {"status": "bad_request",
+                                        "reason": "bad_request_line"}, body)
+                self.assertNotIn(line, raw)
+
+    def test_a_version_this_mint_will_not_speak_is_a_framed_505(self):
+        """The bodiless-protocol family's third door. The library refuses
+        the version itself, from inside ``parse_request``, and its refusal
+        was as naked as the others."""
+        mint = self.start_mint()
+        raw = raw_request(
+            mint.port,
+            b"GET /v3/mints HTTP/9.9\r\nHost: 127.0.0.1\r\n\r\n", timeout=8.0)
+        self.assert_one_framed_response(raw, "HTTP/9.9")
+        status, _, body = parse_http(raw)
+        self.assertEqual(status, 505, raw[:200])
+        self.assertEqual(body["status"], "http_version_not_supported", body)
+        # The version string is the caller's text; it is not echoed.
+        self.assertNotIn(b"9.9", raw.partition(b"\r\n\r\n")[2])
+
+    def test_an_absolute_form_target_is_refused_and_the_socket_goes(self):
+        """The third of the three cross-server disagreements, and the one
+        that was a defect.
+
+        This handler routes on ``self.path`` verbatim, so only origin-form
+        ever matches: ``GET http://host/v3/mints`` has always been a 404
+        and always will be. Answering 404 and then INVITING another request
+        on the same socket is the part that was wrong — RFC 7230 §5.3.2
+        says an origin server that takes absolute-form must ignore ``Host``
+        and route on the target's own authority, and this mint does
+        neither, so the request carries two unreconciled statements of
+        which server it is for. DEPLOYMENT.md puts a proxy in front of
+        every deployed mint, so there is always a second hop that may
+        reconcile them the other way.
+
+        The operator GUI and the operator console both close on these
+        bytes. This is the change that makes all four agree on them.
+        """
+        mint = self.start_mint()
+        for target in (b"http://127.0.0.1/v3/mints", b"http://[",
+                       b"https://evil.example/v3/exchange",
+                       b"127.0.0.1:80", b"*"):
+            with self.subTest(target=target):
+                raw = raw_request(
+                    mint.port,
+                    b"GET " + target + b" HTTP/1.1\r\nHost: h\r\n\r\n",
+                    timeout=8.0)
+                self.assert_one_framed_response(raw, repr(target))
+                status, _, body = parse_http(raw)
+                self.assertEqual(status, 400, raw[:200])
+                self.assertEqual(body["reason"], "bad_request_target", body)
+                self.assertNotIn(target, raw)
+
+    def test_a_refused_head_carries_no_body_after_its_declared_length(self):
+        """The one shape the fix could have broken, so it is pinned.
+
+        ``send_error`` now writes this mint's JSON through ``_send``, and
+        ``_send`` used to write its body unconditionally. No route here
+        answers HEAD — the library refuses it 501 before dispatch — so the
+        only HEAD response that exists is that refusal, and a refusal that
+        declared a length and then sent the body after a HEAD would be a
+        framing violation in the server whose subject is framing.
+        """
+        mint = self.start_mint()
+        raw = raw_request(
+            mint.port,
+            b"HEAD /v3/mints HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n",
+            timeout=8.0)
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        self.assertTrue(sep, raw[:200])
+        self.assertTrue(head.startswith(b"HTTP/1.1 501"), head[:120])
+        self.assertIn(b"Content-Length:", head)
+        self.assertEqual(body, b"", "a HEAD response carried a body: %r" % body)
+
+    def test_octets_past_a_request_are_answered_never_appended(self):
+        """The two remaining cross-server disagreements, decided, with the
+        reason written down.
+
+        The verification pass reports three spellings on which this mint
+        and the supervision profile keep the socket while the operator GUI
+        and the operator console close it: an absolute-form target (a real
+        defect, fixed above), a declared length SHORTER than the octets
+        actually sent, and no declared length with octets sent. The last
+        two are decided the other way, and deliberately.
+
+        On the wire those two shapes are the pipelining this mint supports
+        and this suite already pins (``test_an_ordinary_get_still_keeps_
+        its_connection``, and the CL-tolerance tests that require the
+        pipelined GET behind a refused body to be ANSWERED). They are the
+        same bytes: a request whose body this server read in full or had
+        none of, followed by octets this server has not read yet. Nothing
+        at this layer can tell a pipelined request from a smuggled tail,
+        and closing on them would delete those tests. The other two servers
+        are not making a framing decision on these bytes either — the
+        console answers HTTP/1.0 and closes on everything, and the GUI
+        closes because its auth gate denied the request and a denied
+        request may carry an unread body. Copying either would be copying
+        an accident.
+
+        What this mint owes instead is the absolute bar, and that is what
+        is asserted: whatever those trailing octets turn into, it is a
+        RESPONSE with a status line of its own. Before this round they were
+        answered with the library's naked HTML page, appended past a
+        declared Content-Length with no framing at all — which is the
+        actual harm the disagreement was standing in for.
+        """
+        mint = self.start_mint()
+        cases = {
+            "declared length shorter than the octets sent": (
+                b"POST /v3/exchange HTTP/1.1\r\nHost: h\r\n"
+                b"Content-Length: 2\r\n\r\n{}@@@@\r\n\r\n"),
+            "no declared length, octets sent": (
+                b"GET /v3/mints HTTP/1.1\r\nHost: h\r\n\r\n@@@@\r\n\r\n"),
+        }
+        for name, request in cases.items():
+            with self.subTest(shape=name):
+                raw = raw_request(mint.port, request, timeout=8.0)
+                head, sep, rest = raw.partition(b"\r\n\r\n")
+                self.assertTrue(sep, raw[:200])
+                declared = int(re.search(
+                    rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head).group(1))
+                trailing = rest[declared:]
+                self.assertTrue(
+                    trailing.startswith(b"HTTP/1.1 "),
+                    "%s: %d octets follow the declared Content-Length of %d"
+                    " with no framing of their own: %r"
+                    % (name, len(trailing), declared, trailing[:200]))
+                self.assertNotIn(b"<!DOCTYPE", raw)
+
+    def test_ordinary_pipelining_still_costs_nothing(self):
+        """The half that keeps the decision above from being a denial of
+        service: two well-formed requests down one socket are still two
+        answers on that socket."""
+        mint = self.start_mint()
+        raw = raw_request(
+            mint.port,
+            b"GET /v3/mints HTTP/1.1\r\nHost: h\r\n\r\n"
+            b"GET /v3/mints HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+            timeout=8.0)
+        self.assertEqual(raw.count(b"HTTP/1.1 200"), 2, raw[:200])
 
 
 if __name__ == "__main__":
