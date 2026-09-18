@@ -463,6 +463,25 @@ server {
         proxy_send_timeout    15s;
         proxy_read_timeout    30s;
         proxy_buffering on;
+
+        # HEADER-NAME NORMALIZATION IS THE PROXY'S JOB, AND IT IS LOAD-BEARING.
+        # The mint refuses to obey a mangled framing header -- Transfer_Encoding
+        # with an underscore, a prefixed or otherwise non-standard spelling --
+        # rather than guessing that it meant Transfer-Encoding, because
+        # honouring it would be inventing a rewrite the sender did not ask for.
+        # That is a deliberate boundary, the same shape as TLS: the mint does
+        # not do it, so the proxy MUST. If a hop in front of the mint DOES
+        # collapse such a name and de-chunks on it, while the mint reads the
+        # Content-Length sitting beside it, the two disagree about where the
+        # body ends -- which is the classic request-smuggling desync, and one
+        # the mint cannot see by design.
+        #
+        # nginx happens to drop underscore headers by default, so this block is
+        # safe as written. Caddy and HAProxy, which section 4 permits, give no
+        # such guarantee. Whatever proxy you run: normalize or REJECT
+        # header-name variants (dash/underscore, prefixes, obsolete folds) and
+        # duplicate framing headers before the mint sees them.
+        underscores_in_headers off;   # nginx default; stated, not assumed
     }
 
     # Operator issuance. Not reachable from the internet, full stop.

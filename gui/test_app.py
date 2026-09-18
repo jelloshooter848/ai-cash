@@ -69,6 +69,31 @@ class FakeMintControlError(Exception):
     pass
 
 
+# --- a port this suite OWNS, so no test ever reaches a stranger -------------
+#
+# FINDING B1, reported by thalamus and confirmed in the author's own
+# environment on 2026-09-18. The fake controller used to report port 8787,
+# and gui/app.py's descriptor route PROXIES to whatever the controller
+# names. So every test that reached that route sent a real request to
+# 127.0.0.1:8787 and asserted on whatever process happened to own it. On the
+# author's machine that was a leftover development mint from gui/var, live
+# since the previous evening, which made the body differ between two fetches
+# (snapshot_seq is allocated per fetch, per spec 3.6, and the signature
+# covers it) and failed the test deterministically. On a clean machine
+# nothing answered, both probes got the same refusal, and it passed. That is
+# a suite whose result depends on host state it does not own, and it is why
+# an unexplained failure went unexplained for two days.
+#
+# Bound and never listened on: a connect to a bound-but-unlistening socket is
+# refused immediately and deterministically, and HOLDING the binding for the
+# life of the process means nothing else can take the port mid-run. Binding
+# and closing to "reserve" a number would leave exactly the race this exists
+# to remove.
+_DEAD = socket.socket()
+_DEAD.bind(("127.0.0.1", 0))
+DEAD_PORT = _DEAD.getsockname()[1]
+
+
 class FakeMintControl:
     """Enough of the pinned MintControl contract to exercise the server.
 
@@ -97,7 +122,7 @@ class FakeMintControl:
                 return blob
         except (OSError, ValueError):
             pass
-        return {"mint_id": "fake-mint", "port": 8787}
+        return {"mint_id": "fake-mint", "port": DEAD_PORT}
 
     def status(self):
         record = self._record()
@@ -861,7 +886,7 @@ class TestAuthentication(ServerCase):
         for method, path, body in (
                 ("POST", "/api/mint/start",
                  {"mint_id": "leak-check", "baseline_model_class": "b",
-                  "port": 8787, "rate_ppm": 0, "cap_mc": 0,
+                  "port": DEAD_PORT, "rate_ppm": 0, "cap_mc": 0,
                   "exempt_below_mc": 0}),
                 ("GET", "/api/wallet/list", None),
                 ("POST", "/api/wallet/pay", {"name": "alice", "amount_mc": 1})):
@@ -1250,7 +1275,7 @@ class TestCredentialAndSideEffects(ServerCase):
     def test_start_remembers_what_it_started(self):
         """So a later Stop/Start cannot quietly re-send a default policy."""
         body = {"mint_id": "policy-mint", "baseline_model_class": "baseline-v1",
-                "port": 8787, "rate_ppm": 10000, "cap_mc": 1000,
+                "port": DEAD_PORT, "rate_ppm": 10000, "cap_mc": 1000,
                 "exempt_below_mc": 10}
         status, obj, raw = self.call("POST", "/api/mint/start", body)
         self.assertEqual(status, 200, raw[:300])
@@ -5756,7 +5781,7 @@ class TestTheFormAndTheSupervisorAgree(unittest.TestCase):
         self.assertEqual(last["mint_id"], status["mint_id"])
         self.assertEqual(last["port"], status["port"])
         self.assertNotEqual(last["mint_id"], "local-test-mint")
-        self.assertNotEqual(last["port"], 8787)
+        self.assertNotEqual(last["port"], DEAD_PORT)
         # and the economics are the mint's own, not the form's defaults
         self.assertEqual(last["rate_ppm"], 4200)
         self.assertEqual(last["cap_mc"], 777)
@@ -8701,8 +8726,18 @@ class TestTheDripIsBoundedByAWallClock(ServerCase):
                 status, 200,
                 "a request inside its own budget was refused (%d): %r"
                 % (status, payload[:200]))
-        # The inside half. Four requests were answered, so at least four
-        # turns through handle_one_request have finished.
+        # The inside half. FINDING B2, reported by thalamus: four answered
+        # requests do NOT mean four turns through handle_one_request have
+        # FINISHED. The wrapper appends in a finally, after the response has
+        # been written, so a client that has read all four can reach this
+        # line before the server's fourth finally runs. Asserting here read
+        # the count one short on a third to a half of runs -- a race in the
+        # observation, never in the server: every value recorded was None,
+        # which is the property the next assertion is about, on every turn.
+        # So wait for the bookkeeping rather than racing it.
+        deadline = time.monotonic() + 5.0
+        while len(left_armed) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertGreaterEqual(len(left_armed), 4, left_armed)
         self.assertEqual(
             [seen for seen in left_armed if seen is not None], [],
